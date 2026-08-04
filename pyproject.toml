@@ -1,0 +1,101 @@
+[project]
+name = "deep-research"
+version = "0.1.0"
+description = "Intelligent research platform with LangGraph multi-agent orchestration, hybrid RAG, and GraphRAG"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    # ---- Web 框架 ----
+    "fastapi>=0.115.0",
+    "uvicorn>=0.34.0",
+    "python-multipart>=0.0.20",
+
+    # ---- LangChain / LangGraph ----
+    "langchain>=1.0.5",
+    "langchain-core>=1.0.4",
+    "langchain-openai>=1.0.2",
+    "langchain-community>=0.4.1",
+    "langgraph>=1.0.2",
+    "langgraph-checkpoint-postgres>=3.0.1",
+
+    # ---- 数据库 ----
+    "psycopg[binary]>=3.3.2",
+    "psycopg2-binary>=2.9.10",
+    "sqlmodel>=0.0.25",
+    "alembic>=1.18.4",
+    "neo4j>=5.28.0",
+
+    # ---- 向量检索 & Rerank ----
+    "pgvector>=0.4.0",
+    "rank-bm25>=0.2.2",
+    "sentence-transformers>=3.4.0",
+
+    # ---- 认证 ----
+    "python-jose[cryptography]>=3.4.0",
+    "passlib[bcrypt]>=1.7.4",
+    "bcrypt>=4.3.0",
+
+    # ---- 配置 & 工具 ----
+    "python-dotenv>=1.1.0",
+    "pydantic[email]>=2.11.1",
+    "email-validator>=2.2.0",
+
+    # ---- 可观测性 & 限流 ----
+    "langfuse>=3.9.1",
+    "structlog>=25.2.0",
+    "slowapi>=0.1.9",
+    "asgi-correlation-id>=4.3.4",
+
+    # ---- 重试 & 缓存 ----
+    "tenacity>=9.1.2",
+    "redis>=7.4.0",
+
+    # ---- 搜索 ----
+    "duckduckgo-search>=3.9.0",
+]
+
+[tool.setuptools]
+packages = ["app"]
+
+[project.optional-dependencies]
+dev = [
+    "ruff",
+    "pyright>=1.1.390",
+    "pre-commit>=4.5.1",
+    "detect-secrets>=1.5.0",
+]
+test = [
+    "httpx>=0.28.1",
+    "pytest>=8.3.5",
+]
+
+[tool.ruff]
+line-length = 119
+exclude = ["migrations", "*.ipynb", "venv", ".venv"]
+
+[tool.ruff.lint]
+select = ["E", "F", "B", "ERA", "D"]
+ignore = ["E501", "D203", "D213", "B904", "B008"]
+unfixable = ["B"]
+
+[tool.ruff.lint.pydocstyle]
+convention = "google"
+
+[tool.ruff.lint.per-file-ignores]
+"__init__.py" = ["E402"]
+
+[tool.pyright]
+include = ["app"]
+exclude = [
+    "**/__pycache__",
+    "**/.venv",
+    "alembic/versions",
+    "migrations",
+    "venv",
+]
+pythonVersion = "3.12"
+typeCheckingMode = "standard"
+
+reportDuplicateImport = "error"
+reportInvalidTypeVarUse = "error"
+reportSelfClsParameterName = "error"
