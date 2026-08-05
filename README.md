@@ -9,4 +9,5 @@ correlation, FastAPI middleware, and versioned health routes.
 
 - Product vision: [`../docs/DeepSearch.md`](../docs/DeepSearch.md)
 - Authoritative learning plan and current progress: [`../docs/LABS.MD`](../docs/LABS.MD)
+- Full phase-by-phase curriculum: [`../docs/phases/README.md`](../docs/phases/README.md)
 - Current lesson: [`../docs/lessons/lab-03-fastapi-exceptions.md`](../docs/lessons/lab-03-fastapi-exceptions.md)

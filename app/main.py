@@ -6,6 +6,7 @@ from starlette.middleware.cors import CORSMiddleware
 from app.api.v1.api import api_router
 from app.core.config import settings
 from app.core.middleware import RequestLoggingMiddleware
+from app.core.exception_handlers import register_exception_handlers
 
 app = FastAPI(
     title=settings.PROJECT_NAME,
@@ -14,12 +15,13 @@ app = FastAPI(
     openapi_url=f"{settings.API_V1_STR}/openapi.json",
 )
 
+# 注册异常处理的handler
+register_exception_handlers(app)
+
 # 注意中间件执行顺序：
 # Starlette/FastAPI 中后添加的 middleware 更靠外层，会更早处理请求。
 # 因此 CorrelationIdMiddleware 要在 RequestLoggingMiddleware 之后添加，
 # 这样 request_started/request_completed 也能读到 request_id。
-
-# 请求日志中间件放在这里，用来记录 method、path、status、duration
 app.add_middleware(RequestLoggingMiddleware)
 
 # CorrelationMiddleware 会为每个请求生成/读取 request_id
@@ -35,4 +37,5 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# 注册app router
 app.include_router(api_router, prefix=settings.API_V1_STR)
