@@ -1,7 +1,6 @@
 """FastAPI 全局异常处理
-负责讲框架异常转换为统一的HTTP响应
+负责将框架异常转换为统一的HTTP响应
 """
-from sys import path
 from typing import Any
 
 from asgi_correlation_id import correlation_id
