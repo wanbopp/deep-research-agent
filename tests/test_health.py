@@ -40,3 +40,32 @@ async def test_health_check_return_200(client: AsyncClient) -> None:
     request_id = response.headers.get("X-Request-ID")
     assert request_id is not None
     assert request_id != ""
+
+
+@pytest.mark.anyio
+async def test_openapi_documents_health_response(client: AsyncClient) -> None:
+    """OpenAPI 应使用 HealthResponse 描述健康检查的成功响应."""
+    response = await client.get("/api/v1/openapi.json")
+
+    assert response.status_code == 200
+
+    openapi = response.json()
+
+    # 按照 OpenAPI 的层级找到：
+    # health 路径 -> GET 操作 -> 200 响应 -> JSON body schema。
+    response_schema = openapi["paths"]["/api/v1/health"]["get"]["responses"]["200"]["content"]["application/json"][
+        "schema"
+    ]
+
+    # $ref 表示这里不重复展开模型，而是引用 components 中的定义。
+    assert response_schema["$ref"] == "#/components/schemas/HealthResponse"
+
+    health_schema = openapi["components"]["schemas"]["HealthResponse"]
+
+    # 四个字段都没有默认值，因此都应该是必填字段。
+    assert set(health_schema["required"]) == {
+        "status",
+        "version",
+        "environment",
+        "timestamp",
+    }

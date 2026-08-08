@@ -90,3 +90,31 @@ async def test_unhandled_exception_returns_safe_500_contract(
     assert request_id is not None
     assert request_id != ""
     assert body["request_id"] == request_id
+
+
+@pytest.mark.anyio
+async def test_openapi_documents_common_error_responses(
+    client: AsyncClient,
+) -> None:
+    """OpenAPI 应使用 ErrorResponse 描述公共错误响应."""
+    response = await client.get("/api/v1/openapi.json")
+
+    assert response.status_code == 200
+
+    openapi = response.json()
+    documented_responses = openapi["paths"]["/api/v1/health"]["get"]["responses"]
+
+    # OpenAPI JSON 对象的键只能是字符串，
+    # 因此状态码在文档中表现为 "404"，而不是整数 404。
+    for status_code in ("404", "422", "500"):
+        response_schema = documented_responses[status_code]["content"]["application/json"]["schema"]
+
+        assert response_schema["$ref"] == "#/components/schemas/ErrorResponse"
+
+    error_schema = openapi["components"]["schemas"]["ErrorResponse"]
+
+    # 与运行时错误 body 的顶层结构保持一致。
+    assert set(error_schema["required"]) == {
+        "error",
+        "request_id",
+    }
