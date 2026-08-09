@@ -3,14 +3,14 @@
 负责将框架异常转换为统一的 HTTP 响应。
 """
 
-from typing import Any
+from typing import Any, cast
 
 from asgi_correlation_id import correlation_id
 from fastapi import FastAPI, Request, status
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from starlette.exceptions import HTTPException as StarletteHTTPException
-
+from starlette.types import HTTPExceptionHandler
 from app.core.logging import logger
 
 
@@ -150,15 +150,18 @@ async def unhandled_exception_handler(
 
 def register_exception_handlers(app: FastAPI) -> None:
     """集中注册异常类型与 handler 的对应关系."""
-    # 依次注册 StarletteHTTPException、RequestValidationError 和 Exception。
+    # Starlette 的类型声明无法表达“异常类与 handler 参数类型相关联”。
+    # FastAPI 会在运行时按异常类型正确分发，因此只在注册边界进行类型转换。
     app.add_exception_handler(
         StarletteHTTPException,
-        http_exception_handler,
+        cast(HTTPExceptionHandler, http_exception_handler),
     )
+
     app.add_exception_handler(
         RequestValidationError,
-        validation_exception_handler,
+        cast(HTTPExceptionHandler, validation_exception_handler),
     )
+
     app.add_exception_handler(
         Exception,
         unhandled_exception_handler,

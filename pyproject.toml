@@ -47,8 +47,10 @@ dependencies = [
 ]
 
 [tool.setuptools.packages.find]
-where = ["."]# 从 pyproject.toml 所在目录开始寻找包
-include = ["app", "app.*"]# 包含app本身，已经其所有的子包
+# 从 pyproject.toml 所在目录开始寻找包
+where = ["."]
+# 包含app本身，已经其所有的子包
+include = ["app", "app.*"]
 
 [project.optional-dependencies]
 dev = [
@@ -78,7 +80,8 @@ convention = "google"
 "__init__.py" = ["E402"]
 
 [tool.pyright]
-include = ["app"]
+# 同时检查应用代码和测试代码，避免测试辅助函数绕过类型门禁。
+include = ["app", "tests"]
 exclude = [
     "**/__pycache__",
     "**/.venv",
