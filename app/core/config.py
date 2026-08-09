@@ -1,11 +1,12 @@
-"""
-DeepSearch 配置管理模块
+"""DeepSearch 配置管理模块.
+
 设计思路：
     - 多环境支持（dev/staging/prod/test）
     - .env 文件按优先级加载
     - 所有配置项有安全默认值
     - 环境特定覆盖
 """
+
 import os
 from enum import Enum
 from pathlib import Path
@@ -18,6 +19,8 @@ from dotenv import load_dotenv
 # 双继承 str + Enum：既可比较又可序列化，enum.value 用于拼接 .env 文件名
 # ============================================================
 class Environment(str, Enum):
+    """应用支持的运行环境."""
+
     DEVELOPMENT = "development"
     STAGING = "staging"
     PRODUCTION = "production"
@@ -28,9 +31,10 @@ class Environment(str, Enum):
 # 环境检测函数
 # 从环境变量 APP_ENV 读取，默认 development
 # 使用 match-case（Python 3.10+）做模式匹配
-# case _: 兜底，任何未识别的值都回退到 development
+# 无法识别的值统一回退到 development
 # ============================================================
 def get_environment() -> Environment:
+    """读取 APP_ENV，并转换为受支持的运行环境."""
     match os.getenv("APP_ENV", "development").lower():
         case "production" | "prod":
             return Environment.PRODUCTION
@@ -54,6 +58,11 @@ def get_environment() -> Environment:
 #   dirname 第 3 次       → .../deep-research          ← 根目录
 # ============================================================
 def load_env_file() -> str | None:
+    """按优先级加载首个存在的环境变量文件.
+
+    Returns:
+        成功加载的文件路径；没有可用文件时返回 None。
+    """
     env = get_environment()
     print(f"Loading environment: {env.value}")
 
@@ -105,7 +114,10 @@ ENV_FILE = load_env_file()
 #   - __init__ 末尾调用 apply_environment_settings() 覆盖环境特定配置
 # ============================================================
 class Settings:
+    """集中保存应用运行所需的配置项."""
+
     def __init__(self):
+        """从环境变量加载配置，并应用当前环境的默认覆盖."""
         self.ENVIRONMENT = get_environment()
 
         # ---- 应用基本信息 ----
@@ -168,7 +180,9 @@ class Settings:
 
         # ---- Langfuse 可观测性 ----
         self.LANGFUSE_TRACING_ENABLED = os.getenv("LANGFUSE_TRACING_ENABLED", "false").lower() in (
-            "true", "1", "yes",
+            "true",
+            "1",
+            "yes",
         )
         self.LANGFUSE_PUBLIC_KEY = os.getenv("LANGFUSE_PUBLIC_KEY", "")
         self.LANGFUSE_SECRET_KEY = os.getenv("LANGFUSE_SECRET_KEY", "")
@@ -178,7 +192,7 @@ class Settings:
         self.apply_environment_settings()
 
     def apply_environment_settings(self):
-        """根据环境覆盖配置值。
+        """根据环境覆盖配置值.
 
         仅当对应的环境变量没有被显式设置时才覆盖，
         这样用户可以通过 .env 文件中的 DEBUG=false 来阻止 dev 环境自动设 DEBUG=True。

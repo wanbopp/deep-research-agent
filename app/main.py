@@ -1,4 +1,5 @@
-"""DeepResearch FastAPI 应用入口"""
+"""DeepResearch FastAPI 应用入口."""
+
 from asgi_correlation_id import CorrelationIdMiddleware
 from fastapi import FastAPI
 from starlette.middleware.cors import CORSMiddleware
