@@ -98,7 +98,7 @@ ENV_FILE = load_env_file()
 #
 # 配置分组：
 #   - 应用基本信息（PROJECT_NAME, VERSION, DEBUG）
-#   - LLM 配置（API_KEY, DEFAULT_MODEL, TEMPERATURE, MAX_RETRIES, TOTAL_TIMEOUT）
+#   - LLM 配置（API_KEY, BASE_URL, DEFAULT_MODEL, TEMPERATURE, MAX_RETRIES, TOTAL_TIMEOUT）
 #   - 数据库配置（POSTGRES_HOST/PORT/DB/USER/PASSWORD）
 #   - Neo4j 配置（NEO4J_URI/USER/PASSWORD）
 #   - Redis 配置（REDIS_HOST/PORT）
@@ -137,6 +137,7 @@ class Settings:
 
         # ---- LLM 配置 ----
         self.OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
+        self.OPENAI_BASE_URL = os.getenv("OPENAI_BASE_URL") or None
         self.DEFAULT_LLM_MODEL = os.getenv("DEFAULT_LLM_MODEL", "gpt-4o-mini")
         self.DEFAULT_LLM_TEMPERATURE = float(os.getenv("DEFAULT_LLM_TEMPERATURE", "0.2"))
         self.MAX_LLM_CALL_RETRIES = int(os.getenv("MAX_LLM_CALL_RETRIES", "3"))
