@@ -7,47 +7,47 @@
 .DEFAULT_GOAL := help
 
 ENV ?= development
+PYTHON ?= python
 
 # ---------------------------------------------------------------------------
 # Setup
 # ---------------------------------------------------------------------------
 install:
-	pip install uv
-	uv sync
-	uv run pre-commit install
+	$(PYTHON) -m pip install -e ".[dev,test]"
+	$(PYTHON) -m pre_commit install
 
 # ---------------------------------------------------------------------------
 # Server
 # ---------------------------------------------------------------------------
 dev:
-	uv run uvicorn app.main:app --reload --port 8000
+	$(PYTHON) -m uvicorn app.main:app --reload --port 8000
 
 # ---------------------------------------------------------------------------
 # Code quality
 # ---------------------------------------------------------------------------
 lint:
-	uv run ruff check .
+	$(PYTHON) -m ruff check ./app ./tests
 
 format:
-	uv run ruff format .
+	$(PYTHON) -m ruff format ./app ./tests
+
+format-check:
+	$(PYTHON) -m ruff format --check ./app ./tests
 
 typecheck:
-	uv run pyright
+	$(PYTHON) -m pyright --pythonpath ./.venv/Scripts/python.exe
 
-check: lint typecheck
+test:
+	$(PYTHON) -m pytest ./tests -v
+
+check: lint format-check typecheck test
 	@echo "All checks passed"
 
 # ---------------------------------------------------------------------------
 # Config verification (Lab 01)
 # ---------------------------------------------------------------------------
 verify-config:
-	uv run python -c "from app.core.config import settings; print(f'Config loaded: {settings.PROJECT_NAME} v{settings.VERSION} [{settings.ENVIRONMENT.value}]')"
-
-# ---------------------------------------------------------------------------
-# Misc
-# ---------------------------------------------------------------------------
-clean:
-	rm -rf .venv __pycache__ .pytest_cache
+	$(PYTHON) -c "from app.core.config import settings; print(f'Config loaded: {settings.PROJECT_NAME} v{settings.VERSION} [{settings.ENVIRONMENT.value}]')"
 
 # ---------------------------------------------------------------------------
 # Help
@@ -64,13 +64,12 @@ help:
 	@echo "Code quality:"
 	@echo "  lint            Ruff lint check"
 	@echo "  format          Ruff format"
+	@echo "  format-check    Verify formatting without changing files"
 	@echo "  typecheck       Pyright static type check"
-	@echo "  check           Run lint + typecheck"
+	@echo "  test            Run the test suite"
+	@echo "  check           Run lint + format-check + typecheck + test"
 	@echo ""
 	@echo "Config:"
 	@echo "  verify-config   Verify config.py loads correctly (Lab 01)"
-	@echo ""
-	@echo "Misc:"
-	@echo "  clean           Remove .venv, __pycache__, .pytest_cache"
 
-.PHONY: install dev lint format typecheck check verify-config clean help
+.PHONY: install dev lint format format-check typecheck test check verify-config help
