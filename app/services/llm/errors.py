@@ -69,3 +69,28 @@ class LLMTimeoutError(TimeoutError):
         self.timeout_seconds = timeout_seconds
 
         super().__init__(f"LLM call exceeded total timeout of {timeout_seconds:g} seconds")
+
+
+class StructuredOutputError(ValueError):
+    """结构化模型输出无法通过 schema 校验时抛出."""
+
+    def __init__(
+        self,
+        schema_name: str,
+        error_type: str,
+    ) -> None:
+        """保存安全错误摘要，不保存模型原文或原始异常."""
+        # 把 schema_name 保存为实例属性，
+        # 方便上层通过 error.schema_name 读取。
+        self.schema_name = schema_name
+
+        # 把 error_type 保存为实例属性。
+        # 这里保存 "ValidationError" 这样的类型名称，
+        # 不保存原始 Exception 对象。
+        self.error_type = error_type
+
+        # 构造固定、安全的异常消息。
+        # 只能使用 schema_name 和 error_type。
+        message = f"Structured output validation failed for {schema_name!r}: {error_type}"
+
+        super().__init__(message)  # 保存异常消息。

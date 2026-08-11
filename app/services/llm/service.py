@@ -242,8 +242,8 @@ class LLMService:
         async def invoke_text(model: BaseChatModel) -> BaseMessage:
             """使用当前 alias 对应的模型处理本次消息.
 
-            messages 只存在于公开的 call() 闭包中
-            内部弹性链路不在关系属于和输出的具体类型
+            messages 只存在于公开的 call() 闭包中；
+            内部弹性链路不再关心输入和输出的具体类型。
             """
             return await model.ainvoke(messages)
 
