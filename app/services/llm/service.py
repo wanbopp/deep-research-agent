@@ -1,9 +1,11 @@
 """Resilient LLM invocation service."""
 
 import asyncio
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from time import perf_counter
+from typing import TypeVar
 
+from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.messages import BaseMessage
 from openai import APIConnectionError, InternalServerError, RateLimitError
 from tenacity import (
@@ -24,7 +26,6 @@ from app.services.llm.registry import LLMRegistry
 # 接收异常并回答 "是否允许重试"
 RetryPredicate = Callable[[BaseException], bool]
 
-
 # 只列出明确具有临时性的 provider 异常
 # 是一个 tuple，里面可以放任意多个 Exception 的异常类
 _RETRYABLE_PROVIDER_ERRORS: tuple[type[Exception], ...] = (
@@ -32,6 +33,14 @@ _RETRYABLE_PROVIDER_ERRORS: tuple[type[Exception], ...] = (
     RateLimitError,
     InternalServerError,
 )
+
+
+OutputT = TypeVar("OutputT")
+
+# 接收当前 attempt 创建的模型，并异步返回调用结果。
+# OutputT 让整条 retry/fallback/timeout 链保留 invoker 的返回类型。
+# 一个函数，接收一个 BaseChatModel，调用后返回一个可以 await 的对象；await 完以后，得到 OutputT
+ModelInvoker = Callable[[BaseChatModel], Awaitable[OutputT]]
 
 
 def _is_retryable_provider_error(error: BaseException) -> bool:
@@ -69,23 +78,30 @@ class LLMService:
     async def _invoke_once(
         self,
         alias: str,
-        messages: Sequence[BaseMessage],
+        invoker: ModelInvoker[OutputT],
         overrides: Mapping[str, object] | None = None,
-    ) -> BaseMessage:
-        """使用指定 alias 完成一次异步模型调用."""
+    ) -> OutputT:
+        """使用指定 alias 完成一次异步模型调用.
+
+        - _invoke_once() 不再关心输入是文本消息还是结构化请求。
+        - 返回值从 BaseMessage 改为 OutputT；invoker 返回什么类型，本方法就返回什么类型。
+        - Registry 职责不变；它仍然只负责创建当前 alias 对应的模型。
+        """
         # 通过 Registry 创建 model。
         model = self._registry.get(alias=alias, overrides=overrides)
 
-        # 异步调用模型，并直接返回 BaseMessage。
-        return await model.ainvoke(messages)
+        # 具体调用方式由公开入口注入：
+        # text 路径会执行 model.ainvoke(messages),
+        # structured 路径以后会执行 wrapped_model.ainvoke(messages)
+        return await invoker(model)
 
     async def _invoke_with_retry(
         self,
         alias: str,
-        messages: Sequence[BaseMessage],
+        invoker: ModelInvoker[OutputT],
         overrides: Mapping[str, object] | None = None,
-    ) -> BaseMessage:
-        """对指定模型执行有限次数的异步重试."""
+    ) -> OutputT:
+        """对指定模型执行有限次数的异步重试，并原样返回 invoker 的结果类型."""
         retrying = AsyncRetrying(
             # max_attempts 包含第一次调用。
             stop=stop_after_attempt(self._max_attempts),
@@ -109,9 +125,9 @@ class LLMService:
                 attempt_started_at = perf_counter()
                 try:
                     return await self._invoke_once(
-                        alias,
-                        messages,
-                        overrides,
+                        alias=alias,
+                        invoker=invoker,
+                        overrides=overrides,
                     )
                 except Exception as error:
                     logger.warning(
@@ -132,12 +148,12 @@ class LLMService:
 
     async def _call_with_fallback(
         self,
-        messages: Sequence[BaseMessage],
-        *,  # 后续参数必须通过关键字传递，避免 messages 与 aliases 位置混淆。
+        invoker: ModelInvoker[OutputT],
+        *,  # 策略参数必须通过关键字传递，避免 aliases 与 overrides 混淆。
         aliases: Sequence[str],
         overrides: Mapping[str, object] | None = None,
-    ) -> BaseMessage:
-        """按照 alias 顺序执行 retry 和 fallback."""
+    ) -> OutputT:
+        """按照 alias 顺序执行 retry 和 fallback，并返回 invoker 的结果."""
         # str 本身也是 Sequence[str]，但传入 "primary" 会被逐字符遍历，
         # 因此需要显式拒绝字符串和空序列。
         if isinstance(aliases, str) or not aliases:
@@ -150,9 +166,9 @@ class LLMService:
         for alias in aliases:
             try:
                 return await self._invoke_with_retry(
-                    alias,
-                    messages,
-                    overrides,
+                    alias=alias,
+                    invoker=invoker,
+                    overrides=overrides,
                 )
             except Exception as error:
                 # non-retryable error 不应该 fallback。
@@ -178,13 +194,13 @@ class LLMService:
         # 只有所有 alias 都因 retryable error 耗尽时才会到这里。
         raise AllModelsFailedError(tuple(failures))
 
-    async def call(
+    async def _execute(
         self,
-        messages: Sequence[BaseMessage],
+        invoker: ModelInvoker[OutputT],
         *,
         aliases: Sequence[str],
         overrides: Mapping[str, object] | None = None,
-    ) -> BaseMessage:
+    ) -> OutputT:
         """在总时间预算内执行完整 retry 和 fallback 链."""
         # 保存 timeout 对象，异常发生后可以检查究竟是不是总预算到期。
         timeout_context = asyncio.timeout(
@@ -194,7 +210,7 @@ class LLMService:
         try:
             async with timeout_context:
                 return await self._call_with_fallback(
-                    messages,
+                    invoker=invoker,
                     aliases=aliases,
                     overrides=overrides,
                 )
@@ -213,3 +229,26 @@ class LLMService:
             raise LLMTimeoutError(
                 self._total_timeout_seconds,
             ) from None
+
+    async def call(
+        self,
+        messages: Sequence[BaseMessage],
+        *,
+        aliases: Sequence[str],
+        overrides: Mapping[str, object] | None = None,
+    ) -> BaseMessage:
+        """使用共享弹性链路执行普通文本模型调用."""
+
+        async def invoke_text(model: BaseChatModel) -> BaseMessage:
+            """使用当前 alias 对应的模型处理本次消息.
+
+            messages 只存在于公开的 call() 闭包中
+            内部弹性链路不在关系属于和输出的具体类型
+            """
+            return await model.ainvoke(messages)
+
+        return await self._execute(
+            invoke_text,
+            aliases=aliases,
+            overrides=overrides,
+        )
