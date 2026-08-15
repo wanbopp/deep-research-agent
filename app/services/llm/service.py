@@ -7,6 +7,8 @@ from typing import TypeVar
 
 from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.messages import BaseMessage
+from langchain_core.exceptions import OutputParserException
+from pydantic import BaseModel, ValidationError
 from openai import APIConnectionError, InternalServerError, RateLimitError
 from tenacity import (
     AsyncRetrying,
@@ -20,6 +22,7 @@ from app.services.llm.errors import (
     AllModelsFailedError,
     LLMTimeoutError,
     ModelFailure,
+    StructuredOutputError,
 )
 from app.services.llm.registry import LLMRegistry
 
@@ -34,7 +37,10 @@ _RETRYABLE_PROVIDER_ERRORS: tuple[type[Exception], ...] = (
     InternalServerError,
 )
 
+# 表示最终必须是某种 Pydantic BaseModel 子类,只能返回 Pydantic BaseModel。
+StructuredT = TypeVar("StructuredT", bound=BaseModel)
 
+# 表示内部执行链可以返回任意类型
 OutputT = TypeVar("OutputT")
 
 # 接收当前 attempt 创建的模型，并异步返回调用结果。
@@ -252,3 +258,42 @@ class LLMService:
             aliases=aliases,
             overrides=overrides,
         )
+
+    async def call_structured(
+        self,
+        messages: Sequence[BaseMessage],
+        *,
+        response_model: type[StructuredT],
+        aliases: Sequence[str],
+        overrides: Mapping[str, object] | None = None,
+    ) -> StructuredT:
+        """使用共享弹性链路调用模型，并返回校验后的 Pydantic 对象."""
+
+        async def invoke_structured(
+            model: BaseChatModel,
+        ) -> StructuredT:
+            """为当前模型绑定响应 schema，并校验最终结果."""
+            # 调用 model.with_structured_output(response_model)
+            # 得到只服务于当前 attempt 的 structured runnable。
+            structured_model = model.with_structured_output(
+                response_model,
+                method="function_calling",  # 利用 tool-calling 协议，让模型按照固定参数结构返回数据
+            )
+            try:
+                # 异步调用 structured runnable，传入 messages。
+                result = await structured_model.ainvoke(messages)
+                # 使用 response_model.model_validate(result)
+                # 对 LangChain 的结果再守一次最终类型。
+                return response_model.model_validate(result)
+
+            except (OutputParserException, ValidationError) as error:
+                # 转换成 StructuredOutputError。
+                # 使用 from None 隐藏可能包含原始输出的异常链。
+                raise StructuredOutputError(
+                    schema_name=response_model.__name__,
+                    error_type=type(error).__name__,
+                ) from None
+
+        # 调用 self._execute()。
+        # 传入 invoke_structured、aliases 和 overrides。
+        return await self._execute(invoker=invoke_structured, aliases=aliases, overrides=overrides)

@@ -52,6 +52,11 @@ where = ["."]
 # 包含app本身，已经其所有的子包
 include = ["app", "app.*"]
 
+# Prompt 是运行时资源而不是 Python 模块，必须显式打入 wheel。
+# 否则 editable 安装时可读取，正式构建安装后却可能缺少模板文件。
+[tool.setuptools.package-data]
+"app.agents.prompts" = ["*.md"]
+
 [project.optional-dependencies]
 dev = [
     "ruff",
