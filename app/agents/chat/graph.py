@@ -2,6 +2,8 @@
 
 from typing import Protocol
 from collections.abc import Awaitable
+
+from langgraph.checkpoint.base import BaseCheckpointSaver
 from langgraph.graph import END, START, StateGraph
 from langgraph.graph.state import CompiledStateGraph
 
@@ -26,12 +28,24 @@ class ChatNode(Protocol):
         ...
 
 
-def build_chat_graph(chat_node: ChatNode) -> CompiledStateGraph:
-    """注册单个 chat node 并编译START 到END最小图."""
+def build_chat_graph(
+    chat_node: ChatNode,
+    *,
+    checkpointer: BaseCheckpointSaver[str] | None = None,
+) -> CompiledStateGraph:
+    """注册单个 chat node 并编译START 到END最小图.
+
+    并按需注入短期状态存储.
+    """
     builder = StateGraph(ChatState)
 
     builder.add_node("chat", chat_node)
     builder.add_edge(START, "chat")
     builder.add_edge("chat", END)
 
-    return builder.compile()
+    # checkpointer=none 时保持原来的无状态行为。
+    # 调用方注入 InMemorySaver 时，LangGraph 会按 thread_id
+    # 保存并恢复每次执行完成后的 ChatState
+    return builder.compile(
+        checkpointer=checkpointer,
+    )

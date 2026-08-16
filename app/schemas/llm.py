@@ -47,3 +47,11 @@ class ModelSpec(BaseModel):
     capabilities: frozenset[str] = Field(
         default_factory=lambda: frozenset({"text"}),
     )
+
+    # 限制单次 provider 网络请求的等待时间。
+    # 它必须短于 LLMService 的整体预算，
+    # 为异常记录、重试判断和 fallback 留出时间。
+    request_timeout_seconds: float = Field(
+        default=45.0,
+        gt=0,
+    )

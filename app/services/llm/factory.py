@@ -21,6 +21,7 @@ def create_openai_chat_model(
         "api_key": spec.api_key,
         "temperature": spec.temperature,
         "max_completion_tokens": spec.max_tokens,
+        "timeout": spec.request_timeout_seconds,
         # Lab 06 会统一实现 retry，关闭 ChatOpenAI 内部重试。
         "max_retries": 0,
     }

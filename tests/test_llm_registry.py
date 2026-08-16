@@ -59,6 +59,7 @@ def test_model_spec_rejects_invalid_default_parameters() -> None:
         {"temperature": -0.01},
         {"temperature": 2.01},
         {"max_tokens": 0},
+        {"request_timeout_seconds": 0},
     )
 
     for overrides in invalid_overrides:
@@ -173,3 +174,4 @@ def test_registry_and_openai_factory_keep_call_overrides_isolated() -> None:
     assert client.max_retries == 0
     assert client.openai_api_base == "https://example.invalid/v1"
     assert secret not in repr(client)
+    assert client.request_timeout == 45.0
