@@ -8,6 +8,7 @@ from typing import TypeVar
 from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.messages import BaseMessage
 from langchain_core.exceptions import OutputParserException
+from langchain_core.tools import BaseTool
 from pydantic import BaseModel, ValidationError
 from openai import APIConnectionError, InternalServerError, RateLimitError
 from tenacity import (
@@ -241,9 +242,12 @@ class LLMService:
         messages: Sequence[BaseMessage],
         *,
         aliases: Sequence[str],
+        tools: Sequence[BaseTool] | None = None,
         overrides: Mapping[str, object] | None = None,
     ) -> BaseMessage:
         """使用共享弹性链路执行普通文本模型调用."""
+        # 固定本次调用的工具快照，不能保存到 self。
+        call_tools = tuple(tools or ())
 
         async def invoke_text(model: BaseChatModel) -> BaseMessage:
             """使用当前 alias 对应的模型处理本次消息.
@@ -251,7 +255,11 @@ class LLMService:
             messages 只存在于公开的 call() 闭包中；
             内部弹性链路不再关心输入和输出的具体类型。
             """
-            return await model.ainvoke(messages)
+            # bind_tools 返回新的 runnable，需要保留它。
+            runnable = model.bind_tools(call_tools) if call_tools else model
+
+            # 必须调用绑定后的 runnable，而不是原始 model。
+            return await runnable.ainvoke(messages)
 
         return await self._execute(
             invoke_text,
