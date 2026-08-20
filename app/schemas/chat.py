@@ -4,7 +4,7 @@
 或 LangGraph 的 ChatState。这样框架内部对象发生变化时，公开 API 仍能保持稳定。
 """
 
-from typing import Literal, Annotated
+from typing import Annotated, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
@@ -148,4 +148,57 @@ class ChatResumeRequest(BaseModel):
 ChatAPIResponse = Annotated[
     ChatResponse | ChatInterruptResponse,
     Field(discriminator="status"),
+]
+
+
+# 流事件在应用层表达“Agent 正在发生什么”；下一层才会把
+# 这些对象编码成 SSE event/data 文本。
+class _ChatStreamEventBase(BaseModel):
+    """所有聊天流事件共享的严格模型配置."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+
+class TokenStreamEvent(_ChatStreamEventBase):
+    """模型生成的一段客户端可见文本."""
+
+    event: Literal["token"] = "token"
+    text: str = Field(min_length=1)
+
+
+class ToolStreamEvent(_ChatStreamEventBase):
+    """工具调用开始或结束事件."""
+
+    event: Literal["tool"] = "tool"
+    name: str = Field(min_length=1, max_length=128)
+    tool_call_id: str = Field(min_length=1, max_length=256)
+    status: Literal["started", "success", "error"]
+
+
+class InterruptStreamEvent(_ChatStreamEventBase):
+    """Agent 等待人工输入."""
+
+    event: Literal["interrupt"] = "interrupt"
+    question: str = Field(min_length=1, max_length=MAX_MESSAGE_LENGTH)
+
+
+class ErrorStreamEvent(_ChatStreamEventBase):
+    """流开始后发生的安全错误事件."""
+
+    event: Literal["error"] = "error"
+    code: str = Field(min_length=1, max_length=128)
+    message: str = Field(min_length=1, max_length=512)
+
+
+class DoneStreamEvent(_ChatStreamEventBase):
+    """一次流正常结束."""
+
+    event: Literal["done"] = "done"
+    status: Literal["completed", "interrupted"]
+
+
+# event 是判别字段；Pydantic 根据它直接选择唯一事件模型。
+ChatStreamEvent = Annotated[
+    TokenStreamEvent | ToolStreamEvent | InterruptStreamEvent | ErrorStreamEvent | DoneStreamEvent,
+    Field(discriminator="event"),
 ]
