@@ -3,7 +3,7 @@
 from typing import Any
 
 from fastapi import APIRouter, status
-
+from app.api.v1.chat import router as chat_router
 from app.api.v1.health import router as health_router
 from app.schemas.base import ErrorResponse
 
@@ -29,3 +29,5 @@ COMMON_ERROR_RESPONSES: dict[int | str, dict[str, Any]] = {
 api_router = APIRouter(responses=COMMON_ERROR_RESPONSES)
 
 api_router.include_router(health_router)
+
+api_router.include_router(chat_router)
