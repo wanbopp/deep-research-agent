@@ -4,7 +4,7 @@
 或 LangGraph 的 ChatState。这样框架内部对象发生变化时，公开 API 仍能保持稳定。
 """
 
-from typing import Literal
+from typing import Literal, Annotated
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
@@ -141,3 +141,11 @@ class ChatResumeRequest(BaseModel):
     def normalize_text_fields(cls, value: object) -> object:
         """清理会话标识和恢复回答的首尾空白."""
         return _strip_text(value)
+
+
+# status 是判别字段。Pydantic 根据它的 Literal 值选择唯一响应模型，
+# FastAPI 也会据此生成带 discriminator 的 OpenAPI oneOf。
+ChatAPIResponse = Annotated[
+    ChatResponse | ChatInterruptResponse,
+    Field(discriminator="status"),
+]

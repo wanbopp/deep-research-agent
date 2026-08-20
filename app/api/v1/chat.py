@@ -5,9 +5,9 @@ from typing import Annotated
 from fastapi import APIRouter, Depends
 from app.api.dependencies import get_chat_service
 from app.schemas.chat import (
+    ChatAPIResponse,
     ChatInterruptResponse,
     ChatRequest,
-    ChatResponse,
     ChatResumeRequest,
 )
 from app.services.chat import ChatInterrupt, ChatService, ChatTurnResult
@@ -21,8 +21,6 @@ ChatServiceDependency = Annotated[
         get_chat_service
     ),  # FastAPI的依赖注入声明，告诉FastAPI在路由处理时自动调用 用 get_chat_service 来获取 ChatService 实例
 ]
-
-ChatAPIResponse = ChatResponse | ChatInterruptResponse
 
 
 def _to_api_response(result: ChatTurnResult) -> ChatAPIResponse:
