@@ -50,8 +50,8 @@ def build_chat_graph(
     """构建聊天图，并按需启用工具循环和短期状态存储."""
     builder = StateGraph(ChatState)
 
-    builder.add_node("chat", chat_node)
-    builder.add_edge(START, "chat")
+    builder.add_node("chat", chat_node)  # chat_node 是一个调用LLM执行一次请求
+    builder.add_edge(START, "chat")  # 图的开始节点从这里开始
 
     if tool_node is None:
         # 未注入工具节点时保留 Lab 08 的最小聊天图：

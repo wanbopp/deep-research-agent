@@ -1,8 +1,11 @@
-"""Node implementations for the minimal chat Agent."""
+"""Node implementations for the chat Agent."""
 
+import asyncio
 from collections.abc import Sequence
 
+from langgraph.errors import GraphBubbleUp
 from langchain_core.messages import AIMessage, ToolMessage
+from langchain_core.messages.tool import ToolCall
 
 from app.agents.chat.graph import StateNode
 from app.agents.chat.state import ChatState
@@ -46,12 +49,74 @@ def create_chat_node(
 
 
 def create_tool_node(
-    registry: ToolRegistry,
+    registry: ToolRegistry,  # 位置参数：可以按位置或按名称传
+    *,  # 分隔符：之后的参数必须按名称传
+    tool_timeout_seconds: float = 10.0,  # keyword-only 参数
 ) -> StateNode:
-    """创建执行单个工具调用的异步节点."""
+    """创建并发执行一个或多个工具调用的异步节点.
+
+    LLM 返回的 tool_calls 可能包含多条调用。这个节点会为每条
+    ToolCall 创建一个协程，由 asyncio.gather() 并发等待，再返回
+    顺序稳定的 ToolMessage 列表，交给 add_messages 追加到状态。
+
+    gather() 按输入协程的顺序返回结果，而不是按完成时间排序。
+    因此即使 call-2 最先完成，输出仍保持 call-1、call-2、call-3，
+    便于模型按 tool_call_id 找到每条调用对应的工具结果。
+    """
+    if tool_timeout_seconds <= 0:
+        raise ValueError("tool_timeout_seconds must be greater than 0")
+
+    async def _execute_tool_call(tool_call: ToolCall) -> ToolMessage:
+        """执行一条调用，并转换为成功或错误 ToolMessage."""
+        tool_call_id = tool_call["id"]
+        if not isinstance(tool_call_id, str) or not tool_call_id:
+            raise ValueError("tool call id must be a non-empty string")
+
+        tool_name = tool_call["name"]
+
+        try:
+            tool = registry.resolve(tool_name)
+        except LookupError:
+            return ToolMessage(
+                content=f"Tool {tool_name!r} is not available.",
+                name=tool_name,
+                tool_call_id=tool_call_id,
+                status="error",
+            )
+
+        try:
+            async with asyncio.timeout(tool_timeout_seconds):
+                result = await tool.ainvoke(tool_call["args"])
+        except TimeoutError:
+            return ToolMessage(
+                content=f"Tool {tool_name!r} timed out.",
+                name=tool_name,
+                tool_call_id=tool_call_id,
+                status="error",
+            )
+        except GraphBubbleUp:
+            # interrupt 和其他 LangGraph 控制流不能转换成错误消息。
+            # 必须交还 LangGraph 调度器，由它保存暂停状态。
+            raise
+        except Exception as error:
+            # 每条协程在内部把普通执行异常转换为错误消息，使一个工具
+            # 失败时 gather() 仍能收集其他工具的成功结果。
+            # 只暴露异常类型，不把可能包含敏感数据的 str(error) 交给模型。
+            return ToolMessage(
+                content=(f"Tool {tool_name!r} failed with {type(error).__name__}."),
+                name=tool_name,
+                tool_call_id=tool_call_id,
+                status="error",
+            )
+
+        return ToolMessage(
+            content=str(result),
+            name=tool.name,
+            tool_call_id=tool_call_id,
+        )
 
     async def tool_node(state: ChatState) -> ChatState:
-        """执行最后一条 AIMessage 中的单个工具调用."""
+        """并发执行最后一条 AIMessage 中的全部工具调用."""
         messages = state["messages"]
         if not messages:
             raise ValueError("tool node requires at least one message")
@@ -62,46 +127,14 @@ def create_tool_node(
         if not isinstance(last_message, AIMessage):
             raise TypeError("tool node requires the last message to be an AIMessage")
 
-        # 本 checkpoint 只处理单个调用；多个调用会在后续并发阶段实现。
-        if len(last_message.tool_calls) != 1:
-            raise ValueError("tool node requires exactly one tool call")
+        tool_calls = last_message.tool_calls
+        if not tool_calls:
+            raise ValueError("tool node requires at least one tool call")
 
-        tool_call = last_message.tool_calls[0]
-        tool_call_id = tool_call["id"]
+        # 所有协程在 gather() 调用时一起开始推进；返回列表仍与
+        # tool_calls 的输入顺序一致，不受各工具完成先后的影响。
+        outputs = await asyncio.gather(*(_execute_tool_call(tool_call) for tool_call in tool_calls))
 
-        # LangChain 的 ToolCall.id 类型允许 None，但 ToolMessage 必须使用
-        # 非空字符串才能与模型提出的调用准确配对。
-        if not isinstance(tool_call_id, str) or not tool_call_id:
-            raise ValueError("tool call id must be a non-empty string")
-
-        try:
-            tool = registry.resolve(tool_call["name"])
-        except LookupError:
-            # 未知工具通常来自模型决策偏差。把错误作为 ToolMessage
-            # 返回后，模型可以在下一轮选择其他工具或修正答案。
-            return {
-                "messages": [
-                    ToolMessage(
-                        content=f"Tool {tool_call['name']!r} is not available.",
-                        name=tool_call["name"],
-                        tool_call_id=tool_call_id,
-                        status="error",
-                    )
-                ]
-            }
-
-        # 这里只把模型已经通过 schema 生成的参数交给白名单工具。
-        # 工具结果转换为字符串后，作为下一轮模型可以读取的消息内容。
-        result = await tool.ainvoke(tool_call["args"])
-
-        return {
-            "messages": [
-                ToolMessage(
-                    content=str(result),
-                    name=tool.name,
-                    tool_call_id=tool_call_id,
-                )
-            ]
-        }
+        return {"messages": list(outputs)}
 
     return tool_node
