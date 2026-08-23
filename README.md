@@ -32,13 +32,24 @@ Copy-Item .env.example .env.development
 
 ## Run the API
 
+Run the command from the Python project root so imports, environment files, and
+the project-local virtual environment resolve consistently:
+
 ```powershell
-python -m uvicorn app.main:app --reload --port 8000
+Set-Location E:\workspace\Agent\DeepResearch\deep-research
+.\.venv\Scripts\python.exe -m uvicorn app.main:app --reload --host 127.0.0.1 --port 8000
 ```
 
 - Health check: <http://127.0.0.1:8000/api/v1/health>
-- Swagger UI: <http://127.0.0.1:8000/api/v1/docs>
+- Swagger UI: <http://127.0.0.1:8000/docs>
 - OpenAPI JSON: <http://127.0.0.1:8000/api/v1/openapi.json>
+
+Application startup enters the FastAPI lifespan first. The required PostgreSQL
+dependency must be reachable before Uvicorn starts accepting HTTP requests.
+On Windows, keep `--reload` for the current development command: this Uvicorn
+subprocess path uses a Selector event loop compatible with psycopg async. The
+single-process Windows path uses a Proactor loop and is not the supported local
+development path for this project.
 
 ## Quality checks
 

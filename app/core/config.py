@@ -150,8 +150,20 @@ class Settings:
         self.POSTGRES_DB = os.getenv("POSTGRES_DB", "deep_research_db")
         self.POSTGRES_USER = os.getenv("POSTGRES_USER", "postgres")
         self.POSTGRES_PASSWORD = os.getenv("POSTGRES_PASSWORD", "postgres")
-        self.POSTGRES_POOL_SIZE = int(os.getenv("POSTGRES_POOL_SIZE", "20"))
-        self.POSTGRES_MAX_OVERFLOW = int(os.getenv("POSTGRES_MAX_OVERFLOW", "10"))
+        # PostgreSQL 目前有两类独立消费者，必须分别设置连接预算：
+        # 1. 原生 psycopg pool：供依赖探针和后续 LangGraph checkpointer 使用；
+        # 2. SQLAlchemy pool：供 SQLModel Repository 和业务事务使用。
+        #
+        # 三个默认值采用 Checkpoint 8A 确认的 5/5/5 预算。单进程在突发情况下
+        # 最多占用 5 + 5 + 5 = 15 个 PostgreSQL 连接，不能再把同一组配置复制
+        # 给两套连接池，否则 worker 数量增加时会迅速耗尽数据库连接。
+        self.POSTGRES_PSYCOPG_POOL_SIZE = int(
+            os.getenv("POSTGRES_PSYCOPG_POOL_SIZE", "5")
+        )
+        self.POSTGRES_ORM_POOL_SIZE = int(os.getenv("POSTGRES_ORM_POOL_SIZE", "5"))
+        self.POSTGRES_ORM_MAX_OVERFLOW = int(
+            os.getenv("POSTGRES_ORM_MAX_OVERFLOW", "5")
+        )
 
         # ---- Neo4j 图数据库 ----
         self.NEO4J_URI = os.getenv("NEO4J_URI", "bolt://localhost:7687")

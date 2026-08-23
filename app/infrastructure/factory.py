@@ -32,8 +32,7 @@ def create_application_resources(config: Settings) -> ApplicationResources:
     # 关键参数：
     # - conninfo=postgres_conninfo
     # - min_size=0
-    # - max_size=config.POSTGRES_POOL_SIZE
-    #   + config.POSTGRES_MAX_OVERFLOW
+    # - max_size=config.POSTGRES_PSYCOPG_POOL_SIZE
     # - open=False
     #
     # open=False 很重要：factory 只构造资源，
@@ -41,7 +40,7 @@ def create_application_resources(config: Settings) -> ApplicationResources:
     postgres_pool: AsyncConnectionPool[AsyncConnection[Any]] = AsyncConnectionPool(
         conninfo=postgres_conninfo,
         min_size=0,
-        max_size=config.POSTGRES_POOL_SIZE + config.POSTGRES_MAX_OVERFLOW,
+        max_size=config.POSTGRES_PSYCOPG_POOL_SIZE,
         open=False,
         timeout=CONNECTION_TIMEOUT_SECONDS,
     )
