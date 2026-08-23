@@ -157,13 +157,9 @@ class Settings:
         # 三个默认值采用 Checkpoint 8A 确认的 5/5/5 预算。单进程在突发情况下
         # 最多占用 5 + 5 + 5 = 15 个 PostgreSQL 连接，不能再把同一组配置复制
         # 给两套连接池，否则 worker 数量增加时会迅速耗尽数据库连接。
-        self.POSTGRES_PSYCOPG_POOL_SIZE = int(
-            os.getenv("POSTGRES_PSYCOPG_POOL_SIZE", "5")
-        )
+        self.POSTGRES_PSYCOPG_POOL_SIZE = int(os.getenv("POSTGRES_PSYCOPG_POOL_SIZE", "5"))
         self.POSTGRES_ORM_POOL_SIZE = int(os.getenv("POSTGRES_ORM_POOL_SIZE", "5"))
-        self.POSTGRES_ORM_MAX_OVERFLOW = int(
-            os.getenv("POSTGRES_ORM_MAX_OVERFLOW", "5")
-        )
+        self.POSTGRES_ORM_MAX_OVERFLOW = int(os.getenv("POSTGRES_ORM_MAX_OVERFLOW", "5"))
 
         # ---- Neo4j 图数据库 ----
         self.NEO4J_URI = os.getenv("NEO4J_URI", "bolt://localhost:7687")
