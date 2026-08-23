@@ -1,0 +1,110 @@
+name: deep-research
+
+services:
+  postgres:
+    image: pgvector/pgvector:0.8.6-pg17-trixie
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-deep_research_db}
+      POSTGRES_USER: ${POSTGRES_USER:-deep_research}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set}
+    ports:
+      - "${INFRA_BIND_IP:-127.0.0.1}:5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "pg_isready -h 127.0.0.1 -U \"$${POSTGRES_USER}\" -d \"$${POSTGRES_DB}\"",
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+    mem_limit: 768m
+    shm_size: 128m
+    logging: &default-logging
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    networks:
+      - infrastructure
+
+  neo4j:
+    image: neo4j:2026.07.1
+    restart: unless-stopped
+    environment:
+      NEO4J_AUTH: neo4j/${NEO4J_PASSWORD:?NEO4J_PASSWORD must be set}
+      NEO4J_server_memory_heap_initial__size: 384m
+      NEO4J_server_memory_heap_max__size: 384m
+      NEO4J_server_memory_pagecache_size: 384m
+    ports:
+      - "${INFRA_BIND_IP:-127.0.0.1}:7474:7474"
+      - "${INFRA_BIND_IP:-127.0.0.1}:7687:7687"
+    volumes:
+      - neo4j_data:/data
+      - neo4j_logs:/logs
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "cypher-shell -a bolt://127.0.0.1:7687 -u neo4j -p \"$${NEO4J_AUTH#neo4j/}\" 'RETURN 1;' >/dev/null 2>&1",
+        ]
+      interval: 15s
+      timeout: 10s
+      retries: 20
+      start_period: 60s
+    mem_limit: 1536m
+    logging: *default-logging
+    networks:
+      - infrastructure
+
+  redis:
+    image: redis:7.4.10-alpine
+    restart: unless-stopped
+    environment:
+      REDIS_PASSWORD: ${REDIS_PASSWORD:?REDIS_PASSWORD must be set}
+    command:
+      - sh
+      - -ec
+      - >-
+        exec redis-server
+        --appendonly yes
+        --save "60 1"
+        --requirepass "$${REDIS_PASSWORD}"
+        --maxmemory 192mb
+        --maxmemory-policy allkeys-lru
+    ports:
+      - "${INFRA_BIND_IP:-127.0.0.1}:6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "redis-cli --no-auth-warning -a \"$${REDIS_PASSWORD}\" ping | grep -q PONG",
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+    mem_limit: 256m
+    logging: *default-logging
+    networks:
+      - infrastructure
+
+networks:
+  infrastructure:
+    name: deep-research-infrastructure
+
+volumes:
+  postgres_data:
+    name: deep-research-postgres-data
+  neo4j_data:
+    name: deep-research-neo4j-data
+  neo4j_logs:
+    name: deep-research-neo4j-logs
+  redis_data:
+    name: deep-research-redis-data

@@ -6,14 +6,18 @@ from starlette.middleware.cors import CORSMiddleware
 
 from app.api.v1.api import api_router
 from app.core.config import settings
-from app.core.middleware import RequestLoggingMiddleware
 from app.core.exception_handlers import register_exception_handlers
+from app.core.middleware import RequestLoggingMiddleware
+from app.infrastructure.lifespan import lifespan
 
 app = FastAPI(
     title=settings.PROJECT_NAME,
     version=settings.VERSION,
     description=settings.DESCRIPTION,
     openapi_url=f"{settings.API_V1_STR}/openapi.json",
+    # lifespan 是应用级资源所有权边界。Uvicorn 启动时先进入它，只有 startup
+    # 成功并执行到 yield 后才开始接收请求；关闭时再执行 yield 后的清理逻辑。
+    lifespan=lifespan,
 )
 
 # 注册异常处理的handler

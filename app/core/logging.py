@@ -178,6 +178,12 @@ def setup_logging() -> None:
         force=True,
     )
 
+    # 数据库驱动的原始连接诊断可能包含主机、端口或连接参数，不适合直接进入
+    # 应用日志。依赖状态统一由 infrastructure probe 记录稳定状态和安全错误代码，
+    # 因此关闭这些驱动自己的日志输出，不影响项目内其他标准库日志。
+    for logger_name in ("neo4j", "psycopg", "psycopg.pool", "redis"):
+        logging.getLogger(logger_name).setLevel(logging.CRITICAL + 1)
+
     # structlog 这里只做字段加工，不做最终渲染。
     # wrap_for_formatter 会把 event_dict 交给各 handler 的 ProcessorFormatter：
     #   - console_handler -> ConsoleRenderer
