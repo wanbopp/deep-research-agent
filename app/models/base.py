@@ -6,6 +6,17 @@ from uuid import UUID, uuid4
 from sqlalchemy import DateTime
 from sqlmodel import Field, SQLModel
 
+# 约束名是 migration 的稳定接口。没有命名规则时 PostgreSQL 会自行生成名字，
+# 后续 downgrade 或修改外键就必须猜数据库方言的命名结果。
+# CheckConstraint 已在具体模型中显式命名，因此这里不覆盖 ck 规则。
+NAMING_CONVENTION = {
+    "ix": "ix_%(table_name)s_%(column_0_name)s",
+    "uq": "uq_%(table_name)s_%(column_0_name)s",
+    "fk": "fk_%(table_name)s_%(column_0_name)s_%(referred_table_name)s",
+    "pk": "pk_%(table_name)s",
+}
+SQLModel.metadata.naming_convention = NAMING_CONVENTION
+
 
 class UTCDateTime(DateTime):
     """始终创建 ``timezone=True`` 的 SQLAlchemy DateTime 类型.

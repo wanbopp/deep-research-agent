@@ -9,6 +9,7 @@ from psycopg_pool import AsyncConnectionPool
 from redis.asyncio import Redis
 
 from app.core.config import Settings
+from app.infrastructure.database import create_orm_runtime
 from app.infrastructure.resources import ApplicationResources
 
 CONNECTION_TIMEOUT_SECONDS = 5.0
@@ -45,6 +46,11 @@ def create_application_resources(config: Settings) -> ApplicationResources:
         timeout=CONNECTION_TIMEOUT_SECONDS,
     )
 
+    # SQLModel Repository 使用 SQLAlchemy AsyncEngine，而 LangGraph checkpointer
+    # 和依赖探针继续使用上面的原生 psycopg pool。两套池职责不同、预算独立。
+    # 此处只构造 Engine/sessionmaker，不建立连接，也不执行任何 DDL。
+    orm_engine, orm_session_factory = create_orm_runtime(config)
+
     # 使用 AsyncGraphDatabase.driver() 创建惰性 Neo4j Driver。
     #
     # 参数：
@@ -76,9 +82,12 @@ def create_application_resources(config: Settings) -> ApplicationResources:
         decode_responses=True,
     )
 
-    # 把三个客户端放入 ApplicationResources。
+    # 把所有应用级共享客户端放入 ApplicationResources。
+    # 注意这里只保存 sessionmaker，绝不能创建一个全局 AsyncSession 放进 app.state。
     return ApplicationResources(
         postgres_pool=postgres_pool,
+        orm_engine=orm_engine,
+        orm_session_factory=orm_session_factory,
         neo4j_driver=neo4j_driver,
         redis_client=redis_client,
     )

@@ -42,8 +42,10 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         # AsyncExitStack 按照后进先出（LIFO）执行：
         # 1. 最后登记 Redis，所以最先关闭 Redis；
         # 2. 然后关闭 Neo4j；
-        # 3. 最后关闭 PostgreSQL pool。
+        # 3. 再释放 SQLAlchemy ORM engine 的连接池；
+        # 4. 最后关闭原生 PostgreSQL pool。
         stack.push_async_callback(resources.postgres_pool.close)
+        stack.push_async_callback(resources.orm_engine.dispose)
         stack.push_async_callback(resources.neo4j_driver.close)
         stack.push_async_callback(resources.redis_client.aclose)
 
