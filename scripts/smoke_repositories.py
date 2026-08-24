@@ -1,4 +1,4 @@
-"""在隔离的真实数据库上运行 Repository 与事务验收测试。
+"""在隔离的真实数据库上运行 Repository 与事务验收测试.
 
 本脚本创建一个随机命名的 PostgreSQL 数据库，使用真实 Alembic 迁移升级，
 执行生产 Repository/service 类，最后在 ``finally`` 中删除该数据库。
@@ -37,12 +37,16 @@ CONNECTION_TIMEOUT_SECONDS = 10
 
 
 def _elapsed_ms(started_at: float) -> float:
-    """返回耗时毫秒数，不暴露连接配置。"""
+    """返回耗时毫秒数，不暴露连接配置."""
     return round((perf_counter() - started_at) * 1000, 2)
 
 
 def _conninfo(database: str) -> str:
-    """构建不含凭据的 psycopg 连接字符串。"""
+    """安全构造只交给驱动使用、绝不输出的 psycopg 连接字符串.
+
+    连接串在内存中包含真实凭据；“安全”指使用 ``make_conninfo`` 正确转义，
+    并且后续 JSON 只输出检查结果，不输出这个返回值。
+    """
     return make_conninfo(
         host=settings.POSTGRES_HOST,
         port=settings.POSTGRES_PORT,
@@ -54,18 +58,26 @@ def _conninfo(database: str) -> str:
 
 
 def _temporary_database_url(database: str) -> str:
-    """构建仅用于本次进程的临时 Alembic URL。"""
+    """构建仅用于本次进程的临时 Alembic URL."""
     return build_orm_database_url(settings).set(database=database).render_as_string(hide_password=False)
 
 
 def _create_database(admin_database: str, test_database: str) -> None:
-    """为本次 smoke 测试创建一个随机命名的数据库。"""
+    """为本次 smoke 创建随机数据库.
+
+    ``CREATE DATABASE`` 不能放在 PostgreSQL 普通事务中，所以这里显式使用
+    autocommit；``sql.Identifier`` 则保证随机数据库名被当作标识符处理。
+    """
     with psycopg.connect(_conninfo(admin_database), autocommit=True) as connection:
         connection.execute(sql.SQL("CREATE DATABASE {}").format(sql.Identifier(test_database)))
 
 
 def _drop_database(admin_database: str, test_database: str) -> None:
-    """关闭残留连接并仅删除随机测试数据库。"""
+    """关闭残留连接并仅删除随机测试数据库.
+
+    SQLAlchemy Engine 可能曾建立池连接。异步测试会先 dispose Engine，这里再
+    终止万一残留的连接，避免 ``DROP DATABASE`` 因 database is being accessed 失败。
+    """
     with psycopg.connect(_conninfo(admin_database), autocommit=True) as connection:
         connection.execute(
             """
@@ -79,7 +91,7 @@ def _drop_database(admin_database: str, test_database: str) -> None:
 
 
 def _runtime_settings(database: str) -> Settings:
-    """创建仅隔离数据库名和连接池大小不同的配置。"""
+    """创建仅隔离数据库名和连接池大小不同的配置."""
     config = Settings()
     config.POSTGRES_DB = database
 
@@ -91,7 +103,7 @@ def _runtime_settings(database: str) -> Settings:
 
 
 def _selector_loop_factory() -> asyncio.AbstractEventLoop:
-    """创建 psycopg 异步模式在 Windows 上所需的 Selector 事件循环。
+    """创建 psycopg 异步模式在 Windows 上所需的 Selector 事件循环.
 
     Windows 默认使用 ProactorEventLoop，而 psycopg 的异步连接依赖文件描述符
     监听。把 loop factory 只传给本次 ``asyncio.run``，不会修改应用全局策略。
@@ -100,7 +112,7 @@ def _selector_loop_factory() -> asyncio.AbstractEventLoop:
 
 
 async def _exercise_repositories(database: str) -> dict[str, bool | int]:
-    """执行真实 CRUD、所有权过滤、service 错误和事务回滚验证。"""
+    """执行真实 CRUD、所有权过滤、service 错误和事务回滚验证."""
     engine, session_factory = create_orm_runtime(_runtime_settings(database))
     suffix = uuid4().hex
     first_email = f"repository-a-{suffix}@example.com"
@@ -279,7 +291,12 @@ async def _exercise_repositories(database: str) -> dict[str, bool | int]:
 
 
 def _run_smoke() -> dict[str, object]:
-    """创建、迁移、测试并删除隔离数据库。"""
+    """在同步外壳中创建、迁移、测试并删除隔离数据库.
+
+    数据库级 CREATE/DROP 使用同步 psycopg；Repository 使用生产代码中的
+    AsyncEngine/AsyncSession。这样 smoke 同时覆盖数据库管理和异步业务访问，
+    又让资源创建与清理顺序保持清晰。
+    """
     started_at = perf_counter()
     admin_database = settings.POSTGRES_DB
     test_database = f"deep_research_repository_{uuid4().hex[:12]}"
@@ -288,15 +305,22 @@ def _run_smoke() -> dict[str, object]:
     cleanup_ok = False
 
     try:
+        # 先建空库，再执行真实 Alembic migration。Repository smoke 不允许用
+        # SQLModel.metadata.create_all() 绕过版本迁移，否则无法覆盖正式部署路径。
         _create_database(admin_database, test_database)
         database_created = True
         os.environ["ALEMBIC_DATABASE_URL"] = _temporary_database_url(test_database)
         command.upgrade(Config(str(PROJECT_ROOT / "alembic.ini")), "head")
 
+        # Windows 下给 psycopg async 使用局部 Selector loop。异步函数返回后 Engine
+        # 已 dispose，随后 finally 才能可靠删除临时数据库。
         checks = asyncio.run(
             _exercise_repositories(test_database),
             loop_factory=_selector_loop_factory,
         )
+
+        # checks 既有布尔断言，也有用于教学观察的数量字段。布尔值必须为 true，
+        # 数量必须大于 0；核心精确数量已经包含在 repository_crud_ok 中。
         ok = all(value is True or isinstance(value, int) and value > 0 for value in checks.values())
         return {
             "ok": ok,
@@ -304,6 +328,7 @@ def _run_smoke() -> dict[str, object]:
             "elapsed_ms": _elapsed_ms(started_at),
         }
     finally:
+        # 恢复进程原来的 Alembic URL，避免脚本结束后污染同进程中的后续命令。
         if previous_override is None:
             os.environ.pop("ALEMBIC_DATABASE_URL", None)
         else:
@@ -317,12 +342,13 @@ def _run_smoke() -> dict[str, object]:
             else:
                 cleanup_ok = True
 
+        # 返回成功摘要之前必须完成清理。临时库泄漏本身就是 smoke 失败。
         if database_created and not cleanup_ok:
             raise RuntimeError("临时 Repository 数据库清理失败")
 
 
 def main() -> int:
-    """打印一条不含凭据的 JSON 摘要作为检查记录。"""
+    """打印一条不含凭据的 JSON 摘要作为检查记录."""
     started_at = perf_counter()
     try:
         summary = _run_smoke()
@@ -338,6 +364,7 @@ def main() -> int:
         )
         return 1
 
+    # 能走到这里，说明 _run_smoke 的 finally 已完成临时数据库删除。
     summary["cleanup_ok"] = True
     print(json.dumps(summary))
     return 0 if summary["ok"] is True else 1
