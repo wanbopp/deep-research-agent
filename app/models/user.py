@@ -11,8 +11,8 @@ from app.models.base import UUIDTimestampModel
 class User(UUIDTimestampModel, table=True):
     """应用用户的最小持久化实体.
 
-    这里只描述数据库行和约束。邮箱格式校验属于 API schema，邮箱规范化、
-    密码哈希和注册规则属于后续 authentication service，不放进 ORM 模型。
+    这里只描述数据库行和约束。邮箱格式校验属于 API schema，邮箱规范化与
+    密码哈希属于 authentication service；ORM 只接收已经生成的 credential。
     """
 
     # SQLModel/SQLAlchemy 在运行时允许字符串表名，但基类类型桩把这个动态属性
@@ -29,4 +29,14 @@ class User(UUIDTimestampModel, table=True):
     # 应先由 API Pydantic schema 验证。String(320) 则把长度限制落实到数据库列。
     email: str = Field(
         sa_column=Column(String(320), nullable=False, index=True),
+    )
+
+    # 数据库只保存 Argon2id 编码串，不保存明文密码。该字符串已经内含算法、
+    # 参数、随机 salt 和哈希结果，所以不需要额外 salt 列。它仍是敏感 credential：
+    # 可以持久化和用于 verify，但不能进入 API 响应或普通日志。
+    #
+    # 不为本列建索引：认证先按唯一 email 找到一行，再读取其哈希；按哈希搜索
+    # 没有业务意义，还会增加索引副本和暴露面。255 字符足以容纳编码后的哈希。
+    password_hash: str = Field(
+        sa_column=Column(String(255), nullable=False),
     )

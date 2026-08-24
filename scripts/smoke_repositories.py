@@ -18,6 +18,7 @@ from alembic import command
 from alembic.config import Config
 from psycopg import sql
 from psycopg.conninfo import make_conninfo
+from pydantic import SecretStr
 
 from app.core.config import Settings, settings
 from app.infrastructure.database import build_orm_database_url, create_orm_runtime
@@ -30,6 +31,7 @@ from app.repositories import (
     UserRepository,
 )
 from app.services import UserAlreadyExistsError, UserNotFoundError, UserWorkspaceService
+from app.services.auth import PasswordHasher
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -114,10 +116,18 @@ def _selector_loop_factory() -> asyncio.AbstractEventLoop:
 async def _exercise_repositories(database: str) -> dict[str, bool | int]:
     """执行真实 CRUD、所有权过滤、service 错误和事务回滚验证."""
     engine, session_factory = create_orm_runtime(_runtime_settings(database))
+    password_hasher = PasswordHasher()
     suffix = uuid4().hex
     first_email = f"repository-a-{suffix}@example.com"
     second_email = f"repository-b-{suffix}@example.com"
     rollback_email = f"rollback-{suffix}@example.com"
+
+    # 这些 SecretStr 只在当前进程内作为真实 Argon2 输入。先哈希、再把结果交给
+    # service，复现未来 AuthService 的调用顺序；Repository 永远看不到明文。
+    first_password = SecretStr(f"Repository-A-{suffix}")
+    second_password = SecretStr(f"Repository-B-{suffix}")
+    first_password_hash = await password_hasher.hash(first_password)
+    second_password_hash = await password_hasher.hash(second_password)
 
     try:
         # 第一部分：通过 application service 提交两个完整工作区。service 内部的
@@ -127,10 +137,12 @@ async def _exercise_repositories(database: str) -> dict[str, bool | int]:
             service = UserWorkspaceService(session)
             first_workspace = await service.create_user_workspace(
                 email=first_email,
+                password_hash=first_password_hash,
                 title="第一个工作区",
             )
             second_workspace = await service.create_user_workspace(
                 email=second_email,
+                password_hash=second_password_hash,
                 title="第二个工作区",
             )
             second_first_session_id = second_workspace.chat_session_id
@@ -235,6 +247,18 @@ async def _exercise_repositories(database: str) -> dict[str, bool | int]:
             )
             not_found_returns_none = await users.get_by_id(uuid4()) is None
 
+            # 在全新 Session 读取并执行真实 Argon2 verify，证明数据库保存的是可用
+            # credential，而非明文、占位符或仅存在于旧 Session identity map 的值。
+            credential_stored_safely = (
+                persisted_user is not None
+                and persisted_user.password_hash.startswith("$argon2id$")
+                and persisted_user.password_hash != first_password.get_secret_value()
+                and await password_hasher.verify(
+                    first_password,
+                    persisted_user.password_hash,
+                )
+            )
+
         # 第四部分：service 把 Repository 的结果转换为业务含义。Repository
         # 查询不到只返回 None；“当前用例必须存在用户”由 service 决定并抛业务错误。
         async with session_factory() as session:
@@ -249,7 +273,10 @@ async def _exercise_repositories(database: str) -> dict[str, bool | int]:
         async with session_factory() as session:
             service = UserWorkspaceService(session)
             try:
-                await service.create_user_workspace(email=first_email)
+                await service.create_user_workspace(
+                    email=first_email,
+                    password_hash=first_password_hash,
+                )
             except UserAlreadyExistsError:
                 duplicate_user_translated = True
             else:
@@ -259,10 +286,19 @@ async def _exercise_repositories(database: str) -> dict[str, bool | int]:
         # 异常离开 begin() 后 PostgreSQL 回滚整个事务，所以第一次 INSERT 也不能留下。
         async with session_factory() as session:
             users = UserRepository(session)
+            rollback_password_hash = await password_hasher.hash(
+                SecretStr(f"Rollback-{suffix}"),
+            )
             try:
                 async with session.begin():
-                    await users.create(email=rollback_email)
-                    await users.create(email=rollback_email)
+                    await users.create(
+                        email=rollback_email,
+                        password_hash=rollback_password_hash,
+                    )
+                    await users.create(
+                        email=rollback_email,
+                        password_hash=rollback_password_hash,
+                    )
             except RepositoryConflictError:
                 second_write_failed = True
             else:
@@ -278,6 +314,7 @@ async def _exercise_repositories(database: str) -> dict[str, bool | int]:
             "repository_crud_ok": repository_crud_ok,
             "ownership_isolated": ownership_isolated,
             "not_found_returns_none": not_found_returns_none,
+            "credential_stored_safely": credential_stored_safely,
             "service_transaction_committed": persisted_user is not None and persisted_session is not None,
             "service_errors_translated": missing_user_translated and duplicate_user_translated,
             "rollback_removed_first_write": rollback_removed_first_write,

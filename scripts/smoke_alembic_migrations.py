@@ -19,6 +19,7 @@ DDL 都放在 ``migrations/versions/`` 下的迁移脚本中，由 Alembic 统�
 
 import json
 import os
+from datetime import UTC, datetime
 from pathlib import Path
 from time import perf_counter
 from uuid import uuid4
@@ -49,6 +50,7 @@ MANAGED_TABLES = frozenset(
 # upgrade、downgrade 和 autogenerate 都不能修改它。
 EXTERNAL_TABLE = "checkpoints"
 CONNECTION_TIMEOUT_SECONDS = 10
+INITIAL_BUSINESS_REVISION = "6d6d69a03dd8"
 
 
 def _elapsed_ms(started_at: float) -> float:
@@ -97,6 +99,68 @@ def _public_tables(database: str) -> frozenset[str]:
             """
         ).fetchall()
     return frozenset(str(row[0]) for row in rows)
+
+
+def _password_hash_column_matches(database: str) -> bool:
+    """直接读取 PostgreSQL catalog，验证 credential 列的真实形状.
+
+    ``alembic check`` 负责发现整体 schema drift；这里再显式检查教学重点，确保
+    ``users.password_hash`` 确实是不可空 varchar(255)，而不只是 Python model 中
+    看起来正确。
+    """
+    with psycopg.connect(_conninfo(database)) as connection:
+        row = connection.execute(
+            """
+            SELECT data_type, character_maximum_length, is_nullable
+            FROM information_schema.columns
+            WHERE table_schema = 'public'
+              AND table_name = 'users'
+              AND column_name = 'password_hash'
+            """
+        ).fetchone()
+
+    return row == ("character varying", 255, "NO")
+
+
+def _password_hash_column_exists(database: str) -> bool:
+    """判断失败的 migration 是否意外留下了 credential 列."""
+    with psycopg.connect(_conninfo(database)) as connection:
+        exists = connection.execute(
+            """
+            SELECT EXISTS (
+                SELECT 1
+                FROM information_schema.columns
+                WHERE table_schema = 'public'
+                  AND table_name = 'users'
+                  AND column_name = 'password_hash'
+            )
+            """
+        ).fetchone()
+    return exists == (True,)
+
+
+def _insert_legacy_user(database: str) -> None:
+    """在只有首个 revision 的 users 表中模拟一条旧账户记录."""
+    now = datetime.now(UTC)
+    with psycopg.connect(_conninfo(database)) as connection:
+        connection.execute(
+            """
+            INSERT INTO users (id, created_at, updated_at, email)
+            VALUES (%s, %s, %s, %s)
+            """,
+            (uuid4(), now, now, "legacy-user@example.com"),
+        )
+        connection.commit()
+
+
+def _delete_legacy_user(database: str) -> None:
+    """删除 smoke 自己创建的旧账户，使正常 migration 可以继续."""
+    with psycopg.connect(_conninfo(database)) as connection:
+        connection.execute(
+            "DELETE FROM users WHERE email = %s",
+            ("legacy-user@example.com",),
+        )
+        connection.commit()
 
 
 def _create_database(admin_database: str, test_database: str) -> None:
@@ -167,8 +231,25 @@ def _run_smoke() -> dict[str, object]:
             "alembic_version",
             EXTERNAL_TABLE,
         }
+        first_password_hash_column_matches = _password_hash_column_matches(test_database)
 
-        # 步骤 4：降级到 base。业务表必须按外键依赖逆序删除，但外部表以及
+        # 步骤 4：先只回退第二个 migration，制造一条没有 credential 的旧用户。
+        # 再次升级必须在执行 DDL 前明确拒绝，并且事务回滚后不能留下半截列。
+        command.downgrade(alembic_config, INITIAL_BUSINESS_REVISION)
+        _insert_legacy_user(test_database)
+        try:
+            command.upgrade(alembic_config, "head")
+        except RuntimeError as exc:
+            legacy_user_guard_triggered = "legacy user rows exist" in str(exc)
+        else:
+            legacy_user_guard_triggered = False
+        legacy_guard_left_schema_unchanged = not _password_hash_column_exists(test_database)
+
+        # 清除 smoke 数据后，完全相同的 migration 应在空 users 表上正常完成。
+        _delete_legacy_user(test_database)
+        command.upgrade(alembic_config, "head")
+
+        # 步骤 5：降级到 base。业务表必须按外键依赖逆序删除，但外部表以及
         # Alembic 自己的版本表必须保留。
         command.downgrade(alembic_config, "base")
         tables_after_downgrade = _public_tables(test_database)
@@ -177,15 +258,16 @@ def _run_smoke() -> dict[str, object]:
             EXTERNAL_TABLE,
         }
 
-        # 步骤 5：再次升级，证明 downgrade 没有留下阻止重建的残余对象。
+        # 步骤 6：再次升级，证明 downgrade 没有留下阻止重建的残余对象。
         command.upgrade(alembic_config, "head")
         tables_after_second_upgrade = _public_tables(test_database)
         second_upgrade_matches = tables_after_second_upgrade == MANAGED_TABLES | {
             "alembic_version",
             EXTERNAL_TABLE,
         }
+        second_password_hash_column_matches = _password_hash_column_matches(test_database)
 
-        # 步骤 6：比较当前数据库结构与 SQLModel.metadata。若模型已经变化却没有
+        # 步骤 7：比较当前数据库结构与 SQLModel.metadata。若模型已经变化却没有
         # 新 migration，command.check 会抛异常；无异常才表示不存在 schema drift。
         command.check(alembic_config)
         no_schema_diff = True
@@ -193,16 +275,24 @@ def _run_smoke() -> dict[str, object]:
         ok = all(
             (
                 first_upgrade_matches,
+                first_password_hash_column_matches,
+                legacy_user_guard_triggered,
+                legacy_guard_left_schema_unchanged,
                 downgrade_preserves_only_external,
                 second_upgrade_matches,
+                second_password_hash_column_matches,
                 no_schema_diff,
             )
         )
         return {
             "ok": ok,
             "first_upgrade_matches": first_upgrade_matches,
+            "first_password_hash_column_matches": first_password_hash_column_matches,
+            "legacy_user_guard_triggered": legacy_user_guard_triggered,
+            "legacy_guard_left_schema_unchanged": legacy_guard_left_schema_unchanged,
             "downgrade_preserves_only_external": downgrade_preserves_only_external,
             "second_upgrade_matches": second_upgrade_matches,
+            "second_password_hash_column_matches": second_password_hash_column_matches,
             "external_table_preserved": EXTERNAL_TABLE in tables_after_second_upgrade,
             "no_schema_diff": no_schema_diff,
             "elapsed_ms": _elapsed_ms(started_at),

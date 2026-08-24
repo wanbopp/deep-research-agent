@@ -66,6 +66,7 @@ class UserWorkspaceService:
         self,
         *,
         email: str,
+        password_hash: str,
         title: str = "New chat",
     ) -> CreatedUserWorkspace:
         """原子地创建用户和首个聊天会话.
@@ -74,8 +75,12 @@ class UserWorkspaceService:
         commit；任意一步抛出异常时，退出上下文会 rollback。Repository 只 flush，
         因而不会出现“用户已经提交、会话却创建失败”的半完成状态。
 
+        ``password_hash`` 必须由上层 PasswordHasher 生成。本 service 只协调事务，
+        不接收明文密码，也不重复决定 Argon2 参数。Checkpoint 9D 的 AuthService
+        会先执行 hash，再调用这里或 UserRepository。
+
         Raises:
-            ValueError: 邮箱或标题为空，或者标题超过数据库字段长度。
+            ValueError: 邮箱、credential 或标题为空，或者字段超过数据库长度。
             UserAlreadyExistsError: 邮箱唯一约束冲突。
             RepositoryConflictError: 首个会话违反数据库约束。
         """
@@ -83,6 +88,10 @@ class UserWorkspaceService:
         normalized_title = title.strip()
         if not normalized_email:
             raise ValueError("email must not be empty")
+        if not password_hash:
+            raise ValueError("password_hash must not be empty")
+        if len(password_hash) > 255:
+            raise ValueError("password_hash must not exceed 255 characters")
         if not normalized_title:
             raise ValueError("title must not be empty")
         if len(normalized_title) > 200:
@@ -90,7 +99,10 @@ class UserWorkspaceService:
 
         async with self._session.begin():
             try:
-                user = await self._users.create(email=normalized_email)
+                user = await self._users.create(
+                    email=normalized_email,
+                    password_hash=password_hash,
+                )
             except RepositoryConflictError as exc:
                 # 这里只转换用户 INSERT 的约束冲突。会话 INSERT 若失败则保持原始
                 # RepositoryConflictError，避免把外键错误误报成“邮箱重复”。
