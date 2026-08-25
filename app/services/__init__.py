@@ -1,7 +1,10 @@
 """Application service layer package."""
 
-from app.services.chat_sessions import (
+from app.services.chat_session_ownership import (
     ChatSessionNotFoundError,
+    ChatSessionOwnershipVerifier,
+)
+from app.services.chat_sessions import (
     ChatSessionService,
     ChatSessionServiceError,
 )
@@ -15,6 +18,7 @@ from app.services.persistence import (
 
 __all__ = [
     "ChatSessionNotFoundError",
+    "ChatSessionOwnershipVerifier",
     "ChatSessionService",
     "ChatSessionServiceError",
     "CreatedUserWorkspace",

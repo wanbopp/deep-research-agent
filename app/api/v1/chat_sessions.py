@@ -15,10 +15,8 @@ from app.schemas.chat_session import (
     ChatSessionListResponse,
     ChatSessionResponse,
 )
-from app.services.chat_sessions import (
-    ChatSessionNotFoundError,
-    ChatSessionService,
-)
+from app.services.chat_session_ownership import ChatSessionNotFoundError
+from app.services.chat_sessions import ChatSessionService
 
 router = APIRouter(prefix="/chat/sessions", tags=["chat-sessions"])
 

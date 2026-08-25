@@ -31,9 +31,11 @@ from app.api.v1.auth import router as auth_router
 from app.api.v1.chat_sessions import router as chat_sessions_router
 from app.core.config import Settings, settings
 from app.core.exception_handlers import register_exception_handlers
+from app.infrastructure.chat_session_ownership import PostgresChatSessionOwnershipVerifier
 from app.infrastructure.database import build_orm_database_url, create_orm_runtime
 from app.repositories import ChatSessionRepository
 from app.services.auth import TokenService
+from app.services.chat_session_ownership import ChatSessionNotFoundError
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 CONNECTION_TIMEOUT_SECONDS = 10
@@ -266,6 +268,33 @@ async def _exercise_chat_session_api(database: str) -> dict[str, bool | int | fl
                     user_id=claims_b.sub,
                 )
 
+        # production verifier 长期只保存 sessionmaker，每次调用创建独立 Session。
+        # 三条调用分别验证 owner 命中、cross-user 隐藏和随机不存在资源；它们
+        # 使用真实 PostgreSQL 查询，不是内存集合或 fake Repository。
+        ownership_verifier = PostgresChatSessionOwnershipVerifier(session_factory)
+        await ownership_verifier.require_owned(
+            session_id=thread_a_first,
+            user_id=claims_a.sub,
+        )
+
+        cross_user_verifier_rejected = False
+        try:
+            await ownership_verifier.require_owned(
+                session_id=thread_a_first,
+                user_id=claims_b.sub,
+            )
+        except ChatSessionNotFoundError:
+            cross_user_verifier_rejected = True
+
+        absent_verifier_rejected = False
+        try:
+            await ownership_verifier.require_owned(
+                session_id=uuid4(),
+                user_id=claims_b.sub,
+            )
+        except ChatSessionNotFoundError:
+            absent_verifier_rejected = True
+
         list_a_sessions = list_a.json().get("sessions", [])
         list_b_sessions = list_b.json().get("sessions", [])
         cross_error = read_b_cross_user.json().get("error", {})
@@ -317,6 +346,9 @@ async def _exercise_chat_session_api(database: str) -> dict[str, bool | int | fl
             "database_commits_are_owner_scoped": (
                 len(stored_a) == 2 and len(stored_b) == 1 and cross_user_lookup is None
             ),
+            "shared_verifier_accepts_owner": True,
+            "shared_verifier_rejects_cross_user": cross_user_verifier_rejected,
+            "shared_verifier_rejects_absent": absent_verifier_rejected,
             "openapi_documents_sessions": openapi_documents_sessions,
             "persisted_session_count": len(stored_a) + len(stored_b),
             "exercise_ms": _elapsed_ms(started_at),

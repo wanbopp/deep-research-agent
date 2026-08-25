@@ -16,18 +16,11 @@ from app.schemas.chat_session import (
     ChatSessionListResponse,
     ChatSessionResponse,
 )
+from app.services.chat_session_ownership import ChatSessionNotFoundError
 
 
 class ChatSessionServiceError(RuntimeError):
     """业务聊天会话可预期错误的基类."""
-
-
-class ChatSessionNotFoundError(ChatSessionServiceError):
-    """当前用户作用域中不存在指定业务会话."""
-
-    def __init__(self) -> None:
-        """使用固定文本，避免泄漏相同 UUID 是否属于其他用户."""
-        super().__init__("Chat session was not found")
 
 
 class ChatSessionService:
@@ -146,7 +139,6 @@ class ChatSessionService:
 
 
 __all__ = [
-    "ChatSessionNotFoundError",
     "ChatSessionService",
     "ChatSessionServiceError",
 ]
