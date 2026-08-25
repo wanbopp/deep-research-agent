@@ -1,4 +1,4 @@
-"""验证普通聊天历史与 HITL 恢复跨运行时重建的正确性。
+"""验证普通聊天历史与 HITL 恢复跨运行时重建的正确性.
 
 Checkpoint 10C 已证明 production Graph 绑定了 lifespan 的 PostgreSQL saver。本
 smoke 继续验证 10D 的行为结果：先用 lifespan A 写入普通历史并停在 ask_human
@@ -52,7 +52,7 @@ MEMORY_ACK = "POSTGRES_MEMORY_STORED"
 HITL_FINAL_REPLY = "POSTGRES_HITL_RESUMED_OK"
 HUMAN_RESPONSE = "approved"
 
-  
+
 def _elapsed_ms(started_at: float) -> float:
     """计算已用毫秒数，不暴露 provider 或数据库细节."""
     return round((perf_counter() - started_at) * 1000, 2)

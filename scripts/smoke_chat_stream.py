@@ -39,6 +39,7 @@ os.environ["MAX_TOKENS"] = "256"
 # 这里使用 noqa 是有明确生命周期原因的例外，不是随意关闭代码规范。
 from app.agents.chat.runtime import create_chat_runtime  # noqa: E402
 from app.core.config import settings  # noqa: E402
+from app.infrastructure.chat_guard import InProcessChatExecutionGuard  # noqa: E402
 from app.schemas.chat import (  # noqa: E402
     ChatRequest,
     ChatStreamEvent,
@@ -74,6 +75,8 @@ async def run_text_stream_smoke() -> int:
     # 每次脚本执行只创建一个 runtime；60 秒限制整轮 graph，而不是单个 chunk。
     service = ChatService(
         create_chat_runtime(),
+        # 当前脚本只运行一个进程；正式应用始终由 lifespan 注入 Redis guard。
+        execution_guard=InProcessChatExecutionGuard(),
         graph_timeout_seconds=GRAPH_TIMEOUT_SECONDS,
     )
 

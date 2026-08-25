@@ -11,7 +11,12 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.types import HTTPExceptionHandler
+
 from app.core.logging import logger
+from app.services.chat_guard import (
+    ChatExecutionGuardUnavailableError,
+    ChatThreadBusyError,
+)
 
 
 def get_request_id() -> str | None:
@@ -118,6 +123,60 @@ async def validation_exception_handler(
     )
 
 
+async def chat_thread_busy_exception_handler(
+    request: Request,
+    exc: ChatThreadBusyError,
+) -> JSONResponse:
+    """把同一内部 thread 的并发执行冲突转换为稳定 HTTP 409.
+
+    Args:
+        request: 当前 FastAPI 请求，仅用于记录 method/path。
+        exc: ChatService 在进入 Graph 前抛出的应用层 busy 异常。
+
+    Returns:
+        不包含内部 thread key、Redis key 或 owner token 的统一错误响应。
+    """
+    logger.warning(
+        "chat_thread_busy",
+        method=request.method,
+        path=request.url.path,
+    )
+    return JSONResponse(
+        status_code=status.HTTP_409_CONFLICT,
+        content=build_error_content(
+            code="CHAT_THREAD_BUSY",
+            message="Chat thread is already being processed",
+        ),
+    )
+
+
+async def chat_execution_guard_unavailable_exception_handler(
+    request: Request,
+    exc: ChatExecutionGuardUnavailableError,
+) -> JSONResponse:
+    """在 guard 无法保证互斥时 fail-closed 为稳定 HTTP 503.
+
+    Args:
+        request: 当前 FastAPI 请求，仅用于安全日志上下文。
+        exc: Redis 获取或释放失败后产生的固定应用层异常。
+
+    Returns:
+        告知客户端暂时不可执行 Chat 的统一错误响应。不会降级为无锁执行。
+    """
+    logger.error(
+        "chat_execution_guard_unavailable",
+        method=request.method,
+        path=request.url.path,
+    )
+    return JSONResponse(
+        status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+        content=build_error_content(
+            code="CHAT_EXECUTION_GUARD_UNAVAILABLE",
+            message="Chat execution is temporarily unavailable",
+        ),
+    )
+
+
 async def unhandled_exception_handler(
     request: Request,
     exc: Exception,
@@ -160,6 +219,21 @@ def register_exception_handlers(app: FastAPI) -> None:
     app.add_exception_handler(
         RequestValidationError,
         cast(HTTPExceptionHandler, validation_exception_handler),
+    )
+
+    # 这两个异常属于应用层并发协议，不应先转换为 HTTPException。集中注册可以让
+    # 普通 run/resume route 保持只负责用例调用，同时返回具体稳定错误 code。
+    app.add_exception_handler(
+        ChatThreadBusyError,
+        cast(HTTPExceptionHandler, chat_thread_busy_exception_handler),
+    )
+
+    app.add_exception_handler(
+        ChatExecutionGuardUnavailableError,
+        cast(
+            HTTPExceptionHandler,
+            chat_execution_guard_unavailable_exception_handler,
+        ),
     )
 
     app.add_exception_handler(

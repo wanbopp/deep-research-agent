@@ -10,6 +10,7 @@ from fastapi import FastAPI
 from app.agents.chat.runtime import create_chat_runtime
 from app.core.config import Settings, settings
 from app.core.logging import logger
+from app.infrastructure.chat_guard import RedisChatExecutionGuard
 from app.infrastructure.factory import create_application_resources
 from app.infrastructure.neo4j import probe_neo4j
 from app.infrastructure.postgres import probe_postgres
@@ -20,6 +21,10 @@ from app.services.chat import ChatService
 
 STARTUP_PROBE_TIMEOUT_SECONDS = 5.0
 STARTUP_TOTAL_TIMEOUT_SECONDS = 8.0
+CHAT_GRAPH_TIMEOUT_SECONDS = 90.0
+# Lease 必须长于 Graph 总超时。额外 30 秒用于事件循环调度和 finally 中的 Redis
+# 释放；进程崩溃时 Redis 仍会在 120 秒内自动清除遗留锁。
+CHAT_GUARD_LEASE_SECONDS = 120.0
 REQUIRED_DEPENDENCIES = frozenset({DependencyName.POSTGRES})
 
 
@@ -138,10 +143,23 @@ async def lifespan(
             checkpointer=resources.checkpointer,
         )
 
-        # 4. 用 Graph 创建应用服务。
-        chat_service = ChatService(graph)
+        # 4. guard 复用 lifespan 的共享 Redis client，但每次 hold 创建独立 Lock 和
+        # owner token。Redis 当前仍是 optional dependency；若运行期间不可用，guard
+        # 会 fail-closed 为稳定 503/SSE error，绝不会绕过互斥继续调用模型。
+        execution_guard = RedisChatExecutionGuard(
+            resources.redis_client,
+            lease_seconds=CHAT_GUARD_LEASE_SECONDS,
+        )
 
-        # 5. 所有 startup 步骤成功后，才同时发布底层资源和上层应用服务。
+        # 5. ChatService 同时持有共享 Graph 和 guard。两者都不保存当前用户；用户
+        # 身份和公开 thread ID 仍由每次请求传入并构造独立内部 key。
+        chat_service = ChatService(
+            graph,
+            execution_guard=execution_guard,
+            graph_timeout_seconds=CHAT_GRAPH_TIMEOUT_SECONDS,
+        )
+
+        # 6. 所有 startup 步骤成功后，才同时发布底层资源和上层应用服务。
         # yield 前 FastAPI 尚未接收请求，因此请求不会看到只发布一半的状态。
         app.state.resources = resources
         app.state.chat_service = chat_service

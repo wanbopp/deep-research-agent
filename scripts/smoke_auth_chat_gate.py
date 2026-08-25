@@ -65,6 +65,7 @@ from app.infrastructure.database import (  # noqa: E402
     build_orm_database_url,
     create_orm_runtime,
 )
+from app.infrastructure.chat_guard import InProcessChatExecutionGuard  # noqa: E402
 from app.repositories import UserRepository  # noqa: E402
 from app.services.auth import TokenService  # noqa: E402
 from app.services.chat import ChatService  # noqa: E402
@@ -314,7 +315,14 @@ async def _exercise_gate(database: str) -> dict[str, bool | int | float | str]:
     # A and B intentionally share the exact same graph, saver and service. If each user had
     # a separate instance, isolation could pass without testing checkpoint key ownership.
     graph = create_chat_runtime()
-    service = ChatService(graph, graph_timeout_seconds=GRAPH_TIMEOUT_SECONDS)
+    # 该独立 smoke 不启动应用 lifespan，因此没有共享 Redis guard。这里使用
+    # 单进程实现保留 ChatService 的执行权边界；真实模型、Graph 和 checkpoint
+    # 路径均未替换。跨 worker 互斥由专门的 Redis smoke 验证。
+    service = ChatService(
+        graph,
+        execution_guard=InProcessChatExecutionGuard(),
+        graph_timeout_seconds=GRAPH_TIMEOUT_SECONDS,
+    )
 
     app = FastAPI()
     register_exception_handlers(app)

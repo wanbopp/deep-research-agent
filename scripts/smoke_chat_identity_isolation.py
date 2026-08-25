@@ -44,6 +44,7 @@ from app.api.dependencies import get_chat_service, get_current_user  # noqa: E40
 from app.api.v1.chat import router as chat_router  # noqa: E402
 from app.core.config import settings  # noqa: E402
 from app.core.exception_handlers import register_exception_handlers  # noqa: E402
+from app.infrastructure.chat_guard import InProcessChatExecutionGuard  # noqa: E402
 from app.schemas.auth import AuthenticatedUser  # noqa: E402
 from app.services.chat import ChatService  # noqa: E402
 
@@ -133,6 +134,9 @@ async def _run_smoke() -> int:
     graph = create_chat_runtime()
     service = ChatService(
         graph,
+        # 本 smoke 的重点是用户 checkpoint 隔离；进程内 guard 只补齐执行边界，
+        # 不替换后面的真实 provider、LangGraph 或身份检查。
+        execution_guard=InProcessChatExecutionGuard(),
         graph_timeout_seconds=GRAPH_TIMEOUT_SECONDS,
     )
 

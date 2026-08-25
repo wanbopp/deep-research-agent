@@ -53,6 +53,14 @@ def _to_api_response(result: ChatTurnResult) -> ChatAPIResponse:
             "model": ErrorResponse,
             "description": "Bearer token is missing or invalid",
         },
+        status.HTTP_409_CONFLICT: {
+            "model": ErrorResponse,
+            "description": "The chat thread is already being processed",
+        },
+        status.HTTP_503_SERVICE_UNAVAILABLE: {
+            "model": ErrorResponse,
+            "description": "The chat execution guard is unavailable",
+        },
     },
 )
 async def create_chat_turn(
@@ -79,6 +87,14 @@ async def create_chat_turn(
         status.HTTP_404_NOT_FOUND: {
             "model": ErrorResponse,
             "description": "Chat thread is not available for resume",
+        },
+        status.HTTP_409_CONFLICT: {
+            "model": ErrorResponse,
+            "description": "The chat thread is already being processed",
+        },
+        status.HTTP_503_SERVICE_UNAVAILABLE: {
+            "model": ErrorResponse,
+            "description": "The chat execution guard is unavailable",
         },
     },
 )

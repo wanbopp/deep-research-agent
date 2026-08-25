@@ -36,6 +36,7 @@ from langchain_core.messages import AIMessage  # noqa: E402
 from app.agents.chat.runtime import create_chat_runtime  # noqa: E402
 from app.agents.chat.tools.ask_human import ask_human  # noqa: E402
 from app.core.config import settings  # noqa: E402
+from app.infrastructure.chat_guard import InProcessChatExecutionGuard  # noqa: E402
 from app.schemas.chat import (  # noqa: E402
     ChatRequest,
     ChatStreamEvent,
@@ -76,6 +77,8 @@ async def run_interrupt_stream_smoke() -> int:
     graph = create_chat_runtime()
     service = ChatService(
         graph,
+        # 脚本不启动 lifespan；仅 guard 使用进程内实现，模型与 Graph 仍是真实路径。
+        execution_guard=InProcessChatExecutionGuard(),
         graph_timeout_seconds=GRAPH_TIMEOUT_SECONDS,
     )
 

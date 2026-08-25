@@ -2,6 +2,7 @@
 
 import asyncio
 from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from typing import Any
 from uuid import UUID
@@ -31,6 +32,11 @@ from app.schemas.chat import (
     TokenStreamEvent,
     ToolStreamEvent,
 )
+from app.services.chat_guard import (
+    ChatExecutionGuard,
+    ChatExecutionGuardUnavailableError,
+    ChatThreadBusyError,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -55,6 +61,7 @@ class ChatService:
         self,
         graph: ChatGraph,
         *,
+        execution_guard: ChatExecutionGuard,
         graph_timeout_seconds: float = 90.0,
     ) -> None:
         """保存共享 graph，并验证单轮图执行的时间预算.
@@ -62,15 +69,20 @@ class ChatService:
         Args:
             graph: 已声明 ChatRuntimeContext schema 的共享 ChatGraph。service 可以
                 跨用户复用它，但不能把任何当前用户保存到 graph 或实例字段。
+            execution_guard: 按内部 thread ID 协调执行权的应用层接口。production
+                注入 Redis 实现，保证不同 worker 也能看到相同 busy 状态。
             graph_timeout_seconds: 单次 ainvoke/astream 的总执行时间上限，必须大于 0。
 
         Raises:
             ValueError: graph_timeout_seconds 小于或等于 0。
+
+        对象在项目启动时已经初始化
         """
         if graph_timeout_seconds <= 0:
             raise ValueError("graph_timeout_seconds must be greater than 0")
 
         self._graph = graph
+        self._execution_guard = execution_guard
         self._graph_timeout_seconds = graph_timeout_seconds
 
     @staticmethod
@@ -107,21 +119,61 @@ class ChatService:
         Returns:
             供 invoke、stream、resume 和 snapshot 查询共同使用的配置。
         """
-        config: RunnableConfig = {
-            "configurable": {
-                "thread_id": cls._build_checkpoint_thread_id(
-                    user_id,
-                    public_thread_id,
-                ),
-            },
-            "recursion_limit": 8,
-        }
-        return config
+        internal_thread_id = cls._build_checkpoint_thread_id(
+            user_id,
+            public_thread_id,
+        )
+        return cls._build_config_from_internal_thread_id(internal_thread_id)
 
     @staticmethod
     def _build_runtime_context(user_id: UUID) -> ChatRuntimeContext:
         """把可信用户 UUID 包装成单次图执行的不可变上下文."""
         return ChatRuntimeContext(user_id=user_id)
+
+    @staticmethod
+    def _build_config_from_internal_thread_id(
+        internal_thread_id: str,
+    ) -> RunnableConfig:
+        """使用已经验证的内部 thread ID 构造 LangGraph 运行配置."""
+        return {
+            "configurable": {
+                "thread_id": internal_thread_id,
+            },
+            "recursion_limit": 8,
+        }
+
+    @asynccontextmanager
+    async def _hold_thread_execution(
+        self,
+        *,
+        user_id: UUID,
+        public_thread_id: str,
+    ) -> AsyncIterator[RunnableConfig]:
+        """取得内部 thread 执行权并产生对应的 LangGraph 配置.
+
+        Args:
+            user_id: 已由认证依赖确认的当前用户 UUID。
+            public_thread_id: 客户端可见的会话 ID。
+
+        Yields:
+            与 guard 使用同一个内部 thread ID 构造的 RunnableConfig。
+
+        Raises:
+            ChatThreadBusyError: 相同内部 thread 已有 Graph 正在执行。
+            ChatExecutionGuardUnavailableError: guard 后端无法安全协调执行权。
+
+        Notes:
+            这个 helper 是三个公开入口的共同临界区边界。不要分别在 run、resume、
+            stream 中手写 Redis 获取和释放，否则某条异常路径很容易遗漏 finally。
+        """
+        internal_thread_id = self._build_checkpoint_thread_id(
+            user_id,
+            public_thread_id,
+        )
+
+        async with self._execution_guard.hold(internal_thread_id):
+            # guard key 和 configurable.thread_id 必须来自同一个局部变量。
+            yield self._build_config_from_internal_thread_id(internal_thread_id)
 
     @staticmethod
     def _events_from_message_part(data: object) -> tuple[ChatStreamEvent, ...]:
@@ -318,27 +370,28 @@ class ChatService:
             ]
         }
 
-        config = self._build_config(
-            user_id=user_id,
-            public_thread_id=request.thread_id,
-        )
         runtime_context = self._build_runtime_context(user_id)
 
-        # 在整图时间预算内调用 ainvoke
-        result = await asyncio.wait_for(
-            self._graph.ainvoke(
-                graph_input,
-                config=config,
-                context=runtime_context,
-            ),
-            timeout=self._graph_timeout_seconds,
-        )
+        # guard 必须在 ainvoke 之前取得，并持续覆盖结果解析。interrupt 解析还会用
+        # 同一个 config 读取 snapshot；若提前释放，另一个请求可能在解析期间推进状态。
+        async with self._hold_thread_execution(
+            user_id=user_id,
+            public_thread_id=request.thread_id,
+        ) as config:
+            # 总预算必须覆盖 Graph 和 interrupt 结果解析。后者可能读取 PostgreSQL
+            # snapshot；若只给 ainvoke 计时，临界区可能无限持有到 Redis lease 过期。
+            async with asyncio.timeout(self._graph_timeout_seconds):
+                result = await self._graph.ainvoke(
+                    graph_input,
+                    config=config,
+                    context=runtime_context,
+                )
 
-        return await self._parse_graph_result(
-            result,
-            config=config,
-            thread_id=request.thread_id,
-        )
+                return await self._parse_graph_result(
+                    result,
+                    config=config,
+                    thread_id=request.thread_id,
+                )
 
     async def resume_turn(
         self,
@@ -356,35 +409,36 @@ class ChatService:
             ChatResumeNotAvailableError: 当前用户的内部 checkpoint 不存在，或其中
                 没有等待恢复的 interrupt。相同错误也用于隐藏其他用户会话是否存在。
         """
-        config = self._build_config(
-            user_id=user_id,
-            public_thread_id=request.thread_id,
-        )
         runtime_context = self._build_runtime_context(user_id)
 
-        # 先在“当前用户 + 公开 thread ID”的内部空间检查 interrupt。用户 B 即使
-        # 猜到用户 A 的公开 thread ID，读取的也是 B 自己的空 checkpoint。
-        snapshot = await self._graph.aget_state(config)
-        interrupts = tuple(interrupt for task in snapshot.tasks for interrupt in task.interrupts)
-        if not interrupts:
-            raise ChatResumeNotAvailableError
-        if len(interrupts) != 1:
-            raise RuntimeError("resumable chat graph must contain exactly one interrupt")
+        # snapshot 检查也属于 resume 的临界区。否则普通请求可能在“检查到 interrupt”
+        # 与真正 Command(resume=...) 之间抢先推进同一个 checkpoint。
+        async with self._hold_thread_execution(
+            user_id=user_id,
+            public_thread_id=request.thread_id,
+        ) as config:
+            # 恢复前读取 snapshot、执行 Command 和解析最终结果共享一个总预算。
+            # 这样所有持锁 I/O 都被 90 秒上限覆盖，lease 仍保留 30 秒释放余量。
+            async with asyncio.timeout(self._graph_timeout_seconds):
+                # 用户 B 即使猜到用户 A 的公开 thread ID，读取的也是 B 自己的内部空间。
+                snapshot = await self._graph.aget_state(config)
+                interrupts = tuple(interrupt for task in snapshot.tasks for interrupt in task.interrupts)
+                if not interrupts:
+                    raise ChatResumeNotAvailableError
+                if len(interrupts) != 1:
+                    raise RuntimeError("resumable chat graph must contain exactly one interrupt")
 
-        result = await asyncio.wait_for(
-            self._graph.ainvoke(
-                Command(resume=request.response),
-                config=config,
-                context=runtime_context,
-            ),
-            timeout=self._graph_timeout_seconds,
-        )
+                result = await self._graph.ainvoke(
+                    Command(resume=request.response),
+                    config=config,
+                    context=runtime_context,
+                )
 
-        return await self._parse_graph_result(
-            result,
-            config=config,
-            thread_id=request.thread_id,
-        )
+                return await self._parse_graph_result(
+                    result,
+                    config=config,
+                    thread_id=request.thread_id,
+                )
 
     async def stream_turn(
         self,
@@ -400,10 +454,6 @@ class ChatService:
         astream() 负责“边执行图，边报告过程”；本方法负责把框架报告翻译成
         应用协议，并处理取消、错误、安全隔离和最终状态判断。
         """
-        config = self._build_config(
-            user_id=user_id,
-            public_thread_id=request.thread_id,
-        )
         runtime_context = self._build_runtime_context(user_id)
         # 与非流式入口使用相同的 ChatState 输入契约，保证 ainvoke/astream 不会
         # 因局部变量推断差异产生两套类型边界。
@@ -412,83 +462,102 @@ class ChatService:
         }
 
         try:
-            async with asyncio.timeout(self._graph_timeout_seconds):
-                # 同时观察模型文本分片和节点完成后的状态增量。
-                async for part in self._graph.astream(
-                    graph_input,
-                    config=config,
-                    context=runtime_context,
-                    stream_mode=("messages", "updates"),
-                    version="v2",
-                ):
-                    # 每轮断点停在这里时，part 表示“刚到达的一片流数据”。
-                    # v2 part 应具有 type、ns、data；它不是 ChatState 全量快照。
-                    if not isinstance(part, dict):
-                        raise RuntimeError("graph stream part must be a dict")
+            # 异步生成器的函数体要到第一次迭代才执行，因此 SSE 响应头通常已经发出。
+            # busy 不能再改成 HTTP 409，必须在下面转换为稳定 ErrorStreamEvent。
+            async with self._hold_thread_execution(
+                user_id=user_id,
+                public_thread_id=request.thread_id,
+            ) as config:
+                terminal_event: DoneStreamEvent
 
-                    # type 是 stream mode 标签，而不是消息类型或节点名称。
-                    # data 的形状由 type 决定：messages 是二元组，updates 是字典。
-                    part_type = part.get("type")
-                    part_data = part.get("data")
+                async with asyncio.timeout(self._graph_timeout_seconds):
+                    # 同时观察模型文本分片和节点完成后的状态增量。
+                    async for part in self._graph.astream(
+                        graph_input,
+                        config=config,
+                        context=runtime_context,
+                        stream_mode=("messages", "updates"),
+                        version="v2",
+                    ):
+                        # 每轮断点停在这里时，part 表示“刚到达的一片流数据”。
+                        # v2 part 应具有 type、ns、data；它不是 ChatState 全量快照。
+                        if not isinstance(part, dict):
+                            raise RuntimeError("graph stream part must be a dict")
 
-                    # 分发层不理解 ToolCall 细节，只把不同 payload 交给对应
-                    # helper 翻译。这样框架数据解析不会和主控制流混在一起。
-                    if part_type == "messages":
-                        events = self._events_from_message_part(part_data)
-                    elif part_type == "updates":
-                        events = self._events_from_update_part(part_data)
+                        # type 是 stream mode 标签，而不是消息类型或节点名称。
+                        # data 的形状由 type 决定：messages 是二元组，updates 是字典。
+                        part_type = part.get("type")
+                        part_data = part.get("data")
+
+                        # 分发层不理解 ToolCall 细节，只把不同 payload 交给对应
+                        # helper 翻译。这样框架数据解析不会和主控制流混在一起。
+                        if part_type == "messages":
+                            events = self._events_from_message_part(part_data)
+                        elif part_type == "updates":
+                            events = self._events_from_update_part(part_data)
+                        else:
+                            raise RuntimeError("graph stream part contains an unknown type")
+
+                        # helper 返回 tuple：可能为空，也可能包含多个并发工具事件。
+                        # 必须逐个 yield；yield events 会错误地产生“事件元组”。
+                        for event in events:
+                            # 断点执行过这一行后，控制权会暂时交回 API/SSE 调用方；
+                            # 下一次请求事件时，才回到这里继续处理后续 part。
+                            yield event
+
+                    # astream 停止产生 part 不等于图一定到达 END：ask_human 会让图
+                    # 暂停并结束本轮 stream。因此必须读取同一 thread 的最新快照，
+                    # 不能根据“最后一个 part 是什么”猜测最终状态。
+                    snapshot = await self._graph.aget_state(config)
+
+                    # 一个 snapshot 可能包含多个 task。每个 task 对应一次节点执行，
+                    # interrupt 保存在具体 task 中，所以需要展开所有 task，而不能只
+                    # 检查 tasks[0]。断点时可同时观察 snapshot.next 和 snapshot.tasks。
+                    interrupts = tuple(interrupt for task in snapshot.tasks for interrupt in task.interrupts)
+
+                    if interrupts:
+                        # 当前最小聊天 Agent 一次只支持一个人工问题。多个 interrupt
+                        # 无法安全映射成现有的单 question 协议，应作为内部状态错误。
+                        if len(interrupts) != 1:
+                            raise RuntimeError("interrupted chat stream must contain exactly one interrupt")
+
+                        question = interrupts[0].value
+                        if not isinstance(question, str) or not question.strip():
+                            raise RuntimeError("chat stream interrupt must contain a non-empty question")
+
+                        # interrupt 不是失败，而是“本轮正常结束并等待人工输入”。先把
+                        # 问题交给客户端，再用 done(interrupted) 明确关闭本次事件流。
+                        yield InterruptStreamEvent(question=question.strip())
+                        terminal_event = DoneStreamEvent(status="interrupted")
                     else:
-                        raise RuntimeError("graph stream part contains an unknown type")
+                        # 没有 interrupt 时，正常完成的图应该已经到达 END，此时 next
+                        # 为空。若 next 仍有节点，说明图在未知的非终态停止。
+                        if snapshot.next:
+                            raise RuntimeError("chat stream ended before graph reached a terminal state")
+                        terminal_event = DoneStreamEvent(status="completed")
 
-                    # helper 返回 tuple：可能为空，也可能包含多个并发工具事件。
-                    # 必须逐个 yield；yield events 会错误地产生“事件元组”。
-                    for event in events:
-                        # 断点执行过这一行后，控制权会暂时交回 API/SSE 调用方；
-                        # 下一次请求事件时，才回到这里继续处理后续 part。
-                        yield event
-
-                # astream 停止产生 part 不等于图一定到达 END：ask_human 会让图
-                # 暂停并结束本轮 stream。因此必须读取同一 thread 的最新快照，
-                # 不能根据“最后一个 part 是什么”猜测最终状态。
-                snapshot = await self._graph.aget_state(config)
-
-                # 一个 snapshot 可能包含多个 task。每个 task 对应一次节点执行，
-                # interrupt 保存在具体 task 中，所以需要展开所有 task，而不能只
-                # 检查 tasks[0]。断点时可同时观察 snapshot.next 和 snapshot.tasks。
-                interrupts = tuple(interrupt for task in snapshot.tasks for interrupt in task.interrupts)
-
-                if interrupts:
-                    # 当前最小聊天 Agent 一次只支持一个人工问题。多个 interrupt
-                    # 无法安全映射成现有的单 question 协议，应作为内部状态错误。
-                    if len(interrupts) != 1:
-                        raise RuntimeError("interrupted chat stream must contain exactly one interrupt")
-
-                    question = interrupts[0].value
-                    if not isinstance(question, str) or not question.strip():
-                        raise RuntimeError("chat stream interrupt must contain a non-empty question")
-
-                    # interrupt 不是失败，而是“本轮正常结束并等待人工输入”。先把
-                    # 问题交给客户端，再用 done(interrupted) 明确关闭本次事件流。
-                    yield InterruptStreamEvent(question=question.strip())
-                    yield DoneStreamEvent(status="interrupted")
-
-                    # 必须立即 return；否则代码会继续向下发送 completed，导致
-                    # 同一轮 stream 同时拥有两个相互冲突的终止状态。
-                    return
-
-                # 没有 interrupt 时，正常完成的图应该已经到达 END，此时 next
-                # 为空。若 next 仍有节点，说明图在未知的非终态停止，不能谎报成功。
-                if snapshot.next:
-                    raise RuntimeError("chat stream ended before graph reached a terminal state")
-
-                # completed 表示图真正到达 END，也是正常流的最后一个事件。
-                yield DoneStreamEvent(status="completed")
-                return
+            # 先正常离开 guard 上下文并确认 Redis owner token 已释放，再发送 done。
+            # 因此客户端看到 done 时，本轮执行权已经可供下一请求获取。
+            yield terminal_event
+            return
 
         except asyncio.CancelledError:
             # 客户端断开时必须让取消继续向上传播。
             # 避免继续执行图、造成资源浪费、模型消耗
             raise
+        except ChatThreadBusyError:
+            # SSE 已经开始，只能发送流事件。固定文案不暴露锁名、内部 key 或 owner。
+            yield ErrorStreamEvent(
+                code="CHAT_THREAD_BUSY",
+                message="Chat thread is already being processed",
+            )
+            return
+        except ChatExecutionGuardUnavailableError:
+            yield ErrorStreamEvent(
+                code="CHAT_EXECUTION_GUARD_UNAVAILABLE",
+                message="Chat execution is temporarily unavailable",
+            )
+            return
         except TimeoutError:
             yield ErrorStreamEvent(
                 code="CHAT_STREAM_TIMEOUT",

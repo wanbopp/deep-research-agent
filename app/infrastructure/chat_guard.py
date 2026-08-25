@@ -110,7 +110,9 @@ class RedisChatExecutionGuard:
         )
 
         try:
-            acquired = await lock.acquire()  # 尝试获取分布式锁
+            # 这里只尝试一次。若相同 key 已被持有，redis-py 会立即返回 False；
+            # 当前请求不会排队，也不会进入 Graph 或产生一次额外模型调用。
+            acquired = await lock.acquire()
         except RedisError as error:
             # 固定应用错误不包含 Redis host、密码、原始 key 或驱动错误文本。
             raise ChatExecutionGuardUnavailableError("Chat execution guard is unavailable") from error
@@ -119,7 +121,9 @@ class RedisChatExecutionGuard:
             raise ChatThreadBusyError("Chat thread is already being processed")
 
         try:
-            yield  # 暂停 hold() 住执行async with 内部代码块
+            # 执行到 yield 时，控制权交给 ``async with`` 内部的 Graph 调用。
+            # Graph 正常完成、暂停或抛错后，控制权都会回到下面的 finally。
+            yield
         finally:
             # 正常完成、interrupt return、timeout、provider/tool 异常以及单次任务取消
             # 都会经过 finally。若进程直接崩溃无法运行 finally，Redis TTL 是最后的
@@ -130,3 +134,52 @@ class RedisChatExecutionGuard:
                 # 释放失败意味着我们无法再证明互斥状态，必须显式失败而不是记录后
                 # 假装成功。锁仍有 TTL，最终不会永久阻塞该 thread。
                 raise ChatExecutionGuardUnavailableError("Chat execution guard release failed") from error
+
+
+class InProcessChatExecutionGuard:
+    """为单进程 smoke 提供 fail-fast 的 thread 执行 guard.
+
+    这个实现只把活动中的内部 thread ID 保存在当前 Python 对象的集合里。它用于
+    那些直接构造 ``ChatService``、但不启动 FastAPI lifespan 和 Redis 的历史 smoke，
+    让这些脚本仍然经过真实模型和真实 LangGraph，只替换执行权的存储位置。
+
+    Warning:
+        不得在生产装配中使用。不同 worker 拥有不同 Python 内存，因此该实现无法
+        协调跨进程请求；生产环境必须继续注入 ``RedisChatExecutionGuard``。
+    """
+
+    def __init__(self) -> None:
+        """创建当前 guard 实例独享的活动 thread 集合."""
+        self._active_thread_ids: set[str] = set()
+
+    @asynccontextmanager
+    async def hold(self, internal_thread_id: str) -> AsyncIterator[None]:
+        """在当前事件循环内申请并释放一个内部 thread 的执行权.
+
+        Args:
+            internal_thread_id: 与 LangGraph ``configurable.thread_id`` 相同的内部
+                标识。它由可信 user_id 与公开 thread ID 组合而成。
+
+        Yields:
+            没有业务值；进入调用方的 ``async with`` 代码块表示申请成功。
+
+        Raises:
+            ChatThreadBusyError: 当前 guard 实例中相同内部 thread 正在执行。
+            ValueError: internal_thread_id 为空或只包含空白字符。
+
+        Notes:
+            membership 检查与 ``add`` 之间没有 ``await``。在单个 asyncio 事件
+            循环中，这段同步代码不会被其他 task 插入，因此申请动作是原子的。
+            ``finally`` 中的 ``discard`` 同样没有 await，取消任务时也能完成释放。
+        """
+        if not internal_thread_id.strip():
+            raise ValueError("internal_thread_id must not be empty")
+
+        if internal_thread_id in self._active_thread_ids:
+            raise ChatThreadBusyError("Chat thread is already being processed")
+
+        self._active_thread_ids.add(internal_thread_id)
+        try:
+            yield
+        finally:
+            self._active_thread_ids.discard(internal_thread_id)

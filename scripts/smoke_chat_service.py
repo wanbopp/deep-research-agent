@@ -25,10 +25,9 @@ os.environ["MAX_LLM_CALL_RETRIES"] = "1"
 os.environ["LLM_TOTAL_TIMEOUT"] = "30"
 os.environ["MAX_TOKENS"] = "512"
 
-from langchain_core.runnables import RunnableConfig  # noqa: E402
-
 from app.agents.chat.runtime import create_chat_runtime  # noqa: E402
 from app.core.config import settings  # noqa: E402
+from app.infrastructure.chat_guard import InProcessChatExecutionGuard  # noqa: E402
 from app.schemas.chat import ChatRequest, ChatResponse  # noqa: E402
 from app.services.chat import ChatService  # noqa: E402
 
@@ -59,6 +58,8 @@ async def run_chat_service_smoke() -> int:
         runtime = create_chat_runtime()
         service = ChatService(
             runtime,
+            # 独立 smoke 没有 FastAPI lifespan；只在本进程内验证执行权生命周期。
+            execution_guard=InProcessChatExecutionGuard(),
             graph_timeout_seconds=GRAPH_TIMEOUT_SECONDS,
         )
 
@@ -82,11 +83,12 @@ async def run_chat_service_smoke() -> int:
 
         # Service 已隐藏 LangGraph 内部状态；smoke 为验证历史确实累计，
         # 才直接从同一个 runtime 读取 checkpoint。生产 route 不应这样做。
-        config: RunnableConfig = {
-            "configurable": {
-                "thread_id": THREAD_ID,
-            }
-        }
+        # Service 写入的是“可信 user_id + 公开 thread_id”组成的内部 key，白盒读取
+        # 必须复用同一构造方法。直接使用 THREAD_ID 会查看另一个空的身份空间。
+        config = ChatService._build_config(
+            user_id=SMOKE_USER_ID,
+            public_thread_id=THREAD_ID,
+        )
         snapshot = await runtime.aget_state(config)
         raw_messages = snapshot.values.get("messages", [])
         messages = list(raw_messages) if isinstance(raw_messages, list) else []

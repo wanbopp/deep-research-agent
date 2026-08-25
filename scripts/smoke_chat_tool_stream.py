@@ -32,6 +32,7 @@ os.environ["MAX_TOKENS"] = "256"
 from app.agents.chat.runtime import create_chat_runtime  # noqa: E402
 from app.agents.chat.tools.current_time import get_current_utc_time  # noqa: E402
 from app.core.config import settings  # noqa: E402
+from app.infrastructure.chat_guard import InProcessChatExecutionGuard  # noqa: E402
 from app.schemas.chat import (  # noqa: E402
     ChatRequest,
     ChatStreamEvent,
@@ -68,6 +69,8 @@ async def run_tool_stream_smoke() -> int:
     # 节点和 graph 装配路径。当前脚本进程拥有独立 InMemorySaver。
     service = ChatService(
         create_chat_runtime(),
+        # 仅适用于当前单进程脚本；生产应用由 lifespan 注入 Redis 分布式 guard。
+        execution_guard=InProcessChatExecutionGuard(),
         graph_timeout_seconds=GRAPH_TIMEOUT_SECONDS,
     )
 
