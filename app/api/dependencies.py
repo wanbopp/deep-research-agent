@@ -155,6 +155,7 @@ async def get_current_user(
 
 # 类型别名同时保留 Python 类型和 FastAPI 依赖来源。Route 只声明“需要可信用户”，
 # 不需要知道 JWT、Session 或 Repository 的组合过程。
+# 声明类型是 AuthenticatedUser 值从 get_current_user 中获取
 CurrentUserDependency = Annotated[AuthenticatedUser, Depends(get_current_user)]
 
 

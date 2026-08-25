@@ -1,11 +1,11 @@
 """Construct lazy infrastructure clients for FastAPI lifespan ownership."""
 
-from typing import Any
-
+from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
 from neo4j import AsyncGraphDatabase
 from psycopg import AsyncConnection
 from psycopg.conninfo import make_conninfo
 from psycopg_pool import AsyncConnectionPool
+from psycopg.rows import DictRow, dict_row
 from redis.asyncio import Redis
 
 from app.core.config import Settings
@@ -38,13 +38,30 @@ def create_application_resources(config: Settings) -> ApplicationResources:
     #
     # open=False 很重要：factory 只构造资源，
     # 真正打开连接池属于 lifespan startup。
-    postgres_pool: AsyncConnectionPool[AsyncConnection[Any]] = AsyncConnectionPool(
+    postgres_pool: AsyncConnectionPool[AsyncConnection[DictRow]] = AsyncConnectionPool(
         conninfo=postgres_conninfo,
+        # 这组连接同时服务 dependency probe 与 LangGraph checkpointer：
+        # - autocommit=True 允许 saver.setup() 执行 CREATE INDEX CONCURRENTLY；
+        # - prepare_threshold=0 与 AsyncPostgresSaver.from_conn_string() 的正式
+        #   连接约定一致，避免 checkpoint 动态 SQL 的 prepared statement 问题；
+        # - dict_row 让 pool 的行类型与 saver 读取 checkpoint 的 DictRow 一致。
+        # Saver 自己仍会为每个 cursor 显式声明 dict_row，这里同时固定 pool 类型，
+        # 方便 readiness 和未来其他原生 psycopg 调用得到一致行为。
+        kwargs={
+            "autocommit": True,
+            "prepare_threshold": 0,
+            "row_factory": dict_row,
+        },
         min_size=0,
         max_size=config.POSTGRES_PSYCOPG_POOL_SIZE,
         open=False,
         timeout=CONNECTION_TIMEOUT_SECONDS,
     )
+
+    # AsyncPostgresSaver 构造时会记录当前运行中的 event loop，但不会连接数据库
+    # 或创建表。create_application_resources 因而必须由 async lifespan 调用，
+    # 不能放在模块导入期。连接池 open 和 saver.setup 仍由 lifespan 按顺序负责。
+    checkpointer = AsyncPostgresSaver(postgres_pool)
 
     # SQLModel Repository 使用 SQLAlchemy AsyncEngine，而 LangGraph checkpointer
     # 和依赖探针继续使用上面的原生 psycopg pool。两套池职责不同、预算独立。
@@ -86,6 +103,7 @@ def create_application_resources(config: Settings) -> ApplicationResources:
     # 注意这里只保存 sessionmaker，绝不能创建一个全局 AsyncSession 放进 app.state。
     return ApplicationResources(
         postgres_pool=postgres_pool,
+        checkpointer=checkpointer,
         orm_engine=orm_engine,
         orm_session_factory=orm_session_factory,
         neo4j_driver=neo4j_driver,

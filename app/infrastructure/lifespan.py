@@ -7,7 +7,7 @@ from typing import cast
 
 from fastapi import FastAPI
 
-from app.core.config import settings
+from app.core.config import Settings, settings
 from app.core.logging import logger
 from app.infrastructure.factory import create_application_resources
 from app.infrastructure.neo4j import probe_neo4j
@@ -31,9 +31,28 @@ def get_application_resources(app: FastAPI) -> ApplicationResources:
 
 
 @asynccontextmanager
-async def lifespan(app: FastAPI) -> AsyncIterator[None]:
-    """管理 FastAPI 应用级基础设施资源的完整生命周期."""
-    resources = create_application_resources(settings)
+async def lifespan(
+    app: FastAPI,
+    *,
+    config: Settings = settings,
+) -> AsyncIterator[None]:
+    """管理 FastAPI 应用级基础设施资源的完整生命周期.
+
+    Args:
+        app: 将在 startup 成功后接收共享资源的 FastAPI 应用。
+        config: 用于构造本进程资源的配置。正式应用使用模块级 settings；真实
+            隔离 smoke 可显式传入只修改数据库名的 Settings，避免污染开发库。
+
+    Yields:
+        startup 已完成且 app.state.resources 可用的应用运行阶段。
+
+    Raises:
+        RuntimeError: required dependency 不健康，或 checkpointer setup 失败。异常
+            离开 AsyncExitStack 前仍会执行已经登记的资源清理回调。
+    """
+    # factory 会构造 AsyncPostgresSaver，因此必须在这里的运行中 event loop 内
+    # 调用，不能提前到模块全局。此时仍没有连接数据库，也没有执行 DDL。
+    resources = create_application_resources(config)
 
     async with AsyncExitStack() as stack:
         # 建议登记顺序：执行完成后逆向关闭
@@ -82,6 +101,26 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             raise RuntimeError(
                 f"Required dependencies unhealthy: {', '.join(r.name.value for r in required_failures)}"
             )
+
+        # PostgreSQL 已通过 required probe 后，才运行 LangGraph 自有 migration。
+        # setup() 必须发生在 app.state 发布之前：如果它失败，FastAPI startup
+        # 整体失败，任何 route 都看不到半初始化 checkpointer。
+        try:
+            await resources.checkpointer.setup()
+        except Exception as error:
+            # 保留服务端 traceback 便于定位 migration/权限问题；结构化字段只含
+            # 异常类型，不主动记录 SQL、连接串或数据库凭据。
+            logger.exception(
+                "checkpointer_setup_failed",
+                error_type=type(error).__name__,
+            )
+            raise RuntimeError("PostgreSQL checkpointer setup failed") from error
+
+        logger.info(
+            "checkpointer_initialized",
+            backend="postgres",
+        )
+
         # startup 验收通过后才把 resources 保存到 app.state。
         app.state.resources = resources
 

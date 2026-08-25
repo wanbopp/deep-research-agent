@@ -15,7 +15,7 @@ from app.agents.chat.state import ChatState
 # CompiledStateGraph 的四个泛型参数依次描述 state、runtime context、图输入和
 # 图输出。集中定义别名可以防止 runtime/service 某一层退回裸类型，并错误地把
 # context 推断成 None。
-ChatGraph = CompiledStateGraph[
+type ChatGraph = CompiledStateGraph[
     ChatState,
     ChatRuntimeContext,
     ChatState,
