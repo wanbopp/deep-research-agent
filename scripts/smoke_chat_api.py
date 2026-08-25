@@ -20,7 +20,7 @@ import json
 import os
 from time import perf_counter
 from typing import Any, cast
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 # Settings 在 app.core.config 首次导入时创建，所以受控运行参数必须先写入
 # os.environ。dotenv 默认不会覆盖已经存在的环境变量。
@@ -32,14 +32,19 @@ os.environ["MAX_TOKENS"] = "512"
 
 from httpx import ASGITransport, AsyncClient, Response  # noqa: E402
 
-from app.api.dependencies import get_chat_service  # noqa: E402
+from app.api.dependencies import get_chat_service, get_current_user  # noqa: E402
 from app.core.config import settings  # noqa: E402
 from app.main import app  # noqa: E402
+from app.schemas.auth import AuthenticatedUser  # noqa: E402
 
 COMPLETED_EXPECTED = "REAL_HTTP_CHAT_OK"
 RESUMED_EXPECTED = "REAL_HTTP_HITL_OK"
 HUMAN_RESPONSE = "approved"
 HTTP_TIMEOUT_SECONDS = 120.0
+SMOKE_USER = AuthenticatedUser(
+    user_id=UUID("00000000-0000-4000-8000-000000000001"),
+    email="legacy-chat-smoke@example.com",
+)
 
 # 普通完成路径明确禁止工具调用，避免它与 HITL 路径相互干扰。
 COMPLETED_PROMPT = "Do not call any tool. Reply with exactly REAL_HTTP_CHAT_OK and nothing else."
@@ -111,6 +116,10 @@ async def run_chat_api_smoke() -> int:
     # 每次脚本运行都从干净的进程内 dependency 开始。随后四个 HTTP 请求
     # 必须复用同一个 ChatService，interrupt/resume 才能共享 InMemorySaver。
     get_chat_service.cache_clear()
+
+    # 该 Lab 10 历史 smoke 只验证 Chat API/Agent 行为。9F 的独立 smoke 已覆盖
+    # 401 与跨用户隔离，因此这里注入一个已认证身份，继续保持原实验职责单一。
+    app.dependency_overrides[get_current_user] = lambda: SMOKE_USER
 
     # 两条业务路径使用不同 thread，防止普通聊天历史影响 HITL 工具决策。
     # uuid 只用于避免重复运行脚本时碰到旧 checkpoint，最终不会输出。

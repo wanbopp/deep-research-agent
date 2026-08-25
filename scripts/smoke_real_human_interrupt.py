@@ -16,6 +16,7 @@ import asyncio
 import json
 import os
 from time import perf_counter
+from uuid import UUID
 
 os.environ["DEBUG"] = "false"
 os.environ["LOG_LEVEL"] = "WARNING"
@@ -27,6 +28,7 @@ from langgraph.types import Command  # noqa: E402
 from pydantic import SecretStr  # noqa: E402
 
 from app.agents.chat.graph import build_chat_graph  # noqa: E402
+from app.agents.chat.context import ChatRuntimeContext  # noqa: E402
 from app.agents.chat.nodes import create_chat_node, create_tool_node  # noqa: E402
 from app.agents.chat.tools.ask_human import ask_human  # noqa: E402
 from app.agents.chat.tools.registry import ToolRegistry  # noqa: E402
@@ -39,6 +41,7 @@ from app.services.llm.service import LLMService  # noqa: E402
 EXPECTED_REPLY = "REAL_HITL_OK"
 HUMAN_REPLY = "approved"
 GRAPH_TIMEOUT_SECONDS = 60.0
+SMOKE_CONTEXT = ChatRuntimeContext(user_id=UUID("00000000-0000-4000-8000-000000000001"))
 
 SMOKE_PROMPT = (
     "Call the ask_human tool exactly once to ask whether this bounded "
@@ -124,6 +127,7 @@ async def run_real_human_interrupt_smoke() -> int:
                     ]
                 },
                 config=config,
+                context=SMOKE_CONTEXT,
             ),
             timeout=GRAPH_TIMEOUT_SECONDS,
         )
@@ -201,6 +205,7 @@ async def run_real_human_interrupt_smoke() -> int:
             graph.ainvoke(
                 Command(resume=HUMAN_REPLY),
                 config=config,
+                context=SMOKE_CONTEXT,
             ),
             timeout=GRAPH_TIMEOUT_SECONDS,
         )

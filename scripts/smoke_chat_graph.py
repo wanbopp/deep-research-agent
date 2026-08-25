@@ -4,6 +4,7 @@ import asyncio
 import json
 import os
 from time import perf_counter
+from uuid import UUID
 
 # 必须在导入 app 模块之前设置。
 # development 环境默认会开启 DEBUG 和 INFO 日志，可能输出 SDK traceback。
@@ -17,6 +18,7 @@ from langchain_core.messages import AIMessage, HumanMessage  # noqa: E402
 from pydantic import SecretStr  # noqa: E402
 
 from app.agents.chat.graph import build_chat_graph  # noqa: E402
+from app.agents.chat.context import ChatRuntimeContext  # noqa: E402
 from app.agents.chat.nodes import create_chat_node  # noqa: E402
 from app.core.config import settings  # noqa: E402
 from app.schemas.llm import ModelSpec  # noqa: E402
@@ -30,6 +32,7 @@ EXPECTED_REPLY = "REAL_GRAPH_OK"
 
 # 这是发送给真实模型的最小测试消息。
 SMOKE_PROMPT = "Reply with exactly REAL_GRAPH_OK and nothing else."
+SMOKE_CONTEXT = ChatRuntimeContext(user_id=UUID("00000000-0000-4000-8000-000000000001"))
 
 
 async def run_chat_graph_smoke() -> int:
@@ -101,7 +104,8 @@ async def run_chat_graph_smoke() -> int:
                 "messages": [
                     HumanMessage(content=SMOKE_PROMPT),
                 ]
-            }
+            },
+            context=SMOKE_CONTEXT,
         )
     except Exception as error:
         # smoke 脚本允许在最外层捕获异常，以便输出安全诊断摘要。

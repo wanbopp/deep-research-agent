@@ -2,10 +2,9 @@
 
 from langgraph.checkpoint.base import BaseCheckpointSaver
 from langgraph.checkpoint.memory import InMemorySaver
-from langgraph.graph.state import CompiledStateGraph
 from pydantic import SecretStr
 
-from app.agents.chat.graph import build_chat_graph
+from app.agents.chat.graph import ChatGraph, build_chat_graph
 from app.agents.chat.nodes import create_chat_node, create_tool_node
 from app.agents.chat.tools.ask_human import ask_human
 from app.agents.chat.tools.current_time import get_current_utc_time
@@ -20,8 +19,20 @@ from app.services.llm.service import LLMService
 def create_chat_runtime(
     *,
     checkpointer: BaseCheckpointSaver[str] | None = None,
-) -> CompiledStateGraph:
-    """Create one compiled production chat Agent."""
+) -> ChatGraph:
+    """创建一个可跨请求复用、支持可信 runtime context 的聊天图.
+
+    Args:
+        checkpointer: 调用方注入的状态保存器。未提供时使用进程内
+            InMemorySaver；保存器只拥有图状态，不拥有当前用户身份。
+
+    Returns:
+        context 类型固定为 ChatRuntimeContext 的已编译 ChatGraph。具体用户实例
+        仍由后续每一次 ChatService 调用提供。
+
+    Raises:
+        RuntimeError: 模型 API key 未配置，无法构造生产聊天 runtime。
+    """
     # 配置缺失时尽早失败，但错误信息不能包含 key 本身。
     # Settings 使用空字符串表示未配置，因此不能只判断 None。
     if not settings.OPENAI_API_KEY:

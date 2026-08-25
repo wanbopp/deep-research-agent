@@ -18,6 +18,7 @@ import asyncio
 import json
 import os
 from time import perf_counter
+from uuid import UUID
 
 # 这些限制必须在首次导入 app.core.config 前写入环境变量。python-dotenv 默认
 # 不覆盖已经存在的变量，因此本 smoke 可以在继续读取本地 key/base_url/model 的
@@ -31,7 +32,6 @@ os.environ["MAX_TOKENS"] = "256"
 # 这些导入有意放在环境变量之后。E402 noqa 不是忽略设计问题，而是保护
 # Settings 的初始化顺序，避免模块导入时先读取到未收紧的运行参数。
 from langchain_core.messages import AIMessage  # noqa: E402
-from langchain_core.runnables import RunnableConfig  # noqa: E402
 
 from app.agents.chat.runtime import create_chat_runtime  # noqa: E402
 from app.agents.chat.tools.ask_human import ask_human  # noqa: E402
@@ -49,6 +49,7 @@ from app.services.chat import ChatService  # noqa: E402
 
 THREAD_ID = "smoke-chat-interrupt-stream"
 GRAPH_TIMEOUT_SECONDS = 60.0
+SMOKE_USER_ID = UUID("00000000-0000-4000-8000-000000000001")
 
 # 提示词只要求模型作出一次工具决策。模型不能自己伪造“已批准”，因为本节的
 # 目标就是观察它在得到人工回答之前停下来。恢复阶段会在后续独立验证。
@@ -83,14 +84,12 @@ async def run_interrupt_stream_smoke() -> int:
         message=SMOKE_PROMPT,
     )
 
-    # 这份 config 与 ChatService._build_config() 使用相同 thread_id 和递归上限。
-    # thread_id 是 checkpoint 的“存档键”；只要它不同，读取到的就是另一条会话。
-    config: RunnableConfig = {
-        "configurable": {
-            "thread_id": THREAD_ID,
-        },
-        "recursion_limit": 8,
-    }
+    # 9F 后 checkpoint 存档键由可信 user_id 与公开 thread_id 共同生成。直接使用
+    # service helper，确保白盒 snapshot 检查读取的正是 stream_turn 写入的空间。
+    config = ChatService._build_config(
+        user_id=SMOKE_USER_ID,
+        public_thread_id=THREAD_ID,
+    )
 
     events: list[ChatStreamEvent] = []
 
@@ -103,7 +102,10 @@ async def run_interrupt_stream_smoke() -> int:
         # tools 节点随后进入 interrupt()。它没有返回 ToolMessage，因此这里不应
         # 出现 success/error；astream 结束后，ChatService 会根据 snapshot 补出
         # InterruptStreamEvent 和 DoneStreamEvent(interrupted)。
-        async for event in service.stream_turn(request):
+        async for event in service.stream_turn(
+            request,
+            user_id=SMOKE_USER_ID,
+        ):
             events.append(event)
 
         # 断点 2：astream 停止并不代表图到达 END。读取 snapshot 后，next

@@ -23,6 +23,7 @@ import asyncio
 import json
 import os
 from time import perf_counter
+from uuid import UUID
 
 # Settings 在首次导入 app.core.config 时创建，因此必须先设置受控请求参数。
 # dotenv 默认不会覆盖已经存在的环境变量，这些值可以限制本次真实请求成本。
@@ -51,6 +52,7 @@ from app.services.chat import ChatService  # noqa: E402
 
 EXPECTED_REPLY = "REAL_STREAM_TEXT_OK"
 GRAPH_TIMEOUT_SECONDS = 60.0
+SMOKE_USER_ID = UUID("00000000-0000-4000-8000-000000000001")
 
 # 明确禁止工具调用，让本次实验只验证最短路径 chat -> END。
 SMOKE_PROMPT = "Do not call any tool. Reply with exactly REAL_STREAM_TEXT_OK and nothing else."
@@ -89,7 +91,8 @@ async def run_text_stream_smoke() -> int:
             ChatRequest(
                 thread_id="smoke-chat-stream-text",
                 message=SMOKE_PROMPT,
-            )
+            ),
+            user_id=SMOKE_USER_ID,
         ):
             # 断点 3：观察 type(event).__name__ 和 event.event。正常纯文本路径
             # 会多次进入 TokenStreamEvent，最后一次进入 DoneStreamEvent；

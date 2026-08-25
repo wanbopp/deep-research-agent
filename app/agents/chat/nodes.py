@@ -3,10 +3,12 @@
 import asyncio
 from collections.abc import Sequence
 
-from langgraph.errors import GraphBubbleUp
 from langchain_core.messages import AIMessage, ToolMessage
 from langchain_core.messages.tool import ToolCall
+from langgraph.errors import GraphBubbleUp
+from langgraph.runtime import Runtime
 
+from app.agents.chat.context import ChatRuntimeContext
 from app.agents.chat.graph import StateNode
 from app.agents.chat.state import ChatState
 from app.agents.chat.tools.registry import ToolRegistry
@@ -27,8 +29,25 @@ def create_chat_node(
     model_aliases = tuple(aliases)
     model_tools = tool_registry.tools() if tool_registry is not None else ()
 
-    async def chat_node(state: ChatState) -> ChatState:
-        """把当前消息交给 LLMService，并返回一条消息增量."""
+    async def chat_node(
+        state: ChatState,
+        *,
+        runtime: Runtime[ChatRuntimeContext],
+    ) -> ChatState:
+        """把当前消息交给 LLMService，并返回一条消息增量.
+
+        ``runtime.context`` 只来自服务端调用 ``ainvoke/astream`` 时传入的
+        ChatRuntimeContext。这里主动读取它以确认可信身份已经到达节点，但不会把
+        user_id 写入 Prompt、消息或模型参数；模型因此无法查看或覆盖授权身份。
+        """
+        runtime_context = runtime.context
+        if not isinstance(runtime_context, ChatRuntimeContext):
+            raise RuntimeError("chat node requires a trusted runtime context")
+
+        # 当前普通聊天节点尚不执行用户资源查询。保留这个局部变量便于断点确认
+        # 身份注入成功；未来身份相关能力只能使用它，不能相信 ToolCall 参数。
+        _trusted_user_id = runtime_context.user_id
+
         response = await llm_service.call(
             state["messages"],
             aliases=model_aliases,
@@ -115,8 +134,23 @@ def create_tool_node(
             tool_call_id=tool_call_id,
         )
 
-    async def tool_node(state: ChatState) -> ChatState:
-        """并发执行最后一条 AIMessage 中的全部工具调用."""
+    async def tool_node(
+        state: ChatState,
+        *,
+        runtime: Runtime[ChatRuntimeContext],
+    ) -> ChatState:
+        """在可信用户上下文中并发执行全部工具调用.
+
+        当前工具都不访问用户数据，因此 user_id 不会被拼进模型生成的 ``args``。
+        读取 runtime context 的意义是建立今后的授权边界：身份相关工具应由服务端
+        注入此值，而不是要求模型在 ToolCall 中提供 user_id。
+        """
+        runtime_context = runtime.context
+        if not isinstance(runtime_context, ChatRuntimeContext):
+            raise RuntimeError("tool node requires a trusted runtime context")
+
+        _trusted_user_id = runtime_context.user_id
+
         messages = state["messages"]
         if not messages:
             raise ValueError("tool node requires at least one message")

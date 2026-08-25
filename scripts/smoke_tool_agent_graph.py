@@ -4,6 +4,7 @@ import asyncio
 import json
 import os
 from time import perf_counter
+from uuid import UUID
 
 # 必须在导入任何 app 模块前设置，避免 provider 调试日志输出正文。
 os.environ["DEBUG"] = "false"
@@ -13,6 +14,7 @@ from langchain_core.messages import AIMessage, HumanMessage, ToolMessage  # noqa
 from pydantic import SecretStr  # noqa: E402
 
 from app.agents.chat.graph import build_chat_graph  # noqa: E402
+from app.agents.chat.context import ChatRuntimeContext  # noqa: E402
 from app.agents.chat.nodes import create_chat_node, create_tool_node  # noqa: E402
 from app.agents.chat.tools.current_time import get_current_utc_time  # noqa: E402
 from app.agents.chat.tools.registry import ToolRegistry  # noqa: E402
@@ -24,6 +26,7 @@ from app.services.llm.service import LLMService  # noqa: E402
 
 EXPECTED_REPLY = "REAL_TOOL_AGENT_OK"
 GRAPH_TIMEOUT_SECONDS = 60.0
+SMOKE_CONTEXT = ChatRuntimeContext(user_id=UUID("00000000-0000-4000-8000-000000000001"))
 
 SMOKE_PROMPT = (
     "Call the get_current_utc_time tool exactly once. "
@@ -87,6 +90,7 @@ async def run_tool_agent_graph_smoke() -> int:
                 },
                 # 限制图节点步数，防止模型持续重复调用工具。
                 config={"recursion_limit": 6},
+                context=SMOKE_CONTEXT,
             )
     except Exception as error:
         print(

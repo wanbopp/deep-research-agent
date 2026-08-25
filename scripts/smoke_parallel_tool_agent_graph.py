@@ -5,6 +5,7 @@ import json
 import os
 from time import perf_counter
 from typing import Literal
+from uuid import UUID
 
 os.environ["DEBUG"] = "false"
 os.environ["LOG_LEVEL"] = "WARNING"
@@ -14,6 +15,7 @@ from langchain_core.tools import tool  # noqa: E402
 from pydantic import SecretStr  # noqa: E402
 
 from app.agents.chat.graph import build_chat_graph  # noqa: E402
+from app.agents.chat.context import ChatRuntimeContext  # noqa: E402
 from app.agents.chat.nodes import create_chat_node, create_tool_node  # noqa: E402
 from app.agents.chat.tools.registry import ToolRegistry  # noqa: E402
 from app.core.config import settings  # noqa: E402
@@ -24,6 +26,7 @@ from app.services.llm.service import LLMService  # noqa: E402
 
 EXPECTED_REPLY = "REAL_PARALLEL_TOOL_AGENT_OK"
 GRAPH_TIMEOUT_SECONDS = 60.0
+SMOKE_CONTEXT = ChatRuntimeContext(user_id=UUID("00000000-0000-4000-8000-000000000001"))
 
 SMOKE_PROMPT = (
     "Call fetch_research_signal exactly twice in the same assistant turn: "
@@ -110,6 +113,7 @@ async def run_parallel_tool_agent_graph_smoke() -> int:
                     ]
                 },
                 config={"recursion_limit": 6},
+                context=SMOKE_CONTEXT,
             )
     except Exception as error:
         print(

@@ -19,7 +19,7 @@ import os
 from collections.abc import AsyncIterator
 from time import perf_counter
 from typing import cast
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 # Settings 会在 app.core.config 首次导入时创建。提前写入这些环境变量，可以继续
 # 使用本地忽略文件中的 key/base_url/model，同时把真实请求限制为一次尝试、
@@ -35,8 +35,10 @@ from httpx import ASGITransport, AsyncClient, Response  # noqa: E402
 from pydantic import TypeAdapter  # noqa: E402
 from starlette.types import Message, Receive, Scope, Send  # noqa: E402
 
+from app.api.dependencies import get_current_user  # noqa: E402
 from app.core.config import settings  # noqa: E402
 from app.main import app  # noqa: E402
+from app.schemas.auth import AuthenticatedUser  # noqa: E402
 from app.schemas.chat import (  # noqa: E402
     ChatStreamEvent,
     DoneStreamEvent,
@@ -48,6 +50,10 @@ from app.schemas.chat import (  # noqa: E402
 
 EXPECTED_REPLY = "REAL_HTTP_SSE_OK"
 HTTP_TIMEOUT_SECONDS = 120.0
+SMOKE_USER = AuthenticatedUser(
+    user_id=UUID("00000000-0000-4000-8000-000000000001"),
+    email="legacy-sse-smoke@example.com",
+)
 
 # 该提示明确禁止工具，确保本 smoke 只验证最短的真实文本路径：
 # HumanMessage -> chat -> token... -> done(completed)。工具和 HITL 的内部 stream
@@ -241,6 +247,9 @@ async def _probe_disconnect_cancels_body_iterator() -> tuple[bool, bool]:
 async def run_chat_sse_api_smoke() -> int:
     """Run one real SSE request and one deterministic disconnect probe."""
     started_at = perf_counter()
+
+    # 该历史 smoke 聚焦 SSE 传输和真实模型流；身份隔离由 9F 专用 smoke 验证。
+    app.dependency_overrides[get_current_user] = lambda: SMOKE_USER
 
     if not settings.OPENAI_API_KEY:
         _print_failure(

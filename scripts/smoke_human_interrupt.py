@@ -14,6 +14,7 @@
 
 import asyncio
 import json
+from uuid import UUID
 
 from langchain_core.messages import AIMessage, ToolMessage
 from langchain_core.messages.tool import tool_call
@@ -22,6 +23,7 @@ from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.graph import END, START, StateGraph
 from langgraph.types import Command
 
+from app.agents.chat.context import ChatRuntimeContext
 from app.agents.chat.nodes import create_tool_node
 from app.agents.chat.state import ChatState
 from app.agents.chat.tools.ask_human import ask_human
@@ -31,6 +33,7 @@ THREAD_ID = "smoke-human-interrupt"
 TOOL_CALL_ID = "call-human"
 HUMAN_QUESTION = "Approve this bounded smoke action?"
 HUMAN_REPLY = "approved"
+SMOKE_CONTEXT = ChatRuntimeContext(user_id=UUID("00000000-0000-4000-8000-000000000001"))
 
 
 async def smoke_human_interrupt() -> int:
@@ -46,7 +49,10 @@ async def smoke_human_interrupt() -> int:
     #
     # 初始 AIMessage 由脚本手工提供，作用等同于“模型已经决定调用
     # ask_human”。这样可以只观察 interrupt/checkpoint/resume。
-    builder = StateGraph(ChatState)
+    builder = StateGraph(
+        state_schema=ChatState,
+        context_schema=ChatRuntimeContext,
+    )
     builder.add_node("tools", tool_node)
     builder.add_edge(START, "tools")
     builder.add_edge("tools", END)
@@ -88,6 +94,7 @@ async def smoke_human_interrupt() -> int:
             "messages": [model_message],
         },
         config=config,
+        context=SMOKE_CONTEXT,
     )
 
     # aget_state() 读取该 thread_id 最新的 checkpoint 快照。
@@ -114,6 +121,7 @@ async def smoke_human_interrupt() -> int:
     resumed_result = await graph.ainvoke(
         Command(resume=HUMAN_REPLY),
         config=config,
+        context=SMOKE_CONTEXT,
     )
 
     # 恢复完成后再读取 checkpoint。next 为空元组表示没有待执行节点，

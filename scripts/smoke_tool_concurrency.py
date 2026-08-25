@@ -15,11 +15,14 @@ import asyncio
 import inspect
 import json
 from time import perf_counter
+from uuid import UUID
 
 from langchain_core.messages import AIMessage, ToolMessage
 from langchain_core.messages.tool import tool_call
 from langchain_core.tools import tool
+from langgraph.runtime import Runtime
 
+from app.agents.chat.context import ChatRuntimeContext
 from app.agents.chat.nodes import create_tool_node
 from app.agents.chat.tools.registry import ToolRegistry
 
@@ -78,7 +81,10 @@ async def run_tool_concurrency_smoke() -> int:
     started_at = perf_counter()
 
     # 调用 async 函数会创建协程对象，但函数体要到 await 时才开始推进。
-    node_result = node({"messages": [model_message]})
+    node_result = node(
+        {"messages": [model_message]},
+        runtime=Runtime(context=ChatRuntimeContext(user_id=UUID("00000000-0000-4000-8000-000000000001"))),
+    )
 
     # StateNode 为了兼容 LangGraph，同时允许同步和异步节点，
     # 因此静态返回类型是 ChatState | Awaitable[ChatState]。

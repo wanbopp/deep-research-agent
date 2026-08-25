@@ -4,6 +4,7 @@ import asyncio
 import json
 import os
 from time import perf_counter
+from uuid import UUID
 
 # 必须在导入 app 模块之前设置。
 # development 环境默认会开启 DEBUG 和 INFO 日志，可能输出 SDK traceback。
@@ -19,6 +20,7 @@ from langgraph.checkpoint.memory import InMemorySaver  # noqa: E402
 from pydantic import SecretStr  # noqa: E402
 
 from app.agents.chat.graph import build_chat_graph  # noqa: E402
+from app.agents.chat.context import ChatRuntimeContext  # noqa: E402
 from app.agents.chat.nodes import create_chat_node  # noqa: E402
 from app.core.config import settings  # noqa: E402
 from app.schemas.llm import ModelSpec  # noqa: E402
@@ -37,6 +39,8 @@ thread_b: RunnableConfig = {
         "thread_id": "smoke-thread-b",
     }
 }
+
+SMOKE_CONTEXT = ChatRuntimeContext(user_id=UUID("00000000-0000-4000-8000-000000000001"))
 
 
 async def run_chat_graph_memory_smoke() -> int:
@@ -111,18 +115,21 @@ async def run_chat_graph_memory_smoke() -> int:
         thread_a_first = await graph.ainvoke(
             {"messages": [HumanMessage(content=("Reply with exactly THREAD_A_ONE and nothing else."))]},
             config=thread_a,
+            context=SMOKE_CONTEXT,
         )
         completed_calls += 1
 
         thread_a_second = await graph.ainvoke(
             {"messages": [HumanMessage(content=("Reply with exactly THREAD_A_TWO and nothing else."))]},
             config=thread_a,
+            context=SMOKE_CONTEXT,
         )
         completed_calls += 1
 
         thread_b_first = await graph.ainvoke(
             {"messages": [HumanMessage(content=("Reply with exactly THREAD_B_ONE and nothing else."))]},
             config=thread_b,
+            context=SMOKE_CONTEXT,
         )
         completed_calls += 1
     except Exception as error:

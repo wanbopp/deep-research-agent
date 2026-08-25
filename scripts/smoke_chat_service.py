@@ -15,6 +15,7 @@ import asyncio
 import json
 import os
 from time import perf_counter
+from uuid import UUID
 
 # Settings 在 app.core.config 首次导入时创建，因此受控请求参数必须先写入
 # os.environ。load_dotenv 默认不会覆盖已经存在的环境变量。
@@ -36,6 +37,7 @@ CODE_WORD = "BLUEBERRY"
 FIRST_EXPECTED = "TURN_ONE_OK"
 SECOND_EXPECTED = "MEMORY_OK: BLUEBERRY"
 GRAPH_TIMEOUT_SECONDS = 60.0
+SMOKE_USER_ID = UUID("00000000-0000-4000-8000-000000000001")
 
 # Prompt 明确禁止工具调用，使本实验只验证 completed 分支。
 # ask_human/interrupt 已由前一个 checkpoint 的真实 smoke 独立验证。
@@ -64,7 +66,8 @@ async def run_chat_service_smoke() -> int:
             ChatRequest(
                 thread_id=THREAD_ID,
                 message=FIRST_PROMPT,
-            )
+            ),
+            user_id=SMOKE_USER_ID,
         )
 
         # 第二轮只提交当前的新用户消息，不重复传第一轮历史。
@@ -73,7 +76,8 @@ async def run_chat_service_smoke() -> int:
             ChatRequest(
                 thread_id=THREAD_ID,
                 message=SECOND_PROMPT,
-            )
+            ),
+            user_id=SMOKE_USER_ID,
         )
 
         # Service 已隐藏 LangGraph 内部状态；smoke 为验证历史确实累计，

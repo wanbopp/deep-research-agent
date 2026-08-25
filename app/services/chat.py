@@ -4,6 +4,7 @@ import asyncio
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from typing import Any
+from uuid import UUID
 
 from langchain_core.messages import (
     AIMessage,
@@ -12,9 +13,11 @@ from langchain_core.messages import (
     ToolMessage,
 )
 from langchain_core.runnables import RunnableConfig
-from langgraph.graph.state import CompiledStateGraph
 from langgraph.types import Command
 
+from app.agents.chat.context import ChatRuntimeContext
+from app.agents.chat.graph import ChatGraph
+from app.agents.chat.state import ChatState
 from app.core.logging import logger
 from app.schemas.chat import (
     ChatMessage,
@@ -41,16 +44,29 @@ class ChatInterrupt:
 ChatTurnResult = ChatResponse | ChatInterrupt
 
 
+class ChatResumeNotAvailableError(LookupError):
+    """请求的用户会话不存在，或当前没有可恢复的人工中断."""
+
+
 class ChatService:
     """在 API 模型和 LangGraph runtime 之间执行一次聊天用例."""
 
     def __init__(
         self,
-        graph: CompiledStateGraph,
+        graph: ChatGraph,
         *,
         graph_timeout_seconds: float = 90.0,
     ) -> None:
-        """保存共享 graph，并验证单轮图执行的时间预算."""
+        """保存共享 graph，并验证单轮图执行的时间预算.
+
+        Args:
+            graph: 已声明 ChatRuntimeContext schema 的共享 ChatGraph。service 可以
+                跨用户复用它，但不能把任何当前用户保存到 graph 或实例字段。
+            graph_timeout_seconds: 单次 ainvoke/astream 的总执行时间上限，必须大于 0。
+
+        Raises:
+            ValueError: graph_timeout_seconds 小于或等于 0。
+        """
         if graph_timeout_seconds <= 0:
             raise ValueError("graph_timeout_seconds must be greater than 0")
 
@@ -58,16 +74,54 @@ class ChatService:
         self._graph_timeout_seconds = graph_timeout_seconds
 
     @staticmethod
-    def _build_config(thread_id: str) -> RunnableConfig:
-        """为指定会话构造 LangGraph 运行配置."""
-        # 根据 thread_id 创建 RunnableConfig。
+    def _build_checkpoint_thread_id(user_id: UUID, public_thread_id: str) -> str:
+        """构造只在服务端使用的用户隔离 checkpoint key.
+
+        Args:
+            user_id: ``get_current_user`` 已完成 JWT 验签和数据库确认的用户 UUID。
+            public_thread_id: 客户端提交并在响应中继续使用的公开会话标识。
+
+        Returns:
+            同时包含固定长度用户 UUID 和公开 thread ID 的内部 key。不同用户即使
+            提交相同 public_thread_id，也会访问不同的 checkpoint 身份空间。
+
+        Notes:
+            该值不是安全凭据，无需加密；真正的边界来自 user_id 只能由认证依赖
+            提供。它不会返回客户端，也不会进入 Prompt 或 Agent state。
+        """
+        return f"user:{user_id.hex}:thread:{public_thread_id}"
+
+    @classmethod
+    def _build_config(
+        cls,
+        *,
+        user_id: UUID,
+        public_thread_id: str,
+    ) -> RunnableConfig:
+        """为一次用户会话构造隔离的 LangGraph 运行配置.
+
+        Args:
+            user_id: 当前认证用户的可信 UUID。
+            public_thread_id: 当前 HTTP 请求携带的公开 thread ID。
+
+        Returns:
+            供 invoke、stream、resume 和 snapshot 查询共同使用的配置。
+        """
         config: RunnableConfig = {
             "configurable": {
-                "thread_id": thread_id,
+                "thread_id": cls._build_checkpoint_thread_id(
+                    user_id,
+                    public_thread_id,
+                ),
             },
             "recursion_limit": 8,
         }
         return config
+
+    @staticmethod
+    def _build_runtime_context(user_id: UUID) -> ChatRuntimeContext:
+        """把可信用户 UUID 包装成单次图执行的不可变上下文."""
+        return ChatRuntimeContext(user_id=user_id)
 
     @staticmethod
     def _events_from_message_part(data: object) -> tuple[ChatStreamEvent, ...]:
@@ -246,21 +300,36 @@ class ChatService:
     async def run_turn(
         self,
         request: ChatRequest,
+        *,
+        user_id: UUID,
     ) -> ChatTurnResult:
-        """执行一轮 Agent，并返回完成或暂停结果."""
-        graph_input = {
+        """使用可信用户身份执行一轮 Agent，并返回完成或暂停结果.
+
+        Args:
+            request: 已由 Pydantic 校验的公开 thread ID 和本轮消息。
+            user_id: 由 HTTP 认证依赖提供的可信用户 UUID，不能来自 request。
+        """
+        # 显式使用 ChatState，而不是让 Python 把字面量推断成
+        # dict[str, list[HumanMessage]]。list 是不变类型；虽然 HumanMessage 属于
+        # AnyMessage，list[HumanMessage] 仍不能自动替代 list[AnyMessage]。
+        graph_input: ChatState = {
             "messages": [
                 HumanMessage(content=request.message),
             ]
         }
 
-        config = self._build_config(request.thread_id)
+        config = self._build_config(
+            user_id=user_id,
+            public_thread_id=request.thread_id,
+        )
+        runtime_context = self._build_runtime_context(user_id)
 
         # 在整图时间预算内调用 ainvoke
         result = await asyncio.wait_for(
             self._graph.ainvoke(
                 graph_input,
                 config=config,
+                context=runtime_context,
             ),
             timeout=self._graph_timeout_seconds,
         )
@@ -274,14 +343,39 @@ class ChatService:
     async def resume_turn(
         self,
         request: ChatResumeRequest,
+        *,
+        user_id: UUID,
     ) -> ChatTurnResult:
-        """使用人工回答恢复已暂停的 Agent."""
-        config = self._build_config(request.thread_id)
+        """只在当前用户自己的 checkpoint 空间恢复人工中断.
+
+        Args:
+            request: 公开 thread ID 和人工回答。
+            user_id: 当前认证用户的可信 UUID。
+
+        Raises:
+            ChatResumeNotAvailableError: 当前用户的内部 checkpoint 不存在，或其中
+                没有等待恢复的 interrupt。相同错误也用于隐藏其他用户会话是否存在。
+        """
+        config = self._build_config(
+            user_id=user_id,
+            public_thread_id=request.thread_id,
+        )
+        runtime_context = self._build_runtime_context(user_id)
+
+        # 先在“当前用户 + 公开 thread ID”的内部空间检查 interrupt。用户 B 即使
+        # 猜到用户 A 的公开 thread ID，读取的也是 B 自己的空 checkpoint。
+        snapshot = await self._graph.aget_state(config)
+        interrupts = tuple(interrupt for task in snapshot.tasks for interrupt in task.interrupts)
+        if not interrupts:
+            raise ChatResumeNotAvailableError
+        if len(interrupts) != 1:
+            raise RuntimeError("resumable chat graph must contain exactly one interrupt")
 
         result = await asyncio.wait_for(
             self._graph.ainvoke(
                 Command(resume=request.response),
                 config=config,
+                context=runtime_context,
             ),
             timeout=self._graph_timeout_seconds,
         )
@@ -295,6 +389,8 @@ class ChatService:
     async def stream_turn(
         self,
         request: ChatRequest,
+        *,
+        user_id: UUID,
     ) -> AsyncIterator[ChatStreamEvent]:
         """流式执行一轮 Agent，并逐个产生稳定的应用层事件.
 
@@ -304,8 +400,14 @@ class ChatService:
         astream() 负责“边执行图，边报告过程”；本方法负责把框架报告翻译成
         应用协议，并处理取消、错误、安全隔离和最终状态判断。
         """
-        config = self._build_config(request.thread_id)
-        graph_input = {
+        config = self._build_config(
+            user_id=user_id,
+            public_thread_id=request.thread_id,
+        )
+        runtime_context = self._build_runtime_context(user_id)
+        # 与非流式入口使用相同的 ChatState 输入契约，保证 ainvoke/astream 不会
+        # 因局部变量推断差异产生两套类型边界。
+        graph_input: ChatState = {
             "messages": [HumanMessage(content=request.message)],
         }
 
@@ -315,6 +417,7 @@ class ChatService:
                 async for part in self._graph.astream(
                     graph_input,
                     config=config,
+                    context=runtime_context,
                     stream_mode=("messages", "updates"),
                     version="v2",
                 ):

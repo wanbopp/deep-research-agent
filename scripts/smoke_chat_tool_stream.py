@@ -18,6 +18,7 @@ import asyncio
 import json
 import os
 from time import perf_counter
+from uuid import UUID
 
 # 必须在首次导入 app.core.config 前设置。一次工具循环包含两个 chat 节点，
 # 每个节点分别获得 45 秒 LLMService 总预算；外层 graph 使用 100 秒总预算。
@@ -44,6 +45,7 @@ from app.services.chat import ChatService  # noqa: E402
 
 EXPECTED_REPLY = "REAL_TOOL_STREAM_OK"
 GRAPH_TIMEOUT_SECONDS = 1000.0
+SMOKE_USER_ID = UUID("00000000-0000-4000-8000-000000000001")
 
 # 模型只能提出 ToolCall，真正执行工具的是 LangGraph 的 tools 节点。固定回复使
 # smoke 可以验证第二次模型调用确实发生，同时避免依赖时间字符串的具体内容。
@@ -80,7 +82,8 @@ async def run_tool_stream_smoke() -> int:
             ChatRequest(
                 thread_id="smoke-chat-tool-stream",
                 message=SMOKE_PROMPT,
-            )
+            ),
+            user_id=SMOKE_USER_ID,
         ):
             events.append(event)
 
