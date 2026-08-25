@@ -22,6 +22,7 @@ from pydantic import (
     Field,
     SecretStr,
     field_validator,
+    model_validator,
 )
 
 
@@ -108,6 +109,35 @@ class TokenResponse(_StrictAuthModel):
     expires_at: AwareDatetime
 
 
+class AccessTokenClaims(_StrictAuthModel):
+    """验签后仍需通过结构校验的 access token 声明集合.
+
+    字段名沿用 JWT 标准缩写，便于把编码后的 payload 与模型一一对应：
+
+    - ``sub``（subject）：这个 token 代表的用户 UUID；
+    - ``iat``（issued at）：签发时间；
+    - ``exp``（expiration time）：失效时间；
+    - ``jti``（JWT ID）：本次签发的唯一标识；
+    - ``token_type``：本项目自定义的用途标签，防止其他 token 被当作 access token。
+
+    只有签名验证和本模型校验都成功后，``sub`` 才能进入后续身份查询。仅仅把
+    JWT 的 payload 做 base64 解码，得到的仍是不可信外部输入。
+    """
+
+    sub: UUID
+    iat: AwareDatetime
+    exp: AwareDatetime
+    jti: UUID
+    token_type: Literal["access"]
+
+    @model_validator(mode="after")
+    def validate_time_window(self) -> "AccessTokenClaims":
+        """要求失效时间严格晚于签发时间."""
+        if self.exp <= self.iat:
+            raise ValueError("exp must be later than iat")
+        return self
+
+
 class AuthenticatedUser(_EmailAuthModel):
     """JWT 验证完成后在服务端内部传递的可信用户上下文.
 
@@ -121,6 +151,7 @@ class AuthenticatedUser(_EmailAuthModel):
 
 # 控制导出访问和声明模块公开API边界
 __all__ = [
+    "AccessTokenClaims",
     "AuthenticatedUser",
     "LoginRequest",
     "RegisterRequest",

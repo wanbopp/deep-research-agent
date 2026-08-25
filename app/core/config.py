@@ -102,7 +102,7 @@ ENV_FILE = load_env_file()
 #   - 数据库配置（POSTGRES_HOST/PORT/DB/USER/PASSWORD）
 #   - Neo4j 配置（NEO4J_URI/USER/PASSWORD）
 #   - Redis 配置（REDIS_HOST/PORT）
-#   - JWT 配置（SECRET_KEY, ALGORITHM, EXPIRE_DAYS）
+#   - JWT 配置（SECRET_KEY, ALGORITHM, ACCESS_TOKEN_EXPIRE_MINUTES）
 #   - 限流配置（RATE_LIMIT_DEFAULT）
 #   - 日志配置（LOG_LEVEL, LOG_FORMAT）
 #   - Langfuse 可观测性（TRACING_ENABLED, PUBLIC_KEY, SECRET_KEY, HOST）
@@ -174,9 +174,13 @@ class Settings:
         self.CACHE_TTL_SECONDS = int(os.getenv("CACHE_TTL_SECONDS", "60"))
 
         # ---- JWT 认证 ----
-        self.JWT_SECRET_KEY = os.getenv("JWT_SECRET_KEY", "change-me-in-production")
+        # Secret 不提供可工作的默认值：示例 secret 一旦被误带到部署环境，攻击者
+        # 就能自行签发任意身份 token。TokenService 还会执行长度与已知弱值检查。
+        self.JWT_SECRET_KEY = os.getenv("JWT_SECRET_KEY", "")
         self.JWT_ALGORITHM = os.getenv("JWT_ALGORITHM", "HS256")
-        self.JWT_ACCESS_TOKEN_EXPIRE_DAYS = int(os.getenv("JWT_ACCESS_TOKEN_EXPIRE_DAYS", "30"))
+        # Access token 是短期凭据，默认 30 分钟。长期会话恢复以后由 refresh/session
+        # 机制负责，不能简单地把 bearer access token 延长到 30 天。
+        self.JWT_ACCESS_TOKEN_EXPIRE_MINUTES = int(os.getenv("JWT_ACCESS_TOKEN_EXPIRE_MINUTES", "30"))
 
         # ---- 限流 ----
         rate_limit = os.getenv("RATE_LIMIT_DEFAULT", "200 per day,50 per hour")
