@@ -1,13 +1,23 @@
 """用户注册与登录 HTTP 入口."""
 
 from typing import Annotated
+from uuid import UUID
 
 from fastapi import APIRouter, Depends, status
 from fastapi.responses import JSONResponse
 
-from app.api.dependencies import get_auth_service
+from app.api.dependencies import (
+    CurrentUserDependency,
+    MatchingUserDependency,
+    get_auth_service,
+)
 from app.core.exception_handlers import build_error_content
-from app.schemas.auth import LoginRequest, RegisterRequest, TokenResponse
+from app.schemas.auth import (
+    AuthenticatedUser,
+    LoginRequest,
+    RegisterRequest,
+    TokenResponse,
+)
 from app.schemas.base import ErrorResponse
 from app.services.auth import (
     AuthService,
@@ -92,3 +102,67 @@ async def login_user(
             message="Email or password is incorrect",
             headers={"WWW-Authenticate": "Bearer"},
         )
+
+
+@router.get(
+    "/me",
+    response_model=AuthenticatedUser,
+    responses={
+        status.HTTP_401_UNAUTHORIZED: {
+            "model": ErrorResponse,
+            "description": "Bearer token is missing or invalid",
+        },
+    },
+)
+async def read_current_user(
+    current_user: CurrentUserDependency,
+) -> AuthenticatedUser:
+    """返回服务端已经验签并经数据库确认的当前用户.
+
+    Args:
+        current_user: FastAPI 调用 get_current_user 后注入的可信身份。Route 不接触
+            原始 Authorization header，也不会自行解码 JWT。
+
+    Returns:
+        只包含 user_id 和数据库当前 email 的公开安全模型。token、claims 和
+        password_hash 不会进入响应。
+    """
+    return current_user
+
+
+@router.get(
+    "/users/{user_id}",
+    response_model=AuthenticatedUser,
+    responses={
+        status.HTTP_401_UNAUTHORIZED: {
+            "model": ErrorResponse,
+            "description": "Bearer token is missing or invalid",
+        },
+        status.HTTP_403_FORBIDDEN: {
+            "model": ErrorResponse,
+            "description": "Authenticated user cannot access this user scope",
+        },
+    },
+)
+async def read_user_identity(
+    user_id: UUID,
+    current_user: MatchingUserDependency,
+) -> AuthenticatedUser:
+    """读取与当前身份相同的用户作用域，并明确演示 403 边界.
+
+    Args:
+        user_id: 客户端在路径中指定的用户 UUID。require_current_user_id 会在 route
+            执行前把它与可信 current_user.user_id 比较。
+        current_user: 只有完成认证且路径 ID 与登录用户相同时才会注入。
+
+    Returns:
+        当前已认证用户的安全身份模型。
+
+    Notes:
+        该路由用于需要显式用户作用域的 API。资源 UUID 查询不应先查询资源再返回
+        403，而应直接在 Repository 中组合资源 ID 和用户 ID，跨用户时返回 not found。
+    """
+    # user_id 已由 dependency 校验。保留参数可以让 OpenAPI 明确展示路径输入，
+    # current_user 才是后续业务代码应信任的身份来源。
+    _ = user_id
+    return current_user
