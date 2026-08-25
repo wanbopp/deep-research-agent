@@ -32,6 +32,10 @@ from app.schemas.chat import (
     TokenStreamEvent,
     ToolStreamEvent,
 )
+from app.services.chat_session_ownership import (
+    ChatSessionNotFoundError,
+    ChatSessionOwnershipVerifier,
+)
 from app.services.chat_guard import (
     ChatExecutionGuard,
     ChatExecutionGuardUnavailableError,
@@ -55,13 +59,19 @@ class ChatResumeNotAvailableError(LookupError):
 
 
 class ChatService:
-    """在 API 模型和 LangGraph runtime 之间执行一次聊天用例."""
+    """在 API 模型、业务授权和 LangGraph runtime 之间执行聊天用例.
+
+    该对象由 lifespan 创建并跨请求共享，因此只能保存无请求状态的 Graph、guard、
+    ownership verifier 和配置值。当前 user_id、会话 UUID、RunnableConfig 与
+    AsyncSession 都必须在单次方法调用中创建和释放，不能进入实例字段。
+    """
 
     def __init__(
         self,
         graph: ChatGraph,
         *,
         execution_guard: ChatExecutionGuard,
+        ownership_verifier: ChatSessionOwnershipVerifier,
         graph_timeout_seconds: float = 90.0,
     ) -> None:
         """保存共享 graph，并验证单轮图执行的时间预算.
@@ -71,12 +81,16 @@ class ChatService:
                 跨用户复用它，但不能把任何当前用户保存到 graph 或实例字段。
             execution_guard: 按内部 thread ID 协调执行权的应用层接口。production
                 注入 Redis 实现，保证不同 worker 也能看到相同 busy 状态。
+            ownership_verifier: 在 Graph 执行前验证业务 ChatSession 所有权的应用层
+                协议。production 注入只保存 sessionmaker 的 PostgreSQL 实现；它不
+                让共享 ChatService 持有请求级 AsyncSession。
             graph_timeout_seconds: 单次 ainvoke/astream 的总执行时间上限，必须大于 0。
 
         Raises:
             ValueError: graph_timeout_seconds 小于或等于 0。
 
-        对象在项目启动时已经初始化
+        Notes:
+            构造发生在应用 startup；依赖对象均可跨请求共享，但不能保存当前用户。
         """
         if graph_timeout_seconds <= 0:
             raise ValueError("graph_timeout_seconds must be greater than 0")
@@ -84,6 +98,7 @@ class ChatService:
         self._graph = graph
         self._execution_guard = execution_guard
         self._graph_timeout_seconds = graph_timeout_seconds
+        self._ownership_verifier = ownership_verifier
 
     @staticmethod
     def _build_checkpoint_thread_id(user_id: UUID, public_thread_id: str) -> str:
@@ -91,7 +106,7 @@ class ChatService:
 
         Args:
             user_id: ``get_current_user`` 已完成 JWT 验签和数据库确认的用户 UUID。
-            public_thread_id: 客户端提交并在响应中继续使用的公开会话标识。
+            public_thread_id: 已规范化为标准 UUID 文本的公开业务会话标识。
 
         Returns:
             同时包含固定长度用户 UUID 和公开 thread ID 的内部 key。不同用户即使
@@ -153,7 +168,8 @@ class ChatService:
 
         Args:
             user_id: 已由认证依赖确认的当前用户 UUID。
-            public_thread_id: 客户端可见的会话 ID。
+            public_thread_id: 客户端可见的会话 ID。10F-C3 会在 Pydantic 层直接
+                收紧为 UUID；当前过渡步骤仍在这里拒绝历史任意字符串。
 
         Yields:
             与 guard 使用同一个内部 thread ID 构造的 RunnableConfig。
@@ -161,17 +177,39 @@ class ChatService:
         Raises:
             ChatThreadBusyError: 相同内部 thread 已有 Graph 正在执行。
             ChatExecutionGuardUnavailableError: guard 后端无法安全协调执行权。
+            ChatSessionNotFoundError: 公开 ID 不是 UUID，或当前用户不拥有该会话。
+            SQLAlchemyError: 所有权查询的数据库不可用。基础设施故障必须继续向上
+                传播，不能伪装成“会话不存在”。
 
         Notes:
             这个 helper 是三个公开入口的共同临界区边界。不要分别在 run、resume、
             stream 中手写 Redis 获取和释放，否则某条异常路径很容易遗漏 finally。
         """
+        # C2 仍接收旧 schema 的 str，因此先转换为真正 UUID。C3 把 schema 收紧后，
+        # 这里可以改为直接接收 UUID。非法格式在取得 Redis guard 前即可安全拒绝：
+        # 它不可能对应业务行，也不存在需要与删除操作协调的真实资源。
+        try:
+            session_id = UUID(public_thread_id)
+        except ValueError:
+            raise ChatSessionNotFoundError from None
+
+        # 同一个 UUID 可能有大小写等不同文本表示。内部 checkpoint/guard key 必须
+        # 使用唯一规范文本，否则同一业务会话可能意外映射到两套执行状态。
+        canonical_thread_id = str(session_id)
+
         internal_thread_id = self._build_checkpoint_thread_id(
             user_id,
-            public_thread_id,
+            canonical_thread_id,
         )
 
         async with self._execution_guard.hold(internal_thread_id):
+            # 授权查询必须位于同 key guard 内。10F-D 的删除流程也会取得这把锁，
+            # 因而不会在“检查通过”和 Graph 真正执行之间删除业务行/checkpoint。
+            await self._ownership_verifier.require_owned(
+                session_id=session_id,
+                user_id=user_id,
+            )
+
             # guard key 和 configurable.thread_id 必须来自同一个局部变量。
             yield self._build_config_from_internal_thread_id(internal_thread_id)
 

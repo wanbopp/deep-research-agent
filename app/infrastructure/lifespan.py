@@ -10,6 +10,9 @@ from fastapi import FastAPI
 from app.agents.chat.runtime import create_chat_runtime
 from app.core.config import Settings, settings
 from app.core.logging import logger
+from app.infrastructure.chat_session_ownership import (
+    PostgresChatSessionOwnershipVerifier,
+)
 from app.infrastructure.chat_guard import RedisChatExecutionGuard
 from app.infrastructure.factory import create_application_resources
 from app.infrastructure.neo4j import probe_neo4j
@@ -151,15 +154,23 @@ async def lifespan(
             lease_seconds=CHAT_GUARD_LEASE_SECONDS,
         )
 
-        # 5. ChatService 同时持有共享 Graph 和 guard。两者都不保存当前用户；用户
-        # 身份和公开 thread ID 仍由每次请求传入并构造独立内部 key。
+        # 5. verifier 可以跨请求共享，因为它只保存 sessionmaker；每次授权检查才
+        # 创建独立短生命周期 AsyncSession。不能把一个 Session 放入 app.state 或
+        # ChatService，否则并发 Graph 会共享事务、identity map 和失败状态。
+        ownership_verifier = PostgresChatSessionOwnershipVerifier(
+            resources.orm_session_factory,
+        )
+
+        # 6. ChatService 持有共享 Graph、guard 和无状态 verifier。三者都不保存
+        # 当前用户；身份和公开 thread ID 仍由每次请求传入并构造独立内部 key。
         chat_service = ChatService(
             graph,
             execution_guard=execution_guard,
+            ownership_verifier=ownership_verifier,
             graph_timeout_seconds=CHAT_GRAPH_TIMEOUT_SECONDS,
         )
 
-        # 6. 所有 startup 步骤成功后，才同时发布底层资源和上层应用服务。
+        # 7. 所有 startup 步骤成功后，才同时发布底层资源和上层应用服务。
         # yield 前 FastAPI 尚未接收请求，因此请求不会看到只发布一半的状态。
         app.state.resources = resources
         app.state.chat_service = chat_service
