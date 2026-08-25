@@ -48,8 +48,9 @@ class ChatRequest(BaseModel):
 
     model_config = ConfigDict(extra="forbid", frozen=True)
 
-    # 当前阶段由客户端临时提供 thread_id。Phase 4 引入身份与持久化后，
-    # 服务端会把它映射到经过授权的会话资源。
+    # 10F-A 已把 ChatSession UUID 定义为目标公开标识，但这里暂时保留旧字符串
+    # 类型。等 10F-C 把 session_id + current_user.user_id 所有权查询接入三个
+    # Chat 入口时，再一次性收紧为 UUID，避免形成“只校验格式却没有授权”的假边界。
     thread_id: str = Field(
         min_length=1,
         max_length=MAX_THREAD_ID_LENGTH,

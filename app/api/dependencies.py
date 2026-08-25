@@ -26,6 +26,7 @@ from app.services.auth import (
     TokenService,
 )
 from app.services.chat import ChatService
+from app.services.chat_sessions import ChatSessionService
 
 
 # 当前 /auth/login 接收 JSON，并不是 OAuth2 Password Flow 规定的 form token
@@ -53,6 +54,21 @@ async def get_db_session(request: Request) -> AsyncIterator[AsyncSession]:
     resources = get_application_resources(request.app)
     async with resources.orm_session_factory() as session:
         yield session
+
+
+def get_chat_session_service(
+    session: Annotated[AsyncSession, Depends(get_db_session)],
+) -> ChatSessionService:
+    """为一次 HTTP 请求构造业务会话 application service.
+
+    Args:
+        session: FastAPI 从 get_db_session 注入的请求级 AsyncSession。相同请求中的
+            get_current_user 会复用它，但认证事务会在 route 执行前结束。
+
+    Returns:
+        使用该 Session 协调会话事务与所有权查询的 ChatSessionService。
+    """
+    return ChatSessionService(session)
 
 
 @lru_cache(maxsize=1)
@@ -145,12 +161,19 @@ async def get_current_user(
         # 不把底层异常串进 HTTPException，避免错误链或响应泄漏 token 诊断细节。
         raise _authentication_required() from None
 
-    user = await UserRepository(session).get_by_id(claims.sub)
-    if user is None:
-        # 有效签名并不保证账户仍然存在。删除用户后，旧 access token 会在这里失效。
-        raise _authentication_required()
+    # SQLAlchemy 的 SELECT 也会自动开启事务。如果这里不显式结束事务，同一请求
+    # 后续的 ChatSessionService 再执行 session.begin() 就会报 transaction already
+    # begun。认证查询使用一个短事务，结束后同一请求级 Session 可以顺序开启业务事务。
+    async with session.begin():
+        user = await UserRepository(session).get_by_id(claims.sub)
+        if user is None:
+            # 有效签名并不保证账户仍然存在。删除用户后，旧 access token 会在这里失效。
+            raise _authentication_required()
 
-    return AuthenticatedUser(user_id=user.id, email=user.email)
+        # 在事务内转换为不依赖 ORM 的可信上下文；route 不持有 User ORM 实体。
+        authenticated_user = AuthenticatedUser(user_id=user.id, email=user.email)
+
+    return authenticated_user
 
 
 # 类型别名同时保留 Python 类型和 FastAPI 依赖来源。Route 只声明“需要可信用户”，
