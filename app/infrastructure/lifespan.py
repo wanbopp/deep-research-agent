@@ -7,6 +7,7 @@ from typing import cast
 
 from fastapi import FastAPI
 
+from app.agents.chat.runtime import create_chat_runtime
 from app.core.config import Settings, settings
 from app.core.logging import logger
 from app.infrastructure.factory import create_application_resources
@@ -15,10 +16,21 @@ from app.infrastructure.postgres import probe_postgres
 from app.infrastructure.probes import DependencyName, DependencyProbeResult
 from app.infrastructure.redis import probe_redis
 from app.infrastructure.resources import ApplicationResources
+from app.services.chat import ChatService
 
 STARTUP_PROBE_TIMEOUT_SECONDS = 5.0
 STARTUP_TOTAL_TIMEOUT_SECONDS = 8.0
 REQUIRED_DEPENDENCIES = frozenset({DependencyName.POSTGRES})
+
+
+def get_application_chat_service(app: FastAPI) -> ChatService:
+    """读取 lifespan 已创建的共享 ChatService."""
+    try:
+        chat_service = app.state.chat_service
+    except AttributeError as exc:
+        raise RuntimeError("Application chat service is not initialized") from exc
+    # cast 只帮助静态类型检查，不会在运行时转换或复制 ChatService。
+    return cast(ChatService, chat_service)
 
 
 def get_application_resources(app: FastAPI) -> ApplicationResources:
@@ -121,8 +133,18 @@ async def lifespan(
             backend="postgres",
         )
 
-        # startup 验收通过后才把 resources 保存到 app.state。
+        # 3. 编译 production Graph。
+        graph = create_chat_runtime(
+            checkpointer=resources.checkpointer,
+        )
+
+        # 4. 用 Graph 创建应用服务。
+        chat_service = ChatService(graph)
+
+        # 5. 所有 startup 步骤成功后，才同时发布底层资源和上层应用服务。
+        # yield 前 FastAPI 尚未接收请求，因此请求不会看到只发布一半的状态。
         app.state.resources = resources
+        app.state.chat_service = chat_service
 
         logger.info(
             "infrastructure_initialized",
@@ -133,7 +155,9 @@ async def lifespan(
             # yield 之后，FastAPI 才开始对外处理 HTTP/Agent 请求。
             yield
         finally:
-            # shutdown 开始后先移除引用，避免关闭期间继续获取资源。
+            # shutdown 先撤下依赖资源的 ChatService，再撤下底层资源引用。
+            # 真正的客户端和连接池随后由 AsyncExitStack 按逆序关闭。
+            del app.state.chat_service
             del app.state.resources
             logger.info("infrastructure_shutdown_started")
 

@@ -12,9 +12,11 @@ from fastapi import Depends, HTTPException, Request, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.agents.chat.runtime import create_chat_runtime
 from app.core.config import settings
-from app.infrastructure.lifespan import get_application_resources
+from app.infrastructure.lifespan import (
+    get_application_chat_service,
+    get_application_resources,
+)
 from app.repositories import UserRepository
 from app.schemas.auth import AuthenticatedUser
 from app.services.auth import (
@@ -33,11 +35,9 @@ from app.services.chat import ChatService
 http_bearer = HTTPBearer(auto_error=False)
 
 
-@lru_cache(maxsize=1)
-def get_chat_service() -> ChatService:
-    """创建并复用进程内唯一的聊天应用服务."""
-    graph = create_chat_runtime()
-    return ChatService(graph)
+def get_chat_service(request: Request) -> ChatService:
+    """返回当前 FastAPI 应用在 startup 创建的共享聊天服务."""
+    return get_application_chat_service(request.app)
 
 
 async def get_db_session(request: Request) -> AsyncIterator[AsyncSession]:
