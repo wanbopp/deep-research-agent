@@ -29,6 +29,9 @@ class PostgresMemoryStore:
     store 保存的是 ``async_sessionmaker``，不是可变的 ``AsyncSession``。每个方法
     都创建自己的短生命周期 Session，因此同一个 store 可以被多个请求并发复用，
     而不会让事务、identity map 或 rollback 状态串到其他请求。
+
+
+    依托 embedder 功能对记忆入库前计算向量，入库后通过查询文件向量化后查询数据库
     """
 
     def __init__(
@@ -125,7 +128,9 @@ class PostgresMemoryStore:
             MemorySourceNotFoundError: 来源会话不存在、不是 active 或属于其他用户。
             MemoryUnavailableError: provider 或 PostgreSQL 无法安全完成写入。
         """
-        # 第一次短查询用于尽早拒绝非法来源，避免为明显无效的请求支付模型成本。
+        # 第一次短查询用于查询当前session是否存在且有效
+        # 尽早拒绝非法来源，避免为明显无效的请求支付模型成本。
+        # 分两次检查快速失败
         await self._require_active_source(
             user_id=user_id,
             source_thread_id=memory.source_thread_id,
@@ -133,6 +138,7 @@ class PostgresMemoryStore:
         )
 
         # provider 请求不能放进 session.begin()。外部网络慢或重试时，数据库连接
+        # provider 指的是外部API模型，API服务
         # 应立即归还连接池，而不是长期占用事务和潜在行锁。
         (embedding,) = await self._embedder.embed_documents((memory.content,))
 
@@ -207,7 +213,10 @@ class PostgresMemoryStore:
         source_thread_id: UUID,
         lock_row: bool,
     ) -> None:
-        """在独立短 Session 中验证来源会话归属."""
+        """在独立短 Session 中验证来源会话归属.
+
+        用于在写入记忆之前确认：这条记忆声称的来源 thread 确实属于当前用户，并且该 thread 还处于 active 状态
+        """
         try:
             async with self._session_factory() as session:
                 await self._require_active_source_in_session(
