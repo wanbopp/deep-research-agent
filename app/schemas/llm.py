@@ -6,7 +6,7 @@ from pydantic import BaseModel, ConfigDict, Field, SecretStr
 class ModelSpec(BaseModel):
     """描述一个可通过稳定 alias 查找的模型配置."""
 
-    # frozen 禁止修改模型字段，为后续 overrides 隔离提供基础
+    # frozen 对象实例化后禁止修改模型字段，为后续 overrides 隔离提供基础
     # str_strip_whitespace 自动去除字符串首尾的空白
     model_config = ConfigDict(
         frozen=True,
