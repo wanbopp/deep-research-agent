@@ -5,6 +5,7 @@
 
 from collections.abc import AsyncIterator
 from functools import lru_cache
+from ipaddress import ip_address
 from typing import Annotated
 from uuid import UUID
 
@@ -17,6 +18,8 @@ from app.infrastructure.lifespan import (
     get_application_cache,
     get_application_chat_cleanup_service,
     get_application_chat_service,
+    get_application_rate_limiter,
+    get_application_rate_limit_policies,
     get_application_resources,
 )
 from app.repositories import UserRepository
@@ -30,6 +33,12 @@ from app.services.auth import (
 from app.services.chat import ChatService
 from app.services.chat_session_cleanup import ChatSessionCleanupService
 from app.services.chat_sessions import ChatSessionService
+from app.services.rate_limit import (
+    RateLimiter,
+    RateLimitIdentityUnavailableError,
+    RateLimitPolicies,
+    enforce_rate_limit,
+)
 
 
 # 当前 /auth/login 接收 JSON，并不是 OAuth2 Password Flow 规定的 form token
@@ -42,6 +51,71 @@ http_bearer = HTTPBearer(auto_error=False)
 def get_chat_service(request: Request) -> ChatService:
     """返回当前 FastAPI 应用在 startup 创建的共享聊天服务."""
     return get_application_chat_service(request.app)
+
+
+def get_rate_limiter(request: Request) -> RateLimiter:
+    """返回 startup 创建并借用共享 Redis client 的限流器."""
+    return get_application_rate_limiter(request.app)
+
+
+def get_rate_limit_policies(request: Request) -> RateLimitPolicies:
+    """返回 startup 已校验的不可变限流策略集合."""
+    return get_application_rate_limit_policies(request.app)
+
+
+def _get_client_ip_identity(request: Request) -> str:
+    """从当前直连边界取得规范化客户端 IP.
+
+    Args:
+        request: Starlette 根据实际 ASGI 连接建立的请求对象。
+
+    Returns:
+        规范化后的 IPv4 或 IPv6 字符串，只会在限流适配器内参与摘要计算。
+
+    Raises:
+        RateLimitIdentityUnavailableError: ASGI server 没有提供客户端地址，或地址
+            不是合法 IP。此时无法安全计数，不能用公共常量把所有用户混在一起。
+
+    Security:
+        当前没有配置可信反向代理边界，因此刻意不读取 ``X-Forwarded-For``。
+        直接相信该 header 会允许客户端伪造不同 IP 绕过注册和登录限流。
+    """
+    if request.client is None:
+        raise RateLimitIdentityUnavailableError
+
+    try:
+        return str(ip_address(request.client.host))
+    except ValueError:
+        raise RateLimitIdentityUnavailableError from None
+
+
+async def enforce_auth_rate_limit(
+    request: Request,
+    limiter: Annotated[RateLimiter, Depends(get_rate_limiter)],
+    policies: Annotated[RateLimitPolicies, Depends(get_rate_limit_policies)],
+) -> None:
+    """在注册或登录业务执行前按可信客户端 IP 消费一次额度.
+
+    Args:
+        request: 用于读取 ASGI 直连客户端地址；不会读取 email 或 password。
+        limiter: lifespan 发布的共享 Redis 限流适配器。
+        policies: startup 已校验的固定策略集合。
+
+    Raises:
+        RateLimitExceededError: Redis 明确确认 IP 已耗尽认证入口额度。
+        RateLimitBackendUnavailableError: Redis 无法完成原子判断。
+        RateLimitIdentityUnavailableError: 无法从可信边界建立客户端 IP。
+    """
+    identity = _get_client_ip_identity(request)
+    await enforce_rate_limit(
+        limiter,
+        policy=policies.auth,
+        identity=f"ip:{identity}",
+    )
+
+
+# 匿名认证入口只需要“依赖成功执行”这个事实，不需要把判断对象传给 route。
+AnonymousAuthRateLimitDependency = Annotated[None, Depends(enforce_auth_rate_limit)]
 
 
 def get_chat_session_cleanup_service(
@@ -216,6 +290,39 @@ async def get_current_user(
 # 不需要知道 JWT、Session 或 Repository 的组合过程。
 # 声明类型是 AuthenticatedUser 值从 get_current_user 中获取
 CurrentUserDependency = Annotated[AuthenticatedUser, Depends(get_current_user)]
+
+
+async def enforce_agent_rate_limit(
+    current_user: CurrentUserDependency,
+    limiter: Annotated[RateLimiter, Depends(get_rate_limiter)],
+    policies: Annotated[RateLimitPolicies, Depends(get_rate_limit_policies)],
+) -> None:
+    """在 ChatService 与 Agent Graph 执行前按可信 user_id 消费额度.
+
+    Args:
+        current_user: ``get_current_user`` 验签并查询数据库后建立的可信身份。
+        limiter: lifespan 发布的共享 Redis 限流适配器。
+        policies: startup 已校验的固定策略集合。
+
+    Raises:
+        RateLimitExceededError: 用户已耗尽当前 Agent 请求窗口。
+        RateLimitBackendUnavailableError: Redis 无法可靠判断额度。
+
+    Notes:
+        这里不能使用客户端可自由创建的 ``thread_id``，否则同一用户只需不断换
+        thread 就能绕过模型成本保护。FastAPI 还会缓存同一请求中的 dependency
+        结果，所以 route 再声明 CurrentUserDependency 不会重复查询用户。
+    """
+    await enforce_rate_limit(
+        limiter,
+        policy=policies.agent,
+        identity=f"user:{current_user.user_id}",
+    )
+
+
+# dependency 在 route 函数体之前完成。拒绝时不会构造 ChatService 调用、进入
+# execution guard、运行 LangGraph 或向真实模型 provider 发送请求。
+AgentRateLimitDependency = Annotated[None, Depends(enforce_agent_rate_limit)]
 
 
 def require_current_user_id(

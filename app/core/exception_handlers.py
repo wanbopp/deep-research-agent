@@ -18,6 +18,11 @@ from app.services.chat_guard import (
     ChatThreadBusyError,
 )
 from app.services.chat_session_cleanup import ChatCheckpointCleanupError
+from app.services.rate_limit import (
+    RateLimitBackendUnavailableError,
+    RateLimitExceededError,
+    RateLimitIdentityUnavailableError,
+)
 
 
 def get_request_id() -> str | None:
@@ -209,6 +214,63 @@ async def chat_checkpoint_cleanup_exception_handler(
     )
 
 
+async def rate_limit_exceeded_exception_handler(
+    request: Request,
+    exc: RateLimitExceededError,
+) -> JSONResponse:
+    """把 Redis 已确认的额度耗尽转换为统一 HTTP 429.
+
+    Args:
+        request: 当前请求，仅用于记录 method/path。
+        exc: 携带当前 Redis 窗口剩余秒数的应用层异常。
+
+    Returns:
+        带稳定错误结构和 ``Retry-After`` header 的 429 响应。
+    """
+    logger.warning(
+        "rate_limit_exceeded",
+        method=request.method,
+        path=request.url.path,
+        retry_after_seconds=exc.retry_after_seconds,
+    )
+    return JSONResponse(
+        status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+        content=build_error_content(
+            code="RATE_LIMIT_EXCEEDED",
+            message="Too many requests",
+        ),
+        headers={"Retry-After": str(exc.retry_after_seconds)},
+    )
+
+
+async def rate_limit_unavailable_exception_handler(
+    request: Request,
+    exc: RateLimitBackendUnavailableError | RateLimitIdentityUnavailableError,
+) -> JSONResponse:
+    """在无法可靠判断额度时 fail-closed 为统一 HTTP 503.
+
+    Args:
+        request: 当前请求，仅用于安全日志上下文。
+        exc: Redis 后端故障或可信身份边界缺失。两者都不代表用户已超限。
+
+    Returns:
+        不包含 IP、user_id、Redis key 或底层驱动文本的 503 响应。
+    """
+    logger.error(
+        "rate_limit_unavailable",
+        method=request.method,
+        path=request.url.path,
+        error_type=type(exc).__name__,
+    )
+    return JSONResponse(
+        status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+        content=build_error_content(
+            code="RATE_LIMIT_UNAVAILABLE",
+            message="Request rate limit is temporarily unavailable",
+        ),
+    )
+
+
 async def unhandled_exception_handler(
     request: Request,
     exc: Exception,
@@ -276,6 +338,23 @@ def register_exception_handlers(app: FastAPI) -> None:
             HTTPExceptionHandler,
             chat_checkpoint_cleanup_exception_handler,
         ),
+    )
+
+    # 429 只表示 Redis 已确认额度耗尽。后端故障或无法建立可信身份使用 503，
+    # 防止把基础设施故障错误归因给用户，也防止高成本 Agent 请求 fail-open。
+    app.add_exception_handler(
+        RateLimitExceededError,
+        cast(HTTPExceptionHandler, rate_limit_exceeded_exception_handler),
+    )
+
+    app.add_exception_handler(
+        RateLimitBackendUnavailableError,
+        cast(HTTPExceptionHandler, rate_limit_unavailable_exception_handler),
+    )
+
+    app.add_exception_handler(
+        RateLimitIdentityUnavailableError,
+        cast(HTTPExceptionHandler, rate_limit_unavailable_exception_handler),
     )
 
     app.add_exception_handler(

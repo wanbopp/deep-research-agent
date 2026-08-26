@@ -6,7 +6,11 @@ from typing import Annotated
 from fastapi import APIRouter, Depends, HTTPException, status
 from fastapi.responses import StreamingResponse
 
-from app.api.dependencies import CurrentUserDependency, get_chat_service
+from app.api.dependencies import (
+    AgentRateLimitDependency,
+    CurrentUserDependency,
+    get_chat_service,
+)
 from app.api.sse import encode_sse_event
 from app.schemas.base import ErrorResponse
 from app.schemas.chat import (
@@ -62,9 +66,13 @@ def _to_api_response(result: ChatTurnResult) -> ChatAPIResponse:
             "model": ErrorResponse,
             "description": "The chat thread is already being processed",
         },
+        status.HTTP_429_TOO_MANY_REQUESTS: {
+            "model": ErrorResponse,
+            "description": "Agent request rate limit exceeded",
+        },
         status.HTTP_503_SERVICE_UNAVAILABLE: {
             "model": ErrorResponse,
-            "description": "The chat execution guard is unavailable",
+            "description": "Chat execution guard or request rate limiter is unavailable",
         },
     },
 )
@@ -72,6 +80,7 @@ async def create_chat_turn(
     request: ChatRequest,
     service: ChatServiceDependency,
     current_user: CurrentUserDependency,
+    _rate_limit: AgentRateLimitDependency,
 ) -> ChatAPIResponse:
     """使用服务端认证身份开始或继续一轮普通聊天."""
     try:
@@ -104,9 +113,13 @@ async def create_chat_turn(
             "model": ErrorResponse,
             "description": "The chat thread is already being processed",
         },
+        status.HTTP_429_TOO_MANY_REQUESTS: {
+            "model": ErrorResponse,
+            "description": "Agent request rate limit exceeded",
+        },
         status.HTTP_503_SERVICE_UNAVAILABLE: {
             "model": ErrorResponse,
-            "description": "The chat execution guard is unavailable",
+            "description": "Chat execution guard or request rate limiter is unavailable",
         },
     },
 )
@@ -114,6 +127,7 @@ async def resume_chat_turn(
     request: ChatResumeRequest,
     service: ChatServiceDependency,
     current_user: CurrentUserDependency,
+    _rate_limit: AgentRateLimitDependency,
 ) -> ChatAPIResponse:
     """只在当前用户自己的 checkpoint 空间恢复暂停的 Agent."""
     try:
@@ -150,12 +164,21 @@ async def resume_chat_turn(
             "model": ErrorResponse,
             "description": "Bearer token is missing or invalid",
         },
+        status.HTTP_429_TOO_MANY_REQUESTS: {
+            "model": ErrorResponse,
+            "description": "Agent request rate limit exceeded",
+        },
+        status.HTTP_503_SERVICE_UNAVAILABLE: {
+            "model": ErrorResponse,
+            "description": "Request rate limiter is unavailable",
+        },
     },
 )
 async def stream_chat_turn(
     request: ChatRequest,
     service: ChatServiceDependency,
     current_user: CurrentUserDependency,
+    _rate_limit: AgentRateLimitDependency,
 ) -> StreamingResponse:
     """以 Server-Sent Events 持续输出一轮 Agent 事件."""
 

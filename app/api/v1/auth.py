@@ -7,6 +7,7 @@ from fastapi import APIRouter, Depends, status
 from fastapi.responses import JSONResponse
 
 from app.api.dependencies import (
+    AnonymousAuthRateLimitDependency,
     CurrentUserDependency,
     MatchingUserDependency,
     get_auth_service,
@@ -61,11 +62,20 @@ def _auth_error_response(
             "model": ErrorResponse,
             "description": "Email is already registered",
         },
+        status.HTTP_429_TOO_MANY_REQUESTS: {
+            "model": ErrorResponse,
+            "description": "Authentication request rate limit exceeded",
+        },
+        status.HTTP_503_SERVICE_UNAVAILABLE: {
+            "model": ErrorResponse,
+            "description": "Request rate limiter is unavailable",
+        },
     },
 )
 async def register_user(
     request: RegisterRequest,
     service: AuthServiceDependency,
+    _rate_limit: AnonymousAuthRateLimitDependency,
 ) -> TokenResponse | JSONResponse:
     """注册用户，并在数据库提交成功后返回 bearer access token."""
     try:
@@ -86,11 +96,20 @@ async def register_user(
             "model": ErrorResponse,
             "description": "Email or password is incorrect",
         },
+        status.HTTP_429_TOO_MANY_REQUESTS: {
+            "model": ErrorResponse,
+            "description": "Authentication request rate limit exceeded",
+        },
+        status.HTTP_503_SERVICE_UNAVAILABLE: {
+            "model": ErrorResponse,
+            "description": "Request rate limiter is unavailable",
+        },
     },
 )
 async def login_user(
     request: LoginRequest,
     service: AuthServiceDependency,
+    _rate_limit: AnonymousAuthRateLimitDependency,
 ) -> TokenResponse | JSONResponse:
     """验证邮箱和密码；未知邮箱与错误密码返回完全相同的公开错误."""
     try:

@@ -19,11 +19,13 @@ from app.infrastructure.factory import create_application_resources
 from app.infrastructure.neo4j import probe_neo4j
 from app.infrastructure.postgres import probe_postgres
 from app.infrastructure.probes import DependencyName, DependencyProbeResult
+from app.infrastructure.rate_limit import RedisRateLimiter
 from app.infrastructure.redis import probe_redis
 from app.infrastructure.resources import ApplicationResources
 from app.services.chat import ChatService
 from app.services.cache import Cache
 from app.services.chat_session_cleanup import ChatSessionCleanupService
+from app.services.rate_limit import RateLimiter, RateLimitPolicies, RateLimitPolicy
 
 STARTUP_PROBE_TIMEOUT_SECONDS = 5.0
 STARTUP_TOTAL_TIMEOUT_SECONDS = 8.0
@@ -92,6 +94,44 @@ def get_application_chat_cleanup_service(
     except AttributeError as exc:
         raise RuntimeError("Application chat cleanup service is not initialized") from exc
     return cast(ChatSessionCleanupService, cleanup_service)
+
+
+def get_application_rate_limiter(app: FastAPI) -> RateLimiter:
+    """读取 lifespan 创建的共享限流适配器.
+
+    Args:
+        app: 当前 FastAPI 应用实例。
+
+    Returns:
+        借用 ``ApplicationResources.redis_client`` 的应用层 RateLimiter。
+
+    Raises:
+        RuntimeError: startup 尚未发布限流器，或 shutdown 已撤下引用。
+    """
+    try:
+        limiter = app.state.rate_limiter
+    except AttributeError as exc:
+        raise RuntimeError("Application rate limiter is not initialized") from exc
+    return cast(RateLimiter, limiter)
+
+
+def get_application_rate_limit_policies(app: FastAPI) -> RateLimitPolicies:
+    """读取 startup 已校验并发布的固定限流策略.
+
+    Args:
+        app: 当前 FastAPI 应用实例。
+
+    Returns:
+        认证入口与 Agent 入口各自的不可变策略。
+
+    Raises:
+        RuntimeError: 应用不在可处理请求的 lifespan 阶段。
+    """
+    try:
+        policies = app.state.rate_limit_policies
+    except AttributeError as exc:
+        raise RuntimeError("Application rate limit policies are not initialized") from exc
+    return cast(RateLimitPolicies, policies)
 
 
 @asynccontextmanager
@@ -210,6 +250,23 @@ async def lifespan(
         # 的缓存语义；它不登记 close callback，底层 client 仍由 resources 关闭。
         cache = RedisCache(resources.redis_client)
 
+        # RateLimiter 与 Cache 可以借用同一个 Redis client，但两者语义完全独立。
+        # 缓存读取失败允许业务回源数据库；限流无法判断时，高成本 Agent 请求必须
+        # fail-closed 为 503，不能把 Redis 故障当作“仍有额度”。
+        rate_limiter = RedisRateLimiter(resources.redis_client)
+        rate_limit_policies = RateLimitPolicies(
+            auth=RateLimitPolicy(
+                name="auth",
+                limit=config.AUTH_RATE_LIMIT_REQUESTS,
+                window_seconds=config.AUTH_RATE_LIMIT_WINDOW_SECONDS,
+            ),
+            agent=RateLimitPolicy(
+                name="agent",
+                limit=config.AGENT_RATE_LIMIT_REQUESTS,
+                window_seconds=config.AGENT_RATE_LIMIT_WINDOW_SECONDS,
+            ),
+        )
+
         # 6. ChatService 持有共享 Graph、guard 和无状态 verifier。三者都不保存
         # 当前用户；身份和公开 thread ID 仍由每次请求传入并构造独立内部 key。
         chat_service = ChatService(
@@ -234,6 +291,8 @@ async def lifespan(
         # yield 前 FastAPI 尚未接收请求，因此请求不会看到只发布一半的状态。
         app.state.resources = resources
         app.state.cache = cache
+        app.state.rate_limiter = rate_limiter
+        app.state.rate_limit_policies = rate_limit_policies
         app.state.chat_service = chat_service
         app.state.chat_session_cleanup_service = chat_session_cleanup_service
 
@@ -250,6 +309,8 @@ async def lifespan(
             # 真正的客户端和连接池随后由 AsyncExitStack 按逆序关闭。
             del app.state.chat_session_cleanup_service
             del app.state.chat_service
+            del app.state.rate_limit_policies
+            del app.state.rate_limiter
             del app.state.cache
             del app.state.resources
             logger.info("infrastructure_shutdown_started")

@@ -185,8 +185,30 @@ class Settings:
         self.JWT_ACCESS_TOKEN_EXPIRE_MINUTES = int(os.getenv("JWT_ACCESS_TOKEN_EXPIRE_MINUTES", "30"))
 
         # ---- 限流 ----
+        # RATE_LIMIT_DEFAULT 是项目早期 SlowAPI 示例格式，暂时保留以兼容已有环境。
+        # 新限流边界使用下面四个显式整数，避免 route 在运行时解析自由格式字符串。
+        #
+        # RATE_LIMIT_DEFAULT 是 SlowAPI 遗留的全局默认限流，作用于未显式声明限流的
+        # route。格式为 "N per period" 列表，按环境覆盖。
         rate_limit = os.getenv("RATE_LIMIT_DEFAULT", "200 per day,50 per hour")
         self.RATE_LIMIT_DEFAULT = [r.strip() for r in rate_limit.split(",") if r.strip()]
+        # AUTH 限流：保护注册和登录接口，按客户端 IP 计数（用户尚未认证，无法按 user_id）。
+        # 防止攻击者对同一 IP 批量注册账号或暴力破解密码。
+        self.AUTH_RATE_LIMIT_REQUESTS = int(os.getenv("AUTH_RATE_LIMIT_REQUESTS", "20"))
+        self.AUTH_RATE_LIMIT_WINDOW_SECONDS = int(os.getenv("AUTH_RATE_LIMIT_WINDOW_SECONDS", "60"))
+        # AGENT 限流：保护 Chat/Agent 接口，按已认证 user_id 计数。
+        # 防止单个用户频繁调用模型导致成本失控。不使用 thread_id 计数，否则同一用户
+        # 只需不断新建 thread 就能绕过保护。
+        self.AGENT_RATE_LIMIT_REQUESTS = int(os.getenv("AGENT_RATE_LIMIT_REQUESTS", "20"))
+        self.AGENT_RATE_LIMIT_WINDOW_SECONDS = int(os.getenv("AGENT_RATE_LIMIT_WINDOW_SECONDS", "60"))
+        for name in (
+            "AUTH_RATE_LIMIT_REQUESTS",
+            "AUTH_RATE_LIMIT_WINDOW_SECONDS",
+            "AGENT_RATE_LIMIT_REQUESTS",
+            "AGENT_RATE_LIMIT_WINDOW_SECONDS",
+        ):
+            if getattr(self, name) <= 0:
+                raise ValueError(f"{name} must be greater than 0")
 
         # ---- 日志 ----
         self.LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
