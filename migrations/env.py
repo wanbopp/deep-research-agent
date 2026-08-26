@@ -8,6 +8,7 @@ from collections.abc import Mapping
 from logging.config import fileConfig
 from typing import Any
 
+from pgvector.sqlalchemy import Vector
 from sqlalchemy import URL, pool
 from sqlalchemy.engine import Connection, make_url
 from sqlalchemy.ext.asyncio import create_async_engine
@@ -33,6 +34,7 @@ ALEMBIC_MANAGED_TABLES = frozenset(
         "users",
         "chat_sessions",
         "documents",
+        "memories",
         "research_tasks",
     }
 )
@@ -89,10 +91,14 @@ def include_object(
 
 
 def render_item(type_: str, object_: Any, autogen_context: Any) -> str | bool:
-    """把应用 UTC 类型渲染成 migration 可独立执行的标准 SQLAlchemy 类型."""
-    del autogen_context
+    """把自定义数据库类型渲染成 migration 可独立执行的代码."""
     if type_ == "type" and isinstance(object_, UTCDateTime):
         return "sa.DateTime(timezone=True)"
+    if type_ == "type" and isinstance(object_, Vector):
+        # pgvector 不是 SQLAlchemy 内置类型，autogenerate 必须同时写入 import；
+        # 否则生成的 migration 虽然出现 Vector(1536)，执行时却找不到名称。
+        autogen_context.imports.add("from pgvector.sqlalchemy import Vector")
+        return f"Vector({object_.dim})"
     return False
 
 

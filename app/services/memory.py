@@ -23,6 +23,18 @@ class MemoryUnavailableError(RuntimeError):
         super().__init__("Memory backend is unavailable")
 
 
+class MemorySourceNotFoundError(LookupError):
+    """记忆来源会话不存在、不可用或不属于当前用户.
+
+    三种情况故意使用同一个异常，避免调用方根据错误差异枚举其他用户的
+    ``source_thread_id``。它是业务输入错误，不应被包装成后端不可用。
+    """
+
+    def __init__(self) -> None:
+        """创建不泄露资源存在性的稳定异常."""
+        super().__init__("Memory source chat session was not found")
+
+
 class MemoryStore(Protocol):
     """定义长期记忆持久化适配器必须提供的能力.
 
@@ -68,6 +80,7 @@ class MemoryStore(Protocol):
             带权威 UUID、user_id 和审计时间的持久化结果。
 
         Raises:
+            MemorySourceNotFoundError: 来源会话不存在、不可用或不属于当前用户。
             MemoryUnavailableError: 后端无法安全完成写入。
 
         Notes:
@@ -98,4 +111,8 @@ class MemoryStore(Protocol):
         ...
 
 
-__all__ = ["MemoryStore", "MemoryUnavailableError"]
+__all__ = [
+    "MemorySourceNotFoundError",
+    "MemoryStore",
+    "MemoryUnavailableError",
+]

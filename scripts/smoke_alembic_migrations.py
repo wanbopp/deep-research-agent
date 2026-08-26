@@ -37,12 +37,13 @@ from app.infrastructure.database import build_orm_database_url
 # 从 PowerShell、PyCharm 或其他工作目录启动脚本时都能找到同一个配置文件。
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
-# Alembic 只拥有这四张业务表。集合精确比较可以同时发现“少创建”和“误创建”。
+# Alembic 只拥有这五张业务表。集合精确比较可以同时发现“少创建”和“误创建”。
 MANAGED_TABLES = frozenset(
     {
         "users",
         "chat_sessions",
         "documents",
+        "memories",
         "research_tasks",
     }
 )
@@ -176,7 +177,7 @@ def _create_database(admin_database: str, test_database: str) -> None:
 def _create_external_table(test_database: str) -> None:
     """创建一张 Alembic 永远不能管理的模拟外部表.
 
-    只检查四张业务表是否存在还不够：错误的 downgrade 可能顺便删除其他组件的
+    只检查五张业务表是否存在还不够：错误的 downgrade 可能顺便删除其他组件的
     表。这个哨兵表必须在 upgrade、downgrade、再次 upgrade 后始终存在。
     """
     with psycopg.connect(_conninfo(test_database)) as connection:
@@ -223,7 +224,7 @@ def _run_smoke() -> dict[str, object]:
 
         alembic_config = Config(str(PROJECT_ROOT / "alembic.ini"))
 
-        # 步骤 3：空库升级到 head。预期得到四张业务表、alembic_version 和
+        # 步骤 3：空库升级到 head。预期得到五张业务表、alembic_version 和
         # 外部 checkpoints；精确集合比较也能发现 migration 意外创建其他表。
         command.upgrade(alembic_config, "head")
         tables_after_first_upgrade = _public_tables(test_database)

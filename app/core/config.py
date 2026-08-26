@@ -144,6 +144,35 @@ class Settings:
         self.LLM_TOTAL_TIMEOUT = int(os.getenv("LLM_TOTAL_TIMEOUT", "60"))
         self.MAX_TOKENS = int(os.getenv("MAX_TOKENS", "2000"))
 
+        # ---- Embedding 配置 ----
+        # Embedding 与聊天模型共享 OpenAI-compatible 凭据和 Base URL，但模型、
+        # 维度和超时独立配置。向量维度一旦写入 PostgreSQL schema 就不能随意
+        # 修改；OpenAITextEmbedder 会再次校验它与 VECTOR(n) 完全一致。
+        #
+        # EMBEDDING_MODEL：向量嵌入使用的模型名称，必须与 provider 支持的
+        # embedding 模型一致。更换模型后需要重新生成全部已有向量。
+        self.EMBEDDING_MODEL = os.getenv(
+            "EMBEDDING_MODEL",
+            "openai/text-embedding-3-small",
+        )
+        # EMBEDDING_DIMENSIONS：向量维度，必须与 PostgreSQL pgvector 列的
+        # VECTOR(n) 声明完全一致，否则写入时会报维度不匹配错误。
+        self.EMBEDDING_DIMENSIONS = int(os.getenv("EMBEDDING_DIMENSIONS", "1536"))
+        # EMBEDDING_REQUEST_TIMEOUT：单次 embeddingding 请求的超时时间（秒）。
+        # 必须短于整体 Graph 时间预算，为异常处理和重试保留余量。
+        self.EMBEDDING_REQUEST_TIMEOUT = int(os.getenv("EMBEDDING_REQUEST_TIMEOUT", "30"))
+        # EMBEDDING_MAX_RETRIES：embedding 请求失败时的最大重试次数。
+        # 设为 0 表示不重试，直接向上层抛出异常。
+        self.EMBEDDING_MAX_RETRIES = int(os.getenv("EMBEDDING_MAX_RETRIES", "2"))
+        for name in (
+            "EMBEDDING_DIMENSIONS",
+            "EMBEDDING_REQUEST_TIMEOUT",
+        ):
+            if getattr(self, name) <= 0:
+                raise ValueError(f"{name} must be greater than 0")
+        if self.EMBEDDING_MAX_RETRIES < 0:
+            raise ValueError("EMBEDDING_MAX_RETRIES must not be negative")
+
         # ---- PostgreSQL 数据库 ----
         self.POSTGRES_HOST = os.getenv("POSTGRES_HOST", "localhost")
         self.POSTGRES_PORT = int(os.getenv("POSTGRES_PORT", "5432"))
