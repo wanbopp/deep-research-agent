@@ -47,7 +47,7 @@ from app.services.chat_guard import (
 class ChatInterrupt:
     """Agent 暂停后交给上层处理的稳定应用结果."""
 
-    thread_id: str
+    thread_id: UUID
     question: str
 
 
@@ -101,12 +101,12 @@ class ChatService:
         self._ownership_verifier = ownership_verifier
 
     @staticmethod
-    def _build_checkpoint_thread_id(user_id: UUID, public_thread_id: str) -> str:
+    def _build_checkpoint_thread_id(user_id: UUID, public_thread_id: UUID) -> str:
         """构造只在服务端使用的用户隔离 checkpoint key.
 
         Args:
             user_id: ``get_current_user`` 已完成 JWT 验签和数据库确认的用户 UUID。
-            public_thread_id: 已规范化为标准 UUID 文本的公开业务会话标识。
+            public_thread_id: Pydantic 已解析的公开业务会话 UUID。
 
         Returns:
             同时包含固定长度用户 UUID 和公开 thread ID 的内部 key。不同用户即使
@@ -123,7 +123,7 @@ class ChatService:
         cls,
         *,
         user_id: UUID,
-        public_thread_id: str,
+        public_thread_id: UUID,
     ) -> RunnableConfig:
         """为一次用户会话构造隔离的 LangGraph 运行配置.
 
@@ -162,14 +162,13 @@ class ChatService:
         self,
         *,
         user_id: UUID,
-        public_thread_id: str,
+        public_thread_id: UUID,
     ) -> AsyncIterator[RunnableConfig]:
         """取得内部 thread 执行权并产生对应的 LangGraph 配置.
 
         Args:
             user_id: 已由认证依赖确认的当前用户 UUID。
-            public_thread_id: 客户端可见的会话 ID。10F-C3 会在 Pydantic 层直接
-                收紧为 UUID；当前过渡步骤仍在这里拒绝历史任意字符串。
+            public_thread_id: Pydantic 已验证的业务会话 UUID。
 
         Yields:
             与 guard 使用同一个内部 thread ID 构造的 RunnableConfig。
@@ -177,7 +176,7 @@ class ChatService:
         Raises:
             ChatThreadBusyError: 相同内部 thread 已有 Graph 正在执行。
             ChatExecutionGuardUnavailableError: guard 后端无法安全协调执行权。
-            ChatSessionNotFoundError: 公开 ID 不是 UUID，或当前用户不拥有该会话。
+            ChatSessionNotFoundError: 当前用户不拥有该业务会话。
             SQLAlchemyError: 所有权查询的数据库不可用。基础设施故障必须继续向上
                 传播，不能伪装成“会话不存在”。
 
@@ -185,28 +184,18 @@ class ChatService:
             这个 helper 是三个公开入口的共同临界区边界。不要分别在 run、resume、
             stream 中手写 Redis 获取和释放，否则某条异常路径很容易遗漏 finally。
         """
-        # C2 仍接收旧 schema 的 str，因此先转换为真正 UUID。C3 把 schema 收紧后，
-        # 这里可以改为直接接收 UUID。非法格式在取得 Redis guard 前即可安全拒绝：
-        # 它不可能对应业务行，也不存在需要与删除操作协调的真实资源。
-        try:
-            session_id = UUID(public_thread_id)
-        except ValueError:
-            raise ChatSessionNotFoundError from None
-
-        # 同一个 UUID 可能有大小写等不同文本表示。内部 checkpoint/guard key 必须
-        # 使用唯一规范文本，否则同一业务会话可能意外映射到两套执行状态。
-        canonical_thread_id = str(session_id)
-
+        # public_thread_id 已是 UUID 对象，其字符串表示唯一规范。guard key 和
+        # checkpoint key 因而不会因客户端大小写或 UUID 表示方式产生分叉。
         internal_thread_id = self._build_checkpoint_thread_id(
             user_id,
-            canonical_thread_id,
+            public_thread_id,
         )
 
         async with self._execution_guard.hold(internal_thread_id):
             # 授权查询必须位于同 key guard 内。10F-D 的删除流程也会取得这把锁，
             # 因而不会在“检查通过”和 Graph 真正执行之间删除业务行/checkpoint。
             await self._ownership_verifier.require_owned(
-                session_id=session_id,
+                session_id=public_thread_id,
                 user_id=user_id,
             )
 
@@ -341,7 +330,7 @@ class ChatService:
         result: dict[str, Any],
         *,
         config: RunnableConfig,
-        thread_id: str,
+        thread_id: UUID,
     ) -> ChatTurnResult:
         """把 LangGraph 原始结果转换成稳定的应用层结果."""
         result_dict = dict(result)
@@ -583,6 +572,15 @@ class ChatService:
             # 客户端断开时必须让取消继续向上传播。
             # 避免继续执行图、造成资源浪费、模型消耗
             raise
+        except ChatSessionNotFoundError:
+            # StreamingResponse 的 200 响应头通常已在异步生成器开始迭代前发送，
+            # 此时不能再改成 HTTP 404。使用固定流内错误，随后结束本次事件流；
+            # 不输出 user_id、内部 key，也不区分不存在和属于其他用户。
+            yield ErrorStreamEvent(
+                code="CHAT_SESSION_NOT_FOUND",
+                message="Chat session was not found",
+            )
+            return
         except ChatThreadBusyError:
             # SSE 已经开始，只能发送流事件。固定文案不暴露锁名、内部 key 或 owner。
             yield ErrorStreamEvent(
@@ -606,7 +604,7 @@ class ChatService:
             logger.exception(
                 "chat_stream_failed",
                 error_type=type(error).__name__,
-                thread_id=request.thread_id,
+                thread_id=str(request.thread_id),
             )
             yield ErrorStreamEvent(
                 code="CHAT_STREAM_ERROR",

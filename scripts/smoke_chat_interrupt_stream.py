@@ -47,8 +47,11 @@ from app.schemas.chat import (  # noqa: E402
     ToolStreamEvent,
 )
 from app.services.chat import ChatService  # noqa: E402
+from app.services.chat_session_ownership import (  # noqa: E402
+    InProcessChatSessionOwnershipVerifier,
+)
 
-THREAD_ID = "smoke-chat-interrupt-stream"
+THREAD_ID = UUID("00000000-0000-4000-8000-000000000104")
 GRAPH_TIMEOUT_SECONDS = 60.0
 SMOKE_USER_ID = UUID("00000000-0000-4000-8000-000000000001")
 
@@ -79,6 +82,8 @@ async def run_interrupt_stream_smoke() -> int:
         graph,
         # 脚本不启动 lifespan；仅 guard 使用进程内实现，模型与 Graph 仍是真实路径。
         execution_guard=InProcessChatExecutionGuard(),
+        # HITL 流仍必须先通过会话所有权校验，才能进入 Graph 并创建 interrupt。
+        ownership_verifier=InProcessChatSessionOwnershipVerifier({(SMOKE_USER_ID, THREAD_ID)}),
         graph_timeout_seconds=GRAPH_TIMEOUT_SECONDS,
     )
 

@@ -5,9 +5,9 @@
 1. 在随机临时 PostgreSQL 数据库执行正式 Alembic migration；
 2. 通过真实 ``/auth/register`` 和 ``/auth/login`` 创建两个用户并取得 JWT；
 3. Chat 路由使用正式 ``get_current_user`` 完成 JWT 验签和数据库用户复核；
-4. 两个用户共享一个 ChatService、LangGraph 和 checkpointer，并使用同一个公开
-   thread ID 调用真实模型 provider；
-5. 验证内部 checkpoint key、暂停状态和恢复权限仍按认证用户隔离；
+4. 两个用户各自创建一条真实业务会话，并共享一个 ChatService、LangGraph
+   和 checkpointer 调用真实模型 provider；
+5. 验证 PostgreSQL 会话所有权、内部 checkpoint key、暂停状态和恢复权限隔离；
 6. 验证缺失、篡改和“用户已删除”的 token 在三个 Chat 入口都统一返回 401；
 7. 在内存中扫描本次日志与最终摘要，避免 credential、身份和 Prompt 泄漏。
 
@@ -65,8 +65,11 @@ from app.infrastructure.database import (  # noqa: E402
     build_orm_database_url,
     create_orm_runtime,
 )
+from app.infrastructure.chat_session_ownership import (  # noqa: E402
+    PostgresChatSessionOwnershipVerifier,
+)
 from app.infrastructure.chat_guard import InProcessChatExecutionGuard  # noqa: E402
-from app.repositories import UserRepository  # noqa: E402
+from app.repositories import ChatSessionRepository, UserRepository  # noqa: E402
 from app.services.auth import TokenService  # noqa: E402
 from app.services.chat import ChatService  # noqa: E402
 
@@ -75,7 +78,9 @@ CONNECTION_TIMEOUT_SECONDS = 10
 HTTP_TIMEOUT_SECONDS = 300.0
 GRAPH_TIMEOUT_SECONDS = 240.0
 
-PUBLIC_THREAD_ID = f"auth-chat-gate-{uuid4().hex}"
+# 认证失败实验需要一个语法合法的 UUID，确保请求不会先被 Pydantic 的 422
+# 拦截。它不对应任何业务会话，而且认证 dependency 会先返回 401。
+AUTH_PROBE_SESSION_ID = uuid4()
 EXPECTED_USER_B_REPLY = "REAL_AUTH_CHAT_USER_B_OK"
 EXPECTED_USER_A_RESUMED_REPLY = "REAL_AUTH_CHAT_USER_A_RESUMED_OK"
 HUMAN_RESPONSE = "approved"
@@ -270,17 +275,17 @@ async def _chat_authentication_responses(
     create_response = await client.post(
         "/api/v1/chat",
         headers=request_headers,
-        json={"thread_id": PUBLIC_THREAD_ID, "message": USER_B_PROMPT},
+        json={"thread_id": str(AUTH_PROBE_SESSION_ID), "message": USER_B_PROMPT},
     )
     resume_response = await client.post(
         "/api/v1/chat/resume",
         headers=request_headers,
-        json={"thread_id": PUBLIC_THREAD_ID, "response": HUMAN_RESPONSE},
+        json={"thread_id": str(AUTH_PROBE_SESSION_ID), "response": HUMAN_RESPONSE},
     )
     stream_response = await client.post(
         "/api/v1/chat/stream",
         headers=request_headers,
-        json={"thread_id": PUBLIC_THREAD_ID, "message": USER_B_PROMPT},
+        json={"thread_id": str(AUTH_PROBE_SESSION_ID), "message": USER_B_PROMPT},
     )
     return create_response, resume_response, stream_response
 
@@ -321,6 +326,9 @@ async def _exercise_gate(database: str) -> dict[str, bool | int | float | str]:
     service = ChatService(
         graph,
         execution_guard=InProcessChatExecutionGuard(),
+        # 与生产 lifespan 一样使用真实 PostgreSQL 所有权查询。每次校验都会
+        # 打开独立短生命周期 AsyncSession，不把事务状态保存在共享 service 中。
+        ownership_verifier=PostgresChatSessionOwnershipVerifier(session_factory),
         graph_timeout_seconds=GRAPH_TIMEOUT_SECONDS,
     )
 
@@ -367,7 +375,7 @@ async def _exercise_gate(database: str) -> dict[str, bool | int | float | str]:
         user_a_email,
         user_b_email,
         deleted_user_email,
-        PUBLIC_THREAD_ID,
+        str(AUTH_PROBE_SESSION_ID),
         UNTRUSTED_USER_ID_CLAIM,
         USER_A_INTERRUPT_PROMPT,
         USER_B_PROMPT,
@@ -431,6 +439,32 @@ async def _exercise_gate(database: str) -> dict[str, bool | int | float | str]:
             identities_are_distinct = len(set(user_ids)) == 3
             sensitive_markers.update(str(user_id) for user_id in user_ids)
             sensitive_markers.update(user_id.hex for user_id in user_ids)
+
+            # Chat API 不再接受“尚未创建的任意 thread 名称”。A/B 先在同一个
+            # 临时 PostgreSQL 中创建各自的业务会话；ChatService 后面会使用
+            # (session_id, user_id) 联合查询，而不是仅凭 UUID 存在就授权。
+            async with session_factory() as session:
+                async with session.begin():
+                    chat_sessions = ChatSessionRepository(session)
+                    user_a_session = await chat_sessions.create(
+                        user_id=user_a_claims.sub,
+                        title="Auth gate user A",
+                    )
+                    user_b_session = await chat_sessions.create(
+                        user_id=user_b_claims.sub,
+                        title="Auth gate user B",
+                    )
+
+            user_a_session_id = user_a_session.id
+            user_b_session_id = user_b_session.id
+            sensitive_markers.update(
+                {
+                    str(user_a_session_id),
+                    user_a_session_id.hex,
+                    str(user_b_session_id),
+                    user_b_session_id.hex,
+                }
+            )
 
             # /auth/me traverses the same get_current_user dependency used by Chat. A and B
             # must resolve from the temporary users table before any provider call begins.
@@ -497,7 +531,7 @@ async def _exercise_gate(database: str) -> dict[str, bool | int | float | str]:
                 "/api/v1/chat",
                 headers=_authorization_header(user_a_token),
                 json={
-                    "thread_id": PUBLIC_THREAD_ID,
+                    "thread_id": str(user_a_session_id),
                     "message": USER_A_INTERRUPT_PROMPT,
                 },
             )
@@ -505,23 +539,26 @@ async def _exercise_gate(database: str) -> dict[str, bool | int | float | str]:
             user_a_interrupted = (
                 user_a_interrupt_response.status_code == status.HTTP_200_OK
                 and user_a_interrupt_body.get("status") == "interrupted"
-                and user_a_interrupt_body.get("thread_id") == PUBLIC_THREAD_ID
+                and user_a_interrupt_body.get("thread_id") == str(user_a_session_id)
                 and isinstance(user_a_interrupt_body.get("question"), str)
             )
 
-            # User B deliberately reuses the same public thread ID. get_current_user derives
-            # B from its JWT, then ChatService maps that identity to a different internal key.
+            # B 使用自己拥有的另一条会话。两条会话共享 Graph/checkpointer，
+            # 但 ownership 与内部 checkpoint key 都必须保持隔离。
             user_b_response = await client.post(
                 "/api/v1/chat",
                 headers=_authorization_header(user_b_token),
-                json={"thread_id": PUBLIC_THREAD_ID, "message": USER_B_PROMPT},
+                json={
+                    "thread_id": str(user_b_session_id),
+                    "message": USER_B_PROMPT,
+                },
             )
             user_b_body = _json_object(user_b_response)
             user_b_message = user_b_body.get("message")
             user_b_completed = (
                 user_b_response.status_code == status.HTTP_200_OK
                 and user_b_body.get("status") == "completed"
-                and user_b_body.get("thread_id") == PUBLIC_THREAD_ID
+                and user_b_body.get("thread_id") == str(user_b_session_id)
                 and isinstance(user_b_message, dict)
                 and user_b_message.get("content") == EXPECTED_USER_B_REPLY
             )
@@ -530,11 +567,11 @@ async def _exercise_gate(database: str) -> dict[str, bool | int | float | str]:
             # shape/count/type and never print checkpoint messages or internal thread IDs.
             user_a_config = ChatService._build_config(
                 user_id=user_a_claims.sub,
-                public_thread_id=PUBLIC_THREAD_ID,
+                public_thread_id=user_a_session_id,
             )
             user_b_config = ChatService._build_config(
                 user_id=user_b_claims.sub,
-                public_thread_id=PUBLIC_THREAD_ID,
+                public_thread_id=user_b_session_id,
             )
             user_a_snapshot = await graph.aget_state(user_a_config)
             user_b_snapshot = await graph.aget_state(user_b_config)
@@ -563,28 +600,34 @@ async def _exercise_gate(database: str) -> dict[str, bool | int | float | str]:
                 and isinstance(user_b_messages[1], AIMessage)
             )
 
-            # B's internal key points at B's completed state, not A's interrupt. Returning
-            # 404 hides whether the same public ID exists in somebody else's identity scope.
+            # B 尝试恢复 A 的 session UUID。PostgreSQL verifier 必须在读取 A 的
+            # checkpoint 之前返回 404，从而隐藏“该 UUID 不存在”与“属于别人”的差异。
             cross_user_resume_response = await client.post(
                 "/api/v1/chat/resume",
                 headers=_authorization_header(user_b_token),
-                json={"thread_id": PUBLIC_THREAD_ID, "response": HUMAN_RESPONSE},
+                json={
+                    "thread_id": str(user_a_session_id),
+                    "response": HUMAN_RESPONSE,
+                },
             )
             cross_user_resume_rejected = cross_user_resume_response.status_code == status.HTTP_404_NOT_FOUND
 
-            # A supplies the human answer with A's real JWT. The same authenticated user and
-            # public ID reconstruct A's internal key, allowing Command(resume=...) to proceed.
+            # A 使用真实 JWT 和自己拥有的 session UUID，重新构造同一个内部 key，
+            # 因而可以把人工回答交给 Command(resume=...) 继续执行。
             owner_resume_response = await client.post(
                 "/api/v1/chat/resume",
                 headers=_authorization_header(user_a_token),
-                json={"thread_id": PUBLIC_THREAD_ID, "response": HUMAN_RESPONSE},
+                json={
+                    "thread_id": str(user_a_session_id),
+                    "response": HUMAN_RESPONSE,
+                },
             )
             owner_resume_body = _json_object(owner_resume_response)
             owner_resume_message = owner_resume_body.get("message")
             owner_resume_succeeded = (
                 owner_resume_response.status_code == status.HTTP_200_OK
                 and owner_resume_body.get("status") == "completed"
-                and owner_resume_body.get("thread_id") == PUBLIC_THREAD_ID
+                and owner_resume_body.get("thread_id") == str(user_a_session_id)
                 and isinstance(owner_resume_message, dict)
                 and owner_resume_message.get("content") == EXPECTED_USER_A_RESUMED_REPLY
             )
@@ -606,7 +649,8 @@ async def _exercise_gate(database: str) -> dict[str, bool | int | float | str]:
                 for marker in sensitive_markers
                 if marker
                 not in {
-                    PUBLIC_THREAD_ID,
+                    str(user_a_session_id),
+                    str(user_b_session_id),
                     UNTRUSTED_USER_ID_CLAIM,
                     EXPECTED_USER_B_REPLY,
                     EXPECTED_USER_A_RESUMED_REPLY,

@@ -3,6 +3,7 @@
 from app.services.chat_session_ownership import (
     ChatSessionNotFoundError,
     ChatSessionOwnershipVerifier,
+    InProcessChatSessionOwnershipVerifier,
 )
 from app.services.chat_sessions import (
     ChatSessionService,
@@ -19,6 +20,7 @@ from app.services.persistence import (
 __all__ = [
     "ChatSessionNotFoundError",
     "ChatSessionOwnershipVerifier",
+    "InProcessChatSessionOwnershipVerifier",
     "ChatSessionService",
     "ChatSessionServiceError",
     "CreatedUserWorkspace",

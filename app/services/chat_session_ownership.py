@@ -5,6 +5,7 @@
 验证来自 PostgreSQL、测试替身还是其他持久化后端。
 """
 
+from collections.abc import Iterable
 from typing import Protocol
 from uuid import UUID
 
@@ -46,7 +47,48 @@ class ChatSessionOwnershipVerifier(Protocol):
         ...
 
 
+class InProcessChatSessionOwnershipVerifier:
+    """为直接构造 ChatService 的单进程 smoke 提供显式所有权集合.
+
+    它不会替换模型、Graph 或 checkpoint，只替换业务 owner 查询的存储位置。
+    每个允许的 ``(user_id, session_id)`` 必须在构造时明确登记，未知组合一律
+    fail-closed。production lifespan 不得使用本实现，必须注入 PostgreSQL verifier。
+    """
+
+    def __init__(
+        self,
+        owned_sessions: Iterable[tuple[UUID, UUID]],
+    ) -> None:
+        """保存当前 smoke 明确拥有的用户与会话组合.
+
+        Args:
+            owned_sessions: ``(user_id, session_id)`` 二元组集合。转换为 frozenset
+                后不可变，能够被同一个单进程 ChatService 并发读取。
+        """
+        self._owned_sessions = frozenset(owned_sessions)
+
+    async def require_owned(
+        self,
+        *,
+        session_id: UUID,
+        user_id: UUID,
+    ) -> None:
+        """接受已登记组合，拒绝未知或跨用户组合.
+
+        Args:
+            session_id: smoke 使用的公开业务会话 UUID。
+            user_id: smoke 显式提供的可信用户 UUID。
+
+        Raises:
+            ChatSessionNotFoundError: 当前组合未登记。错误语义与 PostgreSQL 实现
+                一致，因此 ChatService 和 route 不需要识别具体 verifier 类型。
+        """
+        if (user_id, session_id) not in self._owned_sessions:
+            raise ChatSessionNotFoundError
+
+
 __all__ = [
     "ChatSessionNotFoundError",
     "ChatSessionOwnershipVerifier",
+    "InProcessChatSessionOwnershipVerifier",
 ]

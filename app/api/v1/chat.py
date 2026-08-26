@@ -21,6 +21,7 @@ from app.services.chat import (
     ChatService,
     ChatTurnResult,
 )
+from app.services.chat_session_ownership import ChatSessionNotFoundError
 
 router = APIRouter(prefix="/chat", tags=["chat"])
 
@@ -53,6 +54,10 @@ def _to_api_response(result: ChatTurnResult) -> ChatAPIResponse:
             "model": ErrorResponse,
             "description": "Bearer token is missing or invalid",
         },
+        status.HTTP_404_NOT_FOUND: {
+            "model": ErrorResponse,
+            "description": "Chat session is absent from the current user scope",
+        },
         status.HTTP_409_CONFLICT: {
             "model": ErrorResponse,
             "description": "The chat thread is already being processed",
@@ -69,10 +74,17 @@ async def create_chat_turn(
     current_user: CurrentUserDependency,
 ) -> ChatAPIResponse:
     """使用服务端认证身份开始或继续一轮普通聊天."""
-    result = await service.run_turn(
-        request,
-        user_id=current_user.user_id,
-    )
+    try:
+        result = await service.run_turn(
+            request,
+            user_id=current_user.user_id,
+        )
+    except ChatSessionNotFoundError:
+        # UUID 不存在和属于其他用户使用相同 404，不形成资源枚举接口。
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Chat session was not found",
+        ) from None
     return _to_api_response(result)
 
 
@@ -109,6 +121,11 @@ async def resume_chat_turn(
             request,
             user_id=current_user.user_id,
         )
+    except ChatSessionNotFoundError:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Chat session was not found",
+        ) from None
     except ChatResumeNotAvailableError:
         # 不区分“当前用户没有该 thread”与“同名 thread 属于其他用户”，避免
         # 攻击者通过状态码或文案探测另一个用户的 Agent 会话是否存在。

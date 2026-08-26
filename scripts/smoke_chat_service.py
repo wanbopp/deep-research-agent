@@ -30,8 +30,11 @@ from app.core.config import settings  # noqa: E402
 from app.infrastructure.chat_guard import InProcessChatExecutionGuard  # noqa: E402
 from app.schemas.chat import ChatRequest, ChatResponse  # noqa: E402
 from app.services.chat import ChatService  # noqa: E402
+from app.services.chat_session_ownership import (  # noqa: E402
+    InProcessChatSessionOwnershipVerifier,
+)
 
-THREAD_ID = "smoke-chat-service"
+THREAD_ID = UUID("00000000-0000-4000-8000-000000000101")
 CODE_WORD = "BLUEBERRY"
 FIRST_EXPECTED = "TURN_ONE_OK"
 SECOND_EXPECTED = "MEMORY_OK: BLUEBERRY"
@@ -60,6 +63,9 @@ async def run_chat_service_smoke() -> int:
             runtime,
             # 独立 smoke 没有 FastAPI lifespan；只在本进程内验证执行权生命周期。
             execution_guard=InProcessChatExecutionGuard(),
+            # 纯机制 smoke 没有业务数据库，因此显式登记唯一允许的所有权组合。
+            # 这不是生产后门；正式应用始终注入 PostgreSQL verifier。
+            ownership_verifier=InProcessChatSessionOwnershipVerifier({(SMOKE_USER_ID, THREAD_ID)}),
             graph_timeout_seconds=GRAPH_TIMEOUT_SECONDS,
         )
 

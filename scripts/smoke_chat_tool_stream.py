@@ -43,10 +43,14 @@ from app.schemas.chat import (  # noqa: E402
     ToolStreamEvent,
 )
 from app.services.chat import ChatService  # noqa: E402
+from app.services.chat_session_ownership import (  # noqa: E402
+    InProcessChatSessionOwnershipVerifier,
+)
 
 EXPECTED_REPLY = "REAL_TOOL_STREAM_OK"
 GRAPH_TIMEOUT_SECONDS = 1000.0
 SMOKE_USER_ID = UUID("00000000-0000-4000-8000-000000000001")
+THREAD_ID = UUID("00000000-0000-4000-8000-000000000103")
 
 # 模型只能提出 ToolCall，真正执行工具的是 LangGraph 的 tools 节点。固定回复使
 # smoke 可以验证第二次模型调用确实发生，同时避免依赖时间字符串的具体内容。
@@ -71,6 +75,8 @@ async def run_tool_stream_smoke() -> int:
         create_chat_runtime(),
         # 仅适用于当前单进程脚本；生产应用由 lifespan 注入 Redis 分布式 guard。
         execution_guard=InProcessChatExecutionGuard(),
+        # 独立脚本没有业务数据库，故显式声明唯一合法的所有权组合。
+        ownership_verifier=InProcessChatSessionOwnershipVerifier({(SMOKE_USER_ID, THREAD_ID)}),
         graph_timeout_seconds=GRAPH_TIMEOUT_SECONDS,
     )
 
@@ -83,7 +89,7 @@ async def run_tool_stream_smoke() -> int:
         # TokenStreamEvent... -> DoneStreamEvent(completed)。
         async for event in service.stream_turn(
             ChatRequest(
-                thread_id="smoke-chat-tool-stream",
+                thread_id=THREAD_ID,
                 message=SMOKE_PROMPT,
             ),
             user_id=SMOKE_USER_ID,

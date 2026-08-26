@@ -41,6 +41,8 @@ from app.infrastructure.lifespan import (
     lifespan,
 )
 from app.infrastructure.resources import ApplicationResources
+from app.models.chat_session import ChatSession
+from app.models.user import User
 from app.schemas.chat import ChatRequest, ChatResponse, ChatResumeRequest
 from app.services.chat import ChatInterrupt, ChatService
 
@@ -172,8 +174,8 @@ async def _exercise_recovery(database: str) -> dict[str, bool | float | str]:
     """
     started_at = perf_counter()
     user_id = UUID("44444444-4444-4444-8444-444444444444")
-    memory_thread_id = f"postgres-memory-{uuid4().hex}"
-    hitl_thread_id = f"postgres-hitl-{uuid4().hex}"
+    memory_thread_id = uuid4()
+    hitl_thread_id = uuid4()
     memory_marker = f"RECOVERY-{uuid4().hex[:12].upper()}"
     hitl_question_marker = f"APPROVAL-{uuid4().hex[:12].upper()}"
 
@@ -237,6 +239,33 @@ async def _exercise_recovery(database: str) -> dict[str, bool | float | str]:
                 if len(captured_graphs) != 1:
                     raise RuntimeError("lifespan A 必须恰好构建一个 Chat 图")
                 first_graph = captured_graphs[0]
+
+                # Alembic 已创建业务表，但空数据库还没有 owner 与 session 行。
+                # 先写入真实业务所有权，后续 ChatService 才有资格读取或写入
+                # LangGraph checkpoint。第二代 lifespan 会复用这些持久化行。
+                async with first_resources.orm_session_factory() as session:
+                    session.add(
+                        User(
+                            id=user_id,
+                            email=f"recovery-{uuid4().hex}@example.com",
+                            password_hash="smoke-only-not-a-real-credential",
+                        )
+                    )
+                    session.add_all(
+                        [
+                            ChatSession(
+                                id=memory_thread_id,
+                                user_id=user_id,
+                                title="PostgreSQL memory recovery",
+                            ),
+                            ChatSession(
+                                id=hitl_thread_id,
+                                user_id=user_id,
+                                title="PostgreSQL HITL recovery",
+                            ),
+                        ]
+                    )
+                    await session.commit()
 
                 memory_result = await first_service.run_turn(
                     ChatRequest(

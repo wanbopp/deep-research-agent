@@ -30,6 +30,7 @@ from langgraph.checkpoint.base import BaseCheckpointSaver
 from psycopg import sql
 from psycopg.conninfo import make_conninfo
 from redis.asyncio import Redis
+from sqlmodel import SQLModel
 
 import app.infrastructure.lifespan as lifespan_module
 from app.agents.chat.graph import ChatGraph
@@ -45,6 +46,8 @@ from app.infrastructure.lifespan import (
     get_application_resources,
     lifespan,
 )
+from app.models.chat_session import ChatSession
+from app.models.user import User
 from app.schemas.chat import ChatRequest, ChatResponse, ErrorStreamEvent
 from app.services.chat import ChatService
 from app.services.chat_guard import ChatThreadBusyError
@@ -126,12 +129,12 @@ def _selector_loop_factory() -> asyncio.AbstractEventLoop:
     return asyncio.SelectorEventLoop(selectors.SelectSelector())
 
 
-def _internal_thread_id(user_id: UUID, public_thread_id: str) -> str:
+def _internal_thread_id(user_id: UUID, public_thread_id: UUID) -> str:
     """复现 ChatService 的可信 checkpoint 身份映射，仅供 Gate 查询状态."""
     return f"user:{user_id.hex}:thread:{public_thread_id}"
 
 
-def _lock_name(user_id: UUID, public_thread_id: str) -> str:
+def _lock_name(user_id: UUID, public_thread_id: UUID) -> str:
     """计算期望的摘要锁名，返回值只交给 Redis exists，不进入输出."""
     internal_thread_id = _internal_thread_id(user_id, public_thread_id)
     digest = sha256(internal_thread_id.encode("utf-8")).hexdigest()
@@ -184,10 +187,12 @@ async def _exercise_guard(database: str) -> dict[str, bool | float | str]:
     """
     started_at = perf_counter()
     user_id = UUID("55555555-5555-4555-8555-555555555555")
-    same_thread = f"guard-same-{uuid4().hex}"
-    parallel_first_thread = f"guard-parallel-a-{uuid4().hex}"
-    parallel_second_thread = f"guard-parallel-b-{uuid4().hex}"
-    stream_busy_thread = f"guard-stream-{uuid4().hex}"
+    # 公开会话标识已经是业务实体 UUID。随机值既避免与其他 smoke 冲突，
+    # 也让类型层尽早发现把任意名称字符串当作 session_id 的旧用法。
+    same_thread = uuid4()
+    parallel_first_thread = uuid4()
+    parallel_second_thread = uuid4()
+    stream_busy_thread = uuid4()
     rejected_marker = f"REJECTED-{uuid4().hex.upper()}"
 
     # 这两个 Event 只负责让 smoke 获得确定的并发顺序：第一个请求拿到真实 Redis
@@ -277,6 +282,38 @@ async def _exercise_guard(database: str) -> dict[str, bool | float | str]:
             async with lifespan(app, config=_runtime_settings(database)):
                 service = get_application_chat_service(app)
                 resources = get_application_resources(app)
+
+                # 临时数据库最初为空。ownership verifier 查询 chat_sessions，
+                # 所以必须先建立业务表和真实所有权记录，再执行任何 Graph。
+                # checkpoint 表仍由 LangGraph saver 管理，两类表职责保持分离。
+                async with resources.orm_engine.begin() as connection:
+                    await connection.run_sync(SQLModel.metadata.create_all)
+
+                async with resources.orm_session_factory() as session:
+                    session.add(
+                        User(
+                            id=user_id,
+                            email=f"guard-{uuid4().hex}@example.com",
+                            password_hash="smoke-only-not-a-real-credential",
+                        )
+                    )
+                    session.add_all(
+                        [
+                            ChatSession(
+                                id=session_id,
+                                user_id=user_id,
+                                title="Execution guard smoke",
+                            )
+                            for session_id in (
+                                same_thread,
+                                parallel_first_thread,
+                                parallel_second_thread,
+                                stream_busy_thread,
+                            )
+                        ]
+                    )
+                    await session.commit()
+
                 if len(captured_graphs) != 1:
                     raise RuntimeError("lifespan must build exactly one Chat graph")
                 graph = captured_graphs[0]

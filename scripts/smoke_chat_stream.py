@@ -50,10 +50,14 @@ from app.schemas.chat import (  # noqa: E402
     ToolStreamEvent,
 )
 from app.services.chat import ChatService  # noqa: E402
+from app.services.chat_session_ownership import (  # noqa: E402
+    InProcessChatSessionOwnershipVerifier,
+)
 
 EXPECTED_REPLY = "REAL_STREAM_TEXT_OK"
 GRAPH_TIMEOUT_SECONDS = 60.0
 SMOKE_USER_ID = UUID("00000000-0000-4000-8000-000000000001")
+THREAD_ID = UUID("00000000-0000-4000-8000-000000000102")
 
 # 明确禁止工具调用，让本次实验只验证最短路径 chat -> END。
 SMOKE_PROMPT = "Do not call any tool. Reply with exactly REAL_STREAM_TEXT_OK and nothing else."
@@ -77,6 +81,8 @@ async def run_text_stream_smoke() -> int:
         create_chat_runtime(),
         # 当前脚本只运行一个进程；正式应用始终由 lifespan 注入 Redis guard。
         execution_guard=InProcessChatExecutionGuard(),
+        # 该 verifier 只允许本 smoke 的用户访问本 smoke 的会话。
+        ownership_verifier=InProcessChatSessionOwnershipVerifier({(SMOKE_USER_ID, THREAD_ID)}),
         graph_timeout_seconds=GRAPH_TIMEOUT_SECONDS,
     )
 
@@ -92,7 +98,7 @@ async def run_text_stream_smoke() -> int:
         # ToolCall 和 snapshot 的框架细节已经被 ChatService 隔离。
         async for event in service.stream_turn(
             ChatRequest(
-                thread_id="smoke-chat-stream-text",
+                thread_id=THREAD_ID,
                 message=SMOKE_PROMPT,
             ),
             user_id=SMOKE_USER_ID,

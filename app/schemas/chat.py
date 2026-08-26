@@ -5,11 +5,10 @@
 """
 
 from typing import Annotated, Literal
+from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
-THREAD_ID_PATTERN = r"^[A-Za-z0-9][A-Za-z0-9._:-]*$"
-MAX_THREAD_ID_LENGTH = 128
 MAX_MESSAGE_LENGTH = 8000
 
 
@@ -48,14 +47,11 @@ class ChatRequest(BaseModel):
 
     model_config = ConfigDict(extra="forbid", frozen=True)
 
-    # 10F-A 已把 ChatSession UUID 定义为目标公开标识，但这里暂时保留旧字符串
-    # 类型。等 10F-C 把 session_id + current_user.user_id 所有权查询接入三个
-    # Chat 入口时，再一次性收紧为 UUID，避免形成“只校验格式却没有授权”的假边界。
-    thread_id: str = Field(
-        min_length=1,
-        max_length=MAX_THREAD_ID_LENGTH,
-        pattern=THREAD_ID_PATTERN,
-        description="LangGraph checkpoint 使用的临时会话标识",
+    # 公开 thread_id 就是服务端创建的业务 ChatSession.id。UUID 负责稳定标识
+    # 资源，但不负责授权；ChatService 仍会在 guard 内使用 thread_id + trusted
+    # user_id 查询业务行，不能因为 UUID 难猜就跳过 owner-scoped 查询。
+    thread_id: UUID = Field(
+        description="服务端创建的业务聊天会话 UUID",
     )
     # 每次请求只提交当前一条用户输入；既有历史由 checkpointer 按
     # thread_id 保存，避免客户端重复提交完整历史。
@@ -65,10 +61,10 @@ class ChatRequest(BaseModel):
         description="本轮新增的用户消息",
     )
 
-    @field_validator("thread_id", "message", mode="before")
+    @field_validator("message", mode="before")
     @classmethod
     def normalize_text_fields(cls, value: object) -> object:
-        """在 pattern 和长度检查前统一去除首尾空白."""
+        """在长度检查前去除本轮消息的首尾空白."""
         return _strip_text(value)
 
 
@@ -77,12 +73,8 @@ class ChatResponse(BaseModel):
 
     model_config = ConfigDict(extra="forbid", frozen=True)
 
-    # 响应回传 thread_id，客户端才能在下一轮继续同一个 checkpoint。
-    thread_id: str = Field(
-        min_length=1,
-        max_length=MAX_THREAD_ID_LENGTH,
-        pattern=THREAD_ID_PATTERN,
-    )
+    # 响应回传同一个业务 UUID，客户端才能在下一轮继续该会话。
+    thread_id: UUID
 
     # Literal 不只表示字段是字符串，还把可接受的值收窄为
     # "completed"。它与 ChatInterruptResponse.status 共同构成判别字段。
@@ -92,12 +84,6 @@ class ChatResponse(BaseModel):
     # metadata、token usage 或 LangGraph checkpoint 内部结构。
     message: ChatMessage
 
-    @field_validator("thread_id", mode="before")
-    @classmethod
-    def normalize_thread_id(cls, value: object) -> object:
-        """让独立构造的响应也遵守与请求相同的 thread_id 规则."""
-        return _strip_text(value)
-
 
 class ChatInterruptResponse(BaseModel):
     """Agent 暂停并等待人工回答时的公开响应."""
@@ -105,20 +91,16 @@ class ChatInterruptResponse(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
     status: Literal["interrupted"] = "interrupted"
-    thread_id: str = Field(
-        min_length=1,
-        max_length=MAX_THREAD_ID_LENGTH,
-        pattern=THREAD_ID_PATTERN,
-    )
+    thread_id: UUID
     question: str = Field(
         min_length=1,
         max_length=MAX_MESSAGE_LENGTH,
     )
 
-    @field_validator("thread_id", "question", mode="before")
+    @field_validator("question", mode="before")
     @classmethod
     def normalize_text_fields(cls, value: object) -> object:
-        """清理会话标识和人工问题的首尾空白."""
+        """清理人工问题的首尾空白."""
         return _strip_text(value)
 
 
@@ -127,20 +109,16 @@ class ChatResumeRequest(BaseModel):
 
     model_config = ConfigDict(extra="forbid", frozen=True)
 
-    thread_id: str = Field(
-        min_length=1,
-        max_length=MAX_THREAD_ID_LENGTH,
-        pattern=THREAD_ID_PATTERN,
-    )
+    thread_id: UUID
     response: str = Field(
         min_length=1,
         max_length=MAX_MESSAGE_LENGTH,
     )
 
-    @field_validator("thread_id", "response", mode="before")
+    @field_validator("response", mode="before")
     @classmethod
     def normalize_text_fields(cls, value: object) -> object:
-        """清理会话标识和恢复回答的首尾空白."""
+        """清理恢复回答的首尾空白."""
         return _strip_text(value)
 
 

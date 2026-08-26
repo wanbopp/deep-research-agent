@@ -8,10 +8,10 @@ InMemorySaver、工具节点和真实模型 provider。
 执行顺序：
 
 1. 三个 Chat HTTP 入口在没有可信身份时都返回 401，且不会调用模型；
-2. 用户 A 在公开 thread ID 上触发真实 ``ask_human`` 中断；
-3. 用户 B 使用相同公开 thread ID 完成一轮真实普通聊天；
+2. 用户 A 在自己拥有的会话上触发真实 ``ask_human`` 中断；
+3. 用户 B 在自己拥有的另一个会话完成一轮真实普通聊天；
 4. 白盒读取两个内部 checkpoint，确认 key、消息和暂停状态互相隔离；
-5. 用户 B 尝试恢复同名 thread，得到不泄漏 A 会话存在性的 404；
+5. 用户 B 尝试恢复 A 的会话，ownership verifier 在 Graph 前返回安全 404；
 6. 用户 A 恢复自己的中断，真实模型生成最终回答。
 
 控制台不会输出 token、用户 UUID、公开或内部 thread ID、Prompt、ToolCall ID、
@@ -47,10 +47,14 @@ from app.core.exception_handlers import register_exception_handlers  # noqa: E40
 from app.infrastructure.chat_guard import InProcessChatExecutionGuard  # noqa: E402
 from app.schemas.auth import AuthenticatedUser  # noqa: E402
 from app.services.chat import ChatService  # noqa: E402
+from app.services.chat_session_ownership import (  # noqa: E402
+    InProcessChatSessionOwnershipVerifier,
+)
 
 HTTP_TIMEOUT_SECONDS = 300.0
 GRAPH_TIMEOUT_SECONDS = 240.0
-PUBLIC_THREAD_ID = f"identity-isolation-{uuid4().hex}"
+USER_A_SESSION_ID = uuid4()
+USER_B_SESSION_ID = uuid4()
 
 # 这些值只存在于 smoke 进程内，用来代表“9E 已完成验签和数据库确认”的结果。
 # token 是不具备真实认证能力的路由选择标记，因此不会被输出或用于生产代码。
@@ -137,6 +141,14 @@ async def _run_smoke() -> int:
         # 本 smoke 的重点是用户 checkpoint 隔离；进程内 guard 只补齐执行边界，
         # 不替换后面的真实 provider、LangGraph 或身份检查。
         execution_guard=InProcessChatExecutionGuard(),
+        # 独立 smoke 不连接业务数据库，因此明确登记 A/B 各自拥有的会话。
+        # verifier 会拒绝任何未登记组合，尤其是 B 访问 A 会话的情况。
+        ownership_verifier=InProcessChatSessionOwnershipVerifier(
+            {
+                (USER_A.user_id, USER_A_SESSION_ID),
+                (USER_B.user_id, USER_B_SESSION_ID),
+            }
+        ),
         graph_timeout_seconds=GRAPH_TIMEOUT_SECONDS,
     )
 
@@ -188,15 +200,15 @@ async def _run_smoke() -> int:
             unauthorized_responses = (
                 await client.post(
                     "/api/v1/chat",
-                    json={"thread_id": PUBLIC_THREAD_ID, "message": USER_B_PROMPT},
+                    json={"thread_id": str(USER_A_SESSION_ID), "message": USER_B_PROMPT},
                 ),
                 await client.post(
                     "/api/v1/chat/resume",
-                    json={"thread_id": PUBLIC_THREAD_ID, "response": HUMAN_RESPONSE},
+                    json={"thread_id": str(USER_A_SESSION_ID), "response": HUMAN_RESPONSE},
                 ),
                 await client.post(
                     "/api/v1/chat/stream",
-                    json={"thread_id": PUBLIC_THREAD_ID, "message": USER_B_PROMPT},
+                    json={"thread_id": str(USER_A_SESSION_ID), "message": USER_B_PROMPT},
                 ),
             )
             unauthorized_entries_rejected = all(
@@ -206,7 +218,7 @@ async def _run_smoke() -> int:
             invalid_token_response = await client.post(
                 "/api/v1/chat",
                 headers=_authorization_header("unknown-smoke-token"),
-                json={"thread_id": PUBLIC_THREAD_ID, "message": USER_B_PROMPT},
+                json={"thread_id": str(USER_A_SESSION_ID), "message": USER_B_PROMPT},
             )
             invalid_token_rejected = invalid_token_response.status_code == status.HTTP_401_UNAUTHORIZED
 
@@ -228,7 +240,7 @@ async def _run_smoke() -> int:
                 "/api/v1/chat",
                 headers=_authorization_header(USER_A_TOKEN),
                 json={
-                    "thread_id": PUBLIC_THREAD_ID,
+                    "thread_id": str(USER_A_SESSION_ID),
                     "message": USER_A_INTERRUPT_PROMPT,
                 },
             )
@@ -236,7 +248,7 @@ async def _run_smoke() -> int:
             user_a_interrupted = (
                 user_a_interrupt_response.status_code == status.HTTP_200_OK
                 and user_a_interrupt_body.get("status") == "interrupted"
-                and user_a_interrupt_body.get("thread_id") == PUBLIC_THREAD_ID
+                and user_a_interrupt_body.get("thread_id") == str(USER_A_SESSION_ID)
                 and isinstance(user_a_interrupt_body.get("question"), str)
             )
 
@@ -253,13 +265,13 @@ async def _run_smoke() -> int:
                 )
                 return 1
 
-            # 用户 B 故意复用完全相同的公开 thread ID。只有内部 key 包含 user_id，
-            # 这次调用才会从空历史开始，而不是续接 A 的暂停 checkpoint。
+            # 用户 B 使用自己的业务会话。这样既满足“一条会话只有一个 owner”，
+            # 又能继续证明两个身份的 checkpoint 状态不会相互污染。
             user_b_response = await client.post(
                 "/api/v1/chat",
                 headers=_authorization_header(USER_B_TOKEN),
                 json={
-                    "thread_id": PUBLIC_THREAD_ID,
+                    "thread_id": str(USER_B_SESSION_ID),
                     "message": USER_B_PROMPT,
                 },
             )
@@ -268,7 +280,7 @@ async def _run_smoke() -> int:
             user_b_completed = (
                 user_b_response.status_code == status.HTTP_200_OK
                 and user_b_body.get("status") == "completed"
-                and user_b_body.get("thread_id") == PUBLIC_THREAD_ID
+                and user_b_body.get("thread_id") == str(USER_B_SESSION_ID)
                 and isinstance(user_b_message, dict)
                 and user_b_message.get("content") == USER_B_EXPECTED
             )
@@ -287,14 +299,14 @@ async def _run_smoke() -> int:
                 return 1
 
             # 白盒检查只读取状态形状，不输出状态正文。生产 API 不提供这个入口；
-            # smoke 使用它证明两个公开同名 thread 实际落入两个不同内部 key。
+            # smoke 使用它证明两个业务会话落入两个不同内部 checkpoint key。
             user_a_config = ChatService._build_config(
                 user_id=USER_A.user_id,
-                public_thread_id=PUBLIC_THREAD_ID,
+                public_thread_id=USER_A_SESSION_ID,
             )
             user_b_config = ChatService._build_config(
                 user_id=USER_B.user_id,
-                public_thread_id=PUBLIC_THREAD_ID,
+                public_thread_id=USER_B_SESSION_ID,
             )
             user_a_snapshot = await graph.aget_state(user_a_config)
             user_b_snapshot = await graph.aget_state(user_b_config)
@@ -326,25 +338,25 @@ async def _run_smoke() -> int:
                 and isinstance(user_b_messages[1], AIMessage)
             )
 
-            # B 的内部 checkpoint 没有 interrupt，因此 service 在调用 Command 前
-            # 安全拒绝。404 不告诉 B 同名公开 thread 是否在 A 的空间真实存在。
+            # B 用自己的可信身份尝试恢复 A 的 session UUID。ownership verifier
+            # 必须在读取 checkpoint 和执行 Command 前拒绝，并统一返回安全 404。
             cross_user_resume_response = await client.post(
                 "/api/v1/chat/resume",
                 headers=_authorization_header(USER_B_TOKEN),
                 json={
-                    "thread_id": PUBLIC_THREAD_ID,
+                    "thread_id": str(USER_A_SESSION_ID),
                     "response": HUMAN_RESPONSE,
                 },
             )
             cross_user_resume_rejected = cross_user_resume_response.status_code == status.HTTP_404_NOT_FOUND
 
-            # A 使用相同可信身份和公开 thread ID，重新得到同一个内部 key。
+            # A 使用相同可信身份和自己的 session UUID，重新得到同一个内部 key。
             # Command(resume=...) 因此进入 A 的暂停任务，工具返回后模型完成回答。
             user_a_resume_response = await client.post(
                 "/api/v1/chat/resume",
                 headers=_authorization_header(USER_A_TOKEN),
                 json={
-                    "thread_id": PUBLIC_THREAD_ID,
+                    "thread_id": str(USER_A_SESSION_ID),
                     "response": HUMAN_RESPONSE,
                 },
             )
@@ -353,7 +365,7 @@ async def _run_smoke() -> int:
             owner_resume_succeeded = (
                 user_a_resume_response.status_code == status.HTTP_200_OK
                 and user_a_resume_body.get("status") == "completed"
-                and user_a_resume_body.get("thread_id") == PUBLIC_THREAD_ID
+                and user_a_resume_body.get("thread_id") == str(USER_A_SESSION_ID)
                 and isinstance(user_a_resume_message, dict)
                 and user_a_resume_message.get("content") == USER_A_RESUMED_EXPECTED
             )
