@@ -14,6 +14,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
 from app.infrastructure.lifespan import (
+    get_application_cache,
     get_application_chat_cleanup_service,
     get_application_chat_service,
     get_application_resources,
@@ -84,18 +85,26 @@ async def get_db_session(request: Request) -> AsyncIterator[AsyncSession]:
 
 
 def get_chat_session_service(
+    request: Request,
     session: Annotated[AsyncSession, Depends(get_db_session)],
 ) -> ChatSessionService:
     """为一次 HTTP 请求构造业务会话 application service.
 
     Args:
+        request: 当前 FastAPI 请求。这里只用 ``request.app`` 读取 lifespan 已发布
+            的共享 Cache，不读取客户端 body 或身份字段。
         session: FastAPI 从 get_db_session 注入的请求级 AsyncSession。相同请求中的
             get_current_user 会复用它，但认证事务会在 route 执行前结束。
 
     Returns:
-        使用该 Session 协调会话事务与所有权查询的 ChatSessionService。
+        使用请求级 Session 与共享 Cache 协调事务、所有权查询和列表缓存的
+        ChatSessionService。
     """
-    return ChatSessionService(session)
+    return ChatSessionService(
+        session,
+        cache=get_application_cache(request.app),
+        cache_ttl_seconds=settings.CACHE_TTL_SECONDS,
+    )
 
 
 @lru_cache(maxsize=1)

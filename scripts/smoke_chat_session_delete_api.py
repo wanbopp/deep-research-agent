@@ -39,6 +39,7 @@ from app.infrastructure.chat_guard import RedisChatExecutionGuard
 from app.infrastructure.database import build_orm_database_url
 from app.infrastructure.lifespan import (
     CHAT_GUARD_LEASE_SECONDS,
+    get_application_cache,
     get_application_chat_cleanup_service,
     get_application_resources,
     lifespan,
@@ -320,6 +321,7 @@ async def _exercise_delete_api(database: str) -> dict[str, bool | float | int]:
                         lease_seconds=CHAT_GUARD_LEASE_SECONDS,
                     ),
                     internal_thread_id_factory=ChatService._build_checkpoint_thread_id,
+                    cache=get_application_cache(app),
                 )
                 cleanup_unavailable = await client.delete(
                     f"/api/v1/chat/sessions/{failure_id}",

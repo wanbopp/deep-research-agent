@@ -172,6 +172,8 @@ class Settings:
         self.REDIS_DB = int(os.getenv("REDIS_DB", "0"))
         self.REDIS_PASSWORD = os.getenv("REDIS_PASSWORD", "")
         self.CACHE_TTL_SECONDS = int(os.getenv("CACHE_TTL_SECONDS", "60"))
+        if self.CACHE_TTL_SECONDS <= 0:
+            raise ValueError("CACHE_TTL_SECONDS must be greater than 0")
 
         # ---- JWT 认证 ----
         # Secret 不提供可工作的默认值：示例 secret 一旦被误带到部署环境，攻击者

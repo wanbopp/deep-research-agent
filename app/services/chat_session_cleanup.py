@@ -19,6 +19,8 @@ from app.models import ChatSessionStatus
 from app.repositories import ChatSessionRepository
 from app.services.chat_guard import ChatExecutionGuard
 from app.services.chat_session_ownership import ChatSessionNotFoundError
+from app.services.cache import Cache
+from app.services.chat_session_cache import invalidate_chat_session_list_cache
 
 
 class ChatCheckpointStore(Protocol):
@@ -79,6 +81,7 @@ class ChatSessionCleanupService:
         checkpoint_store: ChatCheckpointStore,
         execution_guard: ChatExecutionGuard,
         internal_thread_id_factory: InternalThreadIdFactory,
+        cache: Cache,
     ) -> None:
         """保存可跨请求共享的无状态依赖.
 
@@ -90,11 +93,14 @@ class ChatSessionCleanupService:
             execution_guard: 与 ChatService 共用的内部 thread 执行权接口。
             internal_thread_id_factory: 必须与 ChatService 使用同一映射函数，保证
                 删除锁、checkpoint key 和 Graph 执行锁属于同一并发域。
+            cache: lifespan 共享的缓存协议。阶段 1 提交 deleting 后用于尽力
+                失效用户列表；缓存失败不能中断后续 checkpoint 清理。
         """
         self._session_factory = session_factory
         self._checkpoint_store = checkpoint_store
         self._execution_guard = execution_guard
         self._internal_thread_id_factory = internal_thread_id_factory
+        self._cache = cache
 
     async def delete_owned(
         self,
@@ -138,6 +144,15 @@ class ChatSessionCleanupService:
             await self._mark_deleting(
                 session_id=session_id,
                 user_id=user_id,
+            )
+
+            # deleting 一旦提交，普通 list_by_user 就已隐藏该会话，因此必须在
+            # 这个可见性变化点失效列表缓存，不能等到 checkpoint 和业务 tombstone
+            # 全部删除。失效采用 fail-open，不改变三阶段恢复状态和后续重试方向。
+            await invalidate_chat_session_list_cache(
+                self._cache,
+                user_id=user_id,
+                reason="deleting",
             )
 
             try:

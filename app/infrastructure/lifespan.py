@@ -14,6 +14,7 @@ from app.infrastructure.chat_session_ownership import (
     PostgresChatSessionOwnershipVerifier,
 )
 from app.infrastructure.chat_guard import RedisChatExecutionGuard
+from app.infrastructure.cache import RedisCache
 from app.infrastructure.factory import create_application_resources
 from app.infrastructure.neo4j import probe_neo4j
 from app.infrastructure.postgres import probe_postgres
@@ -21,6 +22,7 @@ from app.infrastructure.probes import DependencyName, DependencyProbeResult
 from app.infrastructure.redis import probe_redis
 from app.infrastructure.resources import ApplicationResources
 from app.services.chat import ChatService
+from app.services.cache import Cache
 from app.services.chat_session_cleanup import ChatSessionCleanupService
 
 STARTUP_PROBE_TIMEOUT_SECONDS = 5.0
@@ -30,6 +32,26 @@ CHAT_GRAPH_TIMEOUT_SECONDS = 90.0
 # 释放；进程崩溃时 Redis 仍会在 120 秒内自动清除遗留锁。
 CHAT_GUARD_LEASE_SECONDS = 120.0
 REQUIRED_DEPENDENCIES = frozenset({DependencyName.POSTGRES})
+
+
+def get_application_cache(app: FastAPI) -> Cache:
+    """读取 lifespan 已创建的共享缓存适配器.
+
+    Args:
+        app: 当前 FastAPI 应用实例。
+
+    Returns:
+        借用 ``ApplicationResources.redis_client`` 的 RedisCache。返回类型使用
+        应用层 Cache Protocol，调用方不依赖 redis-py。
+
+    Raises:
+        RuntimeError: startup 尚未发布缓存，或 shutdown 已经撤下缓存引用。
+    """
+    try:
+        cache = app.state.cache
+    except AttributeError as exc:
+        raise RuntimeError("Application cache is not initialized") from exc
+    return cast(Cache, cache)
 
 
 def get_application_chat_service(app: FastAPI) -> ChatService:
@@ -183,6 +205,11 @@ async def lifespan(
             resources.orm_session_factory,
         )
 
+        # RedisCache 是无状态适配器，只借用 lifespan 共享 client。把它作为单例
+        # 发布可以让请求级业务 service 与共享 cleanup coordinator 使用完全相同
+        # 的缓存语义；它不登记 close callback，底层 client 仍由 resources 关闭。
+        cache = RedisCache(resources.redis_client)
+
         # 6. ChatService 持有共享 Graph、guard 和无状态 verifier。三者都不保存
         # 当前用户；身份和公开 thread ID 仍由每次请求传入并构造独立内部 key。
         chat_service = ChatService(
@@ -200,11 +227,13 @@ async def lifespan(
             checkpoint_store=resources.checkpointer,
             execution_guard=execution_guard,
             internal_thread_id_factory=ChatService._build_checkpoint_thread_id,
+            cache=cache,
         )
 
         # 8. 所有 startup 步骤成功后，才同时发布底层资源和上层应用服务。
         # yield 前 FastAPI 尚未接收请求，因此请求不会看到只发布一半的状态。
         app.state.resources = resources
+        app.state.cache = cache
         app.state.chat_service = chat_service
         app.state.chat_session_cleanup_service = chat_session_cleanup_service
 
@@ -221,6 +250,7 @@ async def lifespan(
             # 真正的客户端和连接池随后由 AsyncExitStack 按逆序关闭。
             del app.state.chat_session_cleanup_service
             del app.state.chat_service
+            del app.state.cache
             del app.state.resources
             logger.info("infrastructure_shutdown_started")
 
