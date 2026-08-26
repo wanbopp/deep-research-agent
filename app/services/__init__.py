@@ -1,5 +1,6 @@
 """Application service layer package."""
 
+from app.services.cache import Cache, CacheUnavailableError, build_cache_key
 from app.services.chat_session_ownership import (
     ChatSessionNotFoundError,
     ChatSessionOwnershipVerifier,
@@ -22,6 +23,8 @@ from app.services.persistence import (
 )
 
 __all__ = [
+    "Cache",
+    "CacheUnavailableError",
     "ChatSessionNotFoundError",
     "ChatCheckpointCleanupError",
     "ChatSessionCleanupService",
@@ -34,4 +37,5 @@ __all__ = [
     "UserAlreadyExistsError",
     "UserNotFoundError",
     "UserWorkspaceService",
+    "build_cache_key",
 ]

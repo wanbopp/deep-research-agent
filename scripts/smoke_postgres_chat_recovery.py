@@ -251,6 +251,16 @@ async def _exercise_recovery(database: str) -> dict[str, bool | float | str]:
                             password_hash="smoke-only-not-a-real-credential",
                         )
                     )
+
+                    # User 与 ChatSession 之间只有数据库 foreign key，没有配置 ORM
+                    # relationship。SQLAlchemy 因而不能通过 Python 对象关系判断这批
+                    # 待写对象的父子顺序。先 flush 用户，可以明确保证外键父行已经
+                    # 插入；事务仍未 commit，后续任一步失败时两类数据仍会一起回滚。
+                    #
+                    # 这属于 smoke fixture 的构造顺序，不是 production Repository
+                    # 事务边界，也不会绕过数据库外键约束。
+                    await session.flush()
+
                     session.add_all(
                         [
                             ChatSession(
