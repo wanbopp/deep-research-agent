@@ -17,6 +17,7 @@ from app.services.chat_guard import (
     ChatExecutionGuardUnavailableError,
     ChatThreadBusyError,
 )
+from app.services.chat_session_cleanup import ChatCheckpointCleanupError
 
 
 def get_request_id() -> str | None:
@@ -177,6 +178,37 @@ async def chat_execution_guard_unavailable_exception_handler(
     )
 
 
+async def chat_checkpoint_cleanup_exception_handler(
+    request: Request,
+    exc: ChatCheckpointCleanupError,
+) -> JSONResponse:
+    """把可重试的 checkpoint 清理故障转换为稳定 HTTP 503.
+
+    Args:
+        request: 当前 FastAPI 请求，只用于记录 method/path。
+        exc: cleanup coordinator 在保留 deleting tombstone 后抛出的固定应用错误。
+
+    Returns:
+        不泄漏 SQL、连接信息、内部 thread key 或 checkpoint 内容的统一错误响应。
+
+    Notes:
+        503 表示当前无法安全完成清理，客户端可以稍后重试同一个 DELETE。这里
+        不能返回 500 后再把会话恢复为 active，因为 saver 可能已经删除了部分行。
+    """
+    logger.error(
+        "chat_checkpoint_cleanup_unavailable",
+        method=request.method,
+        path=request.url.path,
+    )
+    return JSONResponse(
+        status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+        content=build_error_content(
+            code="CHAT_CHECKPOINT_CLEANUP_UNAVAILABLE",
+            message="Chat session cleanup is temporarily unavailable",
+        ),
+    )
+
+
 async def unhandled_exception_handler(
     request: Request,
     exc: Exception,
@@ -233,6 +265,16 @@ def register_exception_handlers(app: FastAPI) -> None:
         cast(
             HTTPExceptionHandler,
             chat_execution_guard_unavailable_exception_handler,
+        ),
+    )
+
+    # cleanup service 已经把失败状态安全地固化为 deleting。HTTP 层只翻译协议，
+    # 不回滚删除意图，也不检查 saver 到底删除了哪些内部行。
+    app.add_exception_handler(
+        ChatCheckpointCleanupError,
+        cast(
+            HTTPExceptionHandler,
+            chat_checkpoint_cleanup_exception_handler,
         ),
     )
 

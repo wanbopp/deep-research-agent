@@ -14,6 +14,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
 from app.infrastructure.lifespan import (
+    get_application_chat_cleanup_service,
     get_application_chat_service,
     get_application_resources,
 )
@@ -26,6 +27,7 @@ from app.services.auth import (
     TokenService,
 )
 from app.services.chat import ChatService
+from app.services.chat_session_cleanup import ChatSessionCleanupService
 from app.services.chat_sessions import ChatSessionService
 
 
@@ -39,6 +41,31 @@ http_bearer = HTTPBearer(auto_error=False)
 def get_chat_service(request: Request) -> ChatService:
     """返回当前 FastAPI 应用在 startup 创建的共享聊天服务."""
     return get_application_chat_service(request.app)
+
+
+def get_chat_session_cleanup_service(
+    request: Request,
+) -> ChatSessionCleanupService:
+    """返回 startup 创建的共享会话清理协调器.
+
+    Args:
+        request: 当前 FastAPI 请求。这里只读取 ``request.app``，不会读取请求
+            body、token 或客户端提供的内部 thread key。
+
+    Returns:
+        lifespan 已组合好的 ``ChatSessionCleanupService``。它与 ``ChatService``
+        共用 checkpointer、Redis guard 和 internal thread ID 映射。
+
+    Raises:
+        RuntimeError: 应用尚未完成 startup，或者已经进入 shutdown。正常 HTTP
+            请求不会处于这两个阶段，因此该错误表示应用生命周期接线问题。
+
+    Notes:
+        这里不能像请求级 ``ChatSessionService`` 那样重新构造 cleanup service。
+        清理操作必须使用 lifespan 中与 Graph 完全相同的 saver 和 guard，才能
+        保证删除与同一会话的 Agent 执行属于同一个并发域。
+    """
+    return get_application_chat_cleanup_service(request.app)
 
 
 async def get_db_session(request: Request) -> AsyncIterator[AsyncSession]:
