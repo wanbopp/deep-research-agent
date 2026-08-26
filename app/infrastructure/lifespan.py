@@ -21,6 +21,7 @@ from app.infrastructure.probes import DependencyName, DependencyProbeResult
 from app.infrastructure.redis import probe_redis
 from app.infrastructure.resources import ApplicationResources
 from app.services.chat import ChatService
+from app.services.chat_session_cleanup import ChatSessionCleanupService
 
 STARTUP_PROBE_TIMEOUT_SECONDS = 5.0
 STARTUP_TOTAL_TIMEOUT_SECONDS = 8.0
@@ -48,6 +49,27 @@ def get_application_resources(app: FastAPI) -> ApplicationResources:
     except AttributeError as exc:
         raise RuntimeError("Application resources are not initialized") from exc
     return cast(ApplicationResources, resources)  # 不做任何转换 声明返回值是 ApplicationResources
+
+
+def get_application_chat_cleanup_service(
+    app: FastAPI,
+) -> ChatSessionCleanupService:
+    """读取 lifespan 已创建的共享会话清理协调器.
+
+    Args:
+        app: 当前 FastAPI 应用实例。
+
+    Returns:
+        与 ChatService 共用 guard、key 映射和 checkpointer 的无状态协调器。
+
+    Raises:
+        RuntimeError: startup 尚未完成或 shutdown 已撤下应用服务。
+    """
+    try:
+        cleanup_service = app.state.chat_session_cleanup_service
+    except AttributeError as exc:
+        raise RuntimeError("Application chat cleanup service is not initialized") from exc
+    return cast(ChatSessionCleanupService, cleanup_service)
 
 
 @asynccontextmanager
@@ -170,10 +192,21 @@ async def lifespan(
             graph_timeout_seconds=CHAT_GRAPH_TIMEOUT_SECONDS,
         )
 
-        # 7. 所有 startup 步骤成功后，才同时发布底层资源和上层应用服务。
+        # 7. cleanup coordinator 与 ChatService 共用同一 guard，确保删除和 Graph
+        # 落在同一个跨 worker 临界区。内部 key factory 也直接复用 ChatService
+        # 当前实现，避免两处字符串拼接随时间漂移成两套 checkpoint 身份空间。
+        chat_session_cleanup_service = ChatSessionCleanupService(
+            session_factory=resources.orm_session_factory,
+            checkpoint_store=resources.checkpointer,
+            execution_guard=execution_guard,
+            internal_thread_id_factory=ChatService._build_checkpoint_thread_id,
+        )
+
+        # 8. 所有 startup 步骤成功后，才同时发布底层资源和上层应用服务。
         # yield 前 FastAPI 尚未接收请求，因此请求不会看到只发布一半的状态。
         app.state.resources = resources
         app.state.chat_service = chat_service
+        app.state.chat_session_cleanup_service = chat_session_cleanup_service
 
         logger.info(
             "infrastructure_initialized",
@@ -184,8 +217,9 @@ async def lifespan(
             # yield 之后，FastAPI 才开始对外处理 HTTP/Agent 请求。
             yield
         finally:
-            # shutdown 先撤下依赖资源的 ChatService，再撤下底层资源引用。
+            # shutdown 先撤下依赖资源的上层 service，再撤下底层资源引用。
             # 真正的客户端和连接池随后由 AsyncExitStack 按逆序关闭。
+            del app.state.chat_session_cleanup_service
             del app.state.chat_service
             del app.state.resources
             logger.info("infrastructure_shutdown_started")

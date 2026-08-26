@@ -6,13 +6,21 @@
 - 外键保证引用存在，索引加速按用户查询会话。
 """
 
+from enum import StrEnum
 from typing import Any
 from uuid import UUID
 
-from sqlalchemy import Column, String
+from sqlalchemy import CheckConstraint, Column, String
 from sqlmodel import Field
 
 from app.models.base import UUIDTimestampModel
+
+
+class ChatSessionStatus(StrEnum):
+    """业务会话在可重试删除流程中的持久状态."""
+
+    ACTIVE = "active"
+    DELETING = "deleting"
 
 
 class ChatSession(UUIDTimestampModel, table=True):
@@ -25,6 +33,15 @@ class ChatSession(UUIDTimestampModel, table=True):
     # 与 User 相同，SQLModel 运行时接受字符串表名，而类型桩使用动态
     # declared_attr；只对这个框架魔术属性放宽类型。
     __tablename__: Any = "chat_sessions"
+
+    # 数据库约束是最后一道防线：即使后台脚本绕过 Pydantic/Service，也不能
+    # 写入 cleanup coordinator 无法理解的第三种状态。
+    __table_args__ = (
+        CheckConstraint(
+            "status IN ('active', 'deleting')",
+            name="ck_chat_sessions_status",
+        ),
+    )
 
     # foreign_key="users.id" 在数据库层保证关联的用户必须存在。
     # nullable=False 表示会话不能脱离用户独立存在。
@@ -40,4 +57,12 @@ class ChatSession(UUIDTimestampModel, table=True):
     title: str = Field(
         default="New chat",
         sa_column=Column(String(200), nullable=False),
+    )
+
+    # active 表示普通 API 和 Agent 可以访问；deleting 是持久 tombstone，表示
+    # 业务行仍保留，但只允许 cleanup coordinator 继续幂等清理。不能只使用
+    # 内存标志，否则进程在 checkpoint 删除中途重启后会遗失恢复方向。
+    status: ChatSessionStatus = Field(
+        default=ChatSessionStatus.ACTIVE,
+        sa_column=Column(String(32), nullable=False, index=True),
     )

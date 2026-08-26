@@ -5,6 +5,10 @@ from app.services.chat_session_ownership import (
     ChatSessionOwnershipVerifier,
     InProcessChatSessionOwnershipVerifier,
 )
+from app.services.chat_session_cleanup import (
+    ChatCheckpointCleanupError,
+    ChatSessionCleanupService,
+)
 from app.services.chat_sessions import (
     ChatSessionService,
     ChatSessionServiceError,
@@ -19,6 +23,8 @@ from app.services.persistence import (
 
 __all__ = [
     "ChatSessionNotFoundError",
+    "ChatCheckpointCleanupError",
+    "ChatSessionCleanupService",
     "ChatSessionOwnershipVerifier",
     "InProcessChatSessionOwnershipVerifier",
     "ChatSessionService",

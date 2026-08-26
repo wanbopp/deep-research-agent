@@ -35,8 +35,7 @@ def upgrade() -> None:
     )
     if has_existing_users:
         raise RuntimeError(
-            "Cannot add users.password_hash while legacy user rows exist; "
-            "migrate or reset those accounts first"
+            "Cannot add users.password_hash while legacy user rows exist; migrate or reset those accounts first"
         )
 
     # With an empty table PostgreSQL can enforce NOT NULL immediately, so there is no

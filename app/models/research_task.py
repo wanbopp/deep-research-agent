@@ -48,6 +48,9 @@ class ResearchTask(UUIDTimestampModel, table=True):
     chat_session_id: UUID | None = Field(
         default=None,
         foreign_key="chat_sessions.id",
+        # 会话删除不应抹掉已经形成的研究任务审计记录。数据库在删除父会话时
+        # 把这个可空引用置空，任务仍归原 user_id 所有。
+        ondelete="SET NULL",
         nullable=True,
         index=True,
     )

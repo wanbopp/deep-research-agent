@@ -1,13 +1,14 @@
-"""端到端验证 production Chat execution guard 与真实 provider.
+"""端到端验证 production Chat ownership、execution guard 与真实 provider.
 
-本 Gate 覆盖 Checkpoint 10E 最关键的应用行为：
+本 Gate 覆盖 Checkpoint 10F-C4 最关键的应用行为：
 
-1. 在随机临时 PostgreSQL 数据库中启动真实 production lifespan；
-2. 第一个同 thread 请求取得真实 Redis 锁后，第二个请求必须 fail-fast busy；
-3. busy 请求的消息不能写入 checkpoint，证明它没有进入 Graph；
-4. 同一用户的两个不同 thread 必须同时持有不同 Redis 锁并完成真实模型请求；
-5. SSE 在响应流阶段遇到 busy 时返回稳定 error 事件，不调用模型；
-6. shutdown 后连接池关闭、app.state 撤下，随机数据库和 Redis 锁均被清理。
+1. 随机 PostgreSQL 数据库执行正式 Alembic migration，再启动 production lifespan；
+2. owner 请求通过 PostgreSQL verifier，并由真实 provider 完成 Agent 回答；
+3. cross-user 与 absent 请求在 Graph 前失败，且真实 Redis 锁仍由 finally 释放；
+4. 第一个同 session 请求取得真实 Redis 锁后，第二个请求必须 fail-fast busy；
+5. busy 请求不能写 checkpoint，不同 session 仍可并发完成真实模型请求；
+6. SSE ownership/busy 分支返回稳定 error 事件，不调用模型；
+7. shutdown 后连接池关闭、app.state 撤下，随机数据库和 Redis 锁均被清理。
 
 所有会产生模型行为的路径都使用当前真实 provider。脚本不会输出 Prompt、模型正文、
 用户 UUID、公开/内部 thread ID、Redis key、owner token、数据库名、连接串或 API key。
@@ -15,27 +16,31 @@
 
 import asyncio
 import json
+import os
 import selectors
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from hashlib import sha256
+from pathlib import Path
 from time import perf_counter
 from unittest.mock import patch
 from uuid import UUID, uuid4
 
 import psycopg
+from alembic import command
+from alembic.config import Config
 from fastapi import FastAPI
 from langchain_core.messages import HumanMessage
 from langgraph.checkpoint.base import BaseCheckpointSaver
 from psycopg import sql
 from psycopg.conninfo import make_conninfo
 from redis.asyncio import Redis
-from sqlmodel import SQLModel
 
 import app.infrastructure.lifespan as lifespan_module
 from app.agents.chat.graph import ChatGraph
 from app.agents.chat.runtime import create_chat_runtime
 from app.core.config import Settings, settings
+from app.infrastructure.database import build_orm_database_url
 from app.infrastructure.chat_guard import (
     CHAT_EXECUTION_LOCK_PREFIX,
     RedisChatExecutionGuard,
@@ -51,7 +56,9 @@ from app.models.user import User
 from app.schemas.chat import ChatRequest, ChatResponse, ErrorStreamEvent
 from app.services.chat import ChatService
 from app.services.chat_guard import ChatThreadBusyError
+from app.services.chat_session_ownership import ChatSessionNotFoundError
 
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
 CONNECTION_TIMEOUT_SECONDS = 10
 TOTAL_TIMEOUT_SECONDS = 300.0
 LOCK_OBSERVATION_TIMEOUT_SECONDS = 15.0
@@ -90,6 +97,18 @@ def _create_database(admin_database: str, test_database: str) -> None:
     """在事务外创建随机临时数据库."""
     with psycopg.connect(_conninfo(admin_database), autocommit=True) as connection:
         connection.execute(sql.SQL("CREATE DATABASE {}").format(sql.Identifier(test_database)))
+
+
+def _temporary_database_url(database: str) -> str:
+    """构造只交给 Alembic 使用且不会输出的临时数据库 URL.
+
+    Args:
+        database: 本 Gate 随机创建的数据库名称。
+
+    Returns:
+        指向随机数据库的 SQLAlchemy URL 字符串。
+    """
+    return build_orm_database_url(settings).set(database=database).render_as_string(hide_password=False)
 
 
 def _drop_database(admin_database: str, test_database: str) -> None:
@@ -187,12 +206,14 @@ async def _exercise_guard(database: str) -> dict[str, bool | float | str]:
     """
     started_at = perf_counter()
     user_id = UUID("55555555-5555-4555-8555-555555555555")
+    other_user_id = UUID("66666666-6666-4666-8666-666666666666")
     # 公开会话标识已经是业务实体 UUID。随机值既避免与其他 smoke 冲突，
     # 也让类型层尽早发现把任意名称字符串当作 session_id 的旧用法。
     same_thread = uuid4()
     parallel_first_thread = uuid4()
     parallel_second_thread = uuid4()
     stream_busy_thread = uuid4()
+    absent_thread = uuid4()
     rejected_marker = f"REJECTED-{uuid4().hex.upper()}"
 
     # 这两个 Event 只负责让 smoke 获得确定的并发顺序：第一个请求拿到真实 Redis
@@ -205,6 +226,7 @@ async def _exercise_guard(database: str) -> dict[str, bool | float | str]:
     rejected_prompt = f"This request must be rejected before Graph execution. Marker: {rejected_marker}"
     parallel_first_prompt = f"Do not call any tool. Reply with exactly {DIFFERENT_FIRST_REPLY} and nothing else."
     parallel_second_prompt = f"Do not call any tool. Reply with exactly {DIFFERENT_SECOND_REPLY} and nothing else."
+    ownership_probe_prompt = "This ownership probe must never reach the Graph or model."
 
     captured_graphs: list[ChatGraph] = []
 
@@ -283,20 +305,30 @@ async def _exercise_guard(database: str) -> dict[str, bool | float | str]:
                 service = get_application_chat_service(app)
                 resources = get_application_resources(app)
 
-                # 临时数据库最初为空。ownership verifier 查询 chat_sessions，
-                # 所以必须先建立业务表和真实所有权记录，再执行任何 Graph。
-                # checkpoint 表仍由 LangGraph saver 管理，两类表职责保持分离。
-                async with resources.orm_engine.begin() as connection:
-                    await connection.run_sync(SQLModel.metadata.create_all)
-
+                # Alembic 已经建立业务表；这里仅写入两个真实用户和 A 拥有的
+                # session。B 用户存在但不拥有这些 session，absent_thread 则完全
+                # 没有业务行，因而可验证两种情况共享相同的安全拒绝语义。
                 async with resources.orm_session_factory() as session:
-                    session.add(
-                        User(
-                            id=user_id,
-                            email=f"guard-{uuid4().hex}@example.com",
-                            password_hash="smoke-only-not-a-real-credential",
-                        )
+                    session.add_all(
+                        [
+                            User(
+                                id=user_id,
+                                email=f"guard-owner-{uuid4().hex}@example.com",
+                                password_hash="smoke-only-not-a-real-credential",
+                            ),
+                            User(
+                                id=other_user_id,
+                                email=f"guard-other-{uuid4().hex}@example.com",
+                                password_hash="smoke-only-not-a-real-credential",
+                            ),
+                        ]
                     )
+
+                    # User 与 ChatSession 之间只声明数据库 foreign key，没有配置
+                    # ORM relationship。显式 flush 用户可保证外键父行先落库，也让
+                    # fixture 构建顺序不依赖 SQLAlchemy 对无关系对象的排序细节。
+                    await session.flush()
+
                     session.add_all(
                         [
                             ChatSession(
@@ -317,6 +349,93 @@ async def _exercise_guard(database: str) -> dict[str, bool | float | str]:
                 if len(captured_graphs) != 1:
                     raise RuntimeError("lifespan must build exactly one Chat graph")
                 graph = captured_graphs[0]
+
+                # 先验证 ownership 的拒绝路径。两个 patch 只是调用计数器：若
+                # verifier 正确位于 Graph 前，它们的 call_count 必须始终为 0。
+                # 这里不替换 Graph 返回值，也不使用 fake LLM；授权路径稍后仍会
+                # 通过同一个真实 Graph 发起真实 provider 请求。
+                cross_user_lock = _lock_name(other_user_id, same_thread)
+                absent_lock = _lock_name(user_id, absent_thread)
+                with (
+                    patch.object(graph, "ainvoke", wraps=graph.ainvoke) as ownership_ainvoke_spy,
+                    patch.object(graph, "astream", wraps=graph.astream) as ownership_astream_spy,
+                ):
+                    try:
+                        await service.run_turn(
+                            ChatRequest(
+                                thread_id=same_thread,
+                                message=ownership_probe_prompt,
+                            ),
+                            user_id=other_user_id,
+                        )
+                    except ChatSessionNotFoundError:
+                        cross_user_rejected = True
+                    else:
+                        cross_user_rejected = False
+
+                    try:
+                        await service.run_turn(
+                            ChatRequest(
+                                thread_id=absent_thread,
+                                message=ownership_probe_prompt,
+                            ),
+                            user_id=user_id,
+                        )
+                    except ChatSessionNotFoundError:
+                        absent_session_rejected = True
+                    else:
+                        absent_session_rejected = False
+
+                    # StreamingResponse 不能在生成器开始后改 HTTP status，因此
+                    # stream_turn 把相同业务错误转换为稳定的流内 error event。
+                    ownership_stream_events: list[ErrorStreamEvent] = []
+                    async for event in service.stream_turn(
+                        ChatRequest(
+                            thread_id=same_thread,
+                            message=ownership_probe_prompt,
+                        ),
+                        user_id=other_user_id,
+                    ):
+                        if isinstance(event, ErrorStreamEvent):
+                            ownership_stream_events.append(event)
+
+                    ownership_failures_skipped_graph = (
+                        ownership_ainvoke_spy.call_count == 0 and ownership_astream_spy.call_count == 0
+                    )
+
+                ownership_stream_error_matches = (
+                    len(ownership_stream_events) == 1 and ownership_stream_events[0].code == "CHAT_SESSION_NOT_FOUND"
+                )
+
+                # ChatService 先取 Redis guard 再查所有权，以便未来删除流程与执行
+                # 共用同一临界区。因此失败后还必须证明两把短暂锁均已释放。
+                await _wait_for_lock_state(
+                    resources.redis_client,
+                    lock_names=(cross_user_lock, absent_lock),
+                    expected_exists=False,
+                )
+                ownership_failure_locks_released = True
+
+                # 即使错误映射正确，也要检查 PostgreSQL saver 中没有产生状态。
+                # 空 snapshot 证明无权输入没有成为 HumanMessage 或 checkpoint 分支。
+                cross_user_snapshot = await graph.aget_state(
+                    ChatService._build_config(
+                        user_id=other_user_id,
+                        public_thread_id=same_thread,
+                    )
+                )
+                absent_snapshot = await graph.aget_state(
+                    ChatService._build_config(
+                        user_id=user_id,
+                        public_thread_id=absent_thread,
+                    )
+                )
+                ownership_failures_left_no_checkpoint = (
+                    not cross_user_snapshot.values
+                    and not cross_user_snapshot.next
+                    and not absent_snapshot.values
+                    and not absent_snapshot.next
+                )
 
                 same_lock_name = _lock_name(user_id, same_thread)
                 first_task = asyncio.create_task(
@@ -448,6 +567,12 @@ async def _exercise_guard(database: str) -> dict[str, bool | float | str]:
     elapsed_ms = _elapsed_ms(started_at)
     return {
         "model": settings.DEFAULT_LLM_MODEL,
+        "cross_user_rejected": cross_user_rejected,
+        "absent_session_rejected": absent_session_rejected,
+        "ownership_stream_error_matches": ownership_stream_error_matches,
+        "ownership_failures_skipped_graph": ownership_failures_skipped_graph,
+        "ownership_failure_locks_released": ownership_failure_locks_released,
+        "ownership_failures_left_no_checkpoint": ownership_failures_left_no_checkpoint,
         "same_thread_rejected": same_thread_rejected,
         "busy_failed_fast": busy_elapsed_ms <= BUSY_BUDGET_SECONDS * 1000,
         "busy_input_absent_from_checkpoint": busy_input_absent_from_checkpoint,
@@ -470,10 +595,11 @@ async def _exercise_guard(database: str) -> dict[str, bool | float | str]:
 
 
 def _run_smoke() -> dict[str, object]:
-    """创建随机数据库、执行真实 Gate，并保证最终清理."""
+    """迁移随机数据库、执行真实 Gate，并保证最终清理."""
     started_at = perf_counter()
     admin_database = settings.POSTGRES_DB
     test_database = f"deep_research_chat_guard_{uuid4().hex[:10]}"
+    previous_override = os.environ.get("ALEMBIC_DATABASE_URL")
     database_created = False
     cleanup_ok = False
     checks: dict[str, bool | float | str]
@@ -481,11 +607,25 @@ def _run_smoke() -> dict[str, object]:
     try:
         _create_database(admin_database, test_database)
         database_created = True
+
+        # 使用部署时相同的 Alembic revision 建立业务表。LangGraph checkpoint
+        # 表仍由 lifespan 中的 saver.setup() 管理，验证两套 migration ownership
+        # 可以在同一空数据库中按正式顺序协作。
+        os.environ["ALEMBIC_DATABASE_URL"] = _temporary_database_url(test_database)
+        command.upgrade(Config(str(PROJECT_ROOT / "alembic.ini")), "head")
+
         checks = asyncio.run(
             _exercise_guard(test_database),
             loop_factory=_selector_loop_factory,
         )
     finally:
+        # 环境变量只在当前进程中临时覆盖。无论 Gate 是否成功，都必须恢复调用者
+        # 原值，避免后续命令意外连接一个即将删除的随机数据库。
+        if previous_override is None:
+            os.environ.pop("ALEMBIC_DATABASE_URL", None)
+        else:
+            os.environ["ALEMBIC_DATABASE_URL"] = previous_override
+
         if database_created:
             try:
                 _drop_database(admin_database, test_database)
