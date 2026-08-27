@@ -7,13 +7,17 @@
 """
 
 from enum import StrEnum
+from datetime import datetime
 from typing import Any
 from uuid import UUID
 
-from sqlalchemy import CheckConstraint, Column, String
+from sqlalchemy import CheckConstraint, Column, String, Uuid
 from sqlmodel import Field
 
-from app.models.base import UUIDTimestampModel
+from app.models.base import UTCDateTime, UUIDTimestampModel
+
+DEFAULT_CHAT_SESSION_TITLE = "New chat"
+MAX_CHAT_SESSION_TITLE_LENGTH = 200
 
 
 class ChatSessionStatus(StrEnum):
@@ -41,6 +45,13 @@ class ChatSession(UUIDTimestampModel, table=True):
             "status IN ('active', 'deleting')",
             name="ck_chat_sessions_status",
         ),
+        # token 与时间必须同时存在或同时为空。数据库约束保护所有写入入口，
+        # 即使维护脚本绕过 Repository，也不能制造无法判断租约年龄的半状态。
+        CheckConstraint(
+            "(title_claim_token IS NULL AND title_claimed_at IS NULL) OR "
+            "(title_claim_token IS NOT NULL AND title_claimed_at IS NOT NULL)",
+            name="ck_chat_sessions_title_claim_pair",
+        ),
     )
 
     # foreign_key="users.id" 在数据库层保证关联的用户必须存在。
@@ -55,8 +66,30 @@ class ChatSession(UUIDTimestampModel, table=True):
     # title 是业务展示信息，不是 Agent prompt，也不是完整消息历史。
     # 先提供稳定默认值，后续 service 可以根据用户输入或模型结果更新标题。
     title: str = Field(
-        default="New chat",
-        sa_column=Column(String(200), nullable=False),
+        default=DEFAULT_CHAT_SESSION_TITLE,
+        sa_column=Column(String(MAX_CHAT_SESSION_TITLE_LENGTH), nullable=False),
+    )
+
+    # 自动命名使用数据库租约，而不是 asyncio.Lock。token 标识本次占有者，
+    # claimed_at 用于 worker 崩溃后的超时接管。二者都不公开给 API 或 Agent。
+    # 谁拥有当前租约。
+    title_claim_token: UUID | None = Field(
+        default=None,
+        sa_column=Column(Uuid(), nullable=True),
+    )
+    # 租约从什么时候开始
+    title_claimed_at: datetime | None = Field(
+        default=None,
+        sa_type=UTCDateTime,
+        nullable=True,
+    )
+    # 自动标题是否已经成功生成
+    # 成功写入自动标题后记录完成时间。它与 title 分开保存，使系统能区分
+    # “模型生成成功”和“用户从创建时就提供了自定义标题”两种业务来源。
+    title_generated_at: datetime | None = Field(
+        default=None,
+        sa_type=UTCDateTime,
+        nullable=True,
     )
 
     # active 表示普通 API 和 Agent 可以访问；deleting 是持久 tombstone，表示

@@ -17,6 +17,7 @@ ChatSessionCacheInvalidationReason = Literal[
     "created",
     "deleting",
     "invalid_payload",
+    "title_generated",
 ]
 
 

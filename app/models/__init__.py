@@ -7,7 +7,12 @@
 """
 
 from app.models.base import UUIDTimestampModel, utc_now
-from app.models.chat_session import ChatSession, ChatSessionStatus
+from app.models.chat_session import (
+    DEFAULT_CHAT_SESSION_TITLE,
+    MAX_CHAT_SESSION_TITLE_LENGTH,
+    ChatSession,
+    ChatSessionStatus,
+)
 from app.models.document import Document, DocumentStatus
 from app.models.memory import MEMORY_EMBEDDING_DIMENSIONS, Memory
 from app.models.research_task import ResearchTask, ResearchTaskStatus
@@ -16,10 +21,12 @@ from app.models.user import User
 __all__ = [
     "ChatSession",
     "ChatSessionStatus",
+    "DEFAULT_CHAT_SESSION_TITLE",
     "Document",
     "DocumentStatus",
     "MEMORY_EMBEDDING_DIMENSIONS",
     "Memory",
+    "MAX_CHAT_SESSION_TITLE_LENGTH",
     "ResearchTask",
     "ResearchTaskStatus",
     "UUIDTimestampModel",

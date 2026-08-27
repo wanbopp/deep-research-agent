@@ -64,7 +64,7 @@ from app.infrastructure.lifespan import (  # noqa: E402
     get_application_resources,
     lifespan,
 )
-from app.models import Memory  # noqa: E402
+from app.models import DEFAULT_CHAT_SESSION_TITLE, ChatSession, Memory  # noqa: E402
 from app.schemas.memory import (  # noqa: E402
     MemoryCreate,
     MemoryItem,
@@ -481,7 +481,10 @@ async def _exercise_smoke(database: str) -> dict[str, bool | int | float | str]:
                         source_thread_id = await _create_session(
                             client,
                             headers=headers,
-                            title="Long-term memory source",
+                            # 默认标题让本次真实 HTTP Chat 同时经过 12E 自动命名。
+                            # target/degraded 会话仍使用人工标题，验证它们不会额外调用
+                            # 标题模型，也保持降级场景的任务数量断言稳定。
+                            title=DEFAULT_CHAT_SESSION_TITLE,
                         )
                         target_thread_id = await _create_session(
                             client,
@@ -514,6 +517,21 @@ async def _exercise_smoke(database: str) -> dict[str, bool | int | float | str]:
                         async with resources.orm_session_factory() as session:
                             result = await session.execute(select(Memory).where(Memory.user_id == user_id))
                             rows_after_source = tuple(result.scalars().all())
+                            title_result = await session.execute(
+                                select(ChatSession).where(ChatSession.id == source_thread_id)
+                            )
+                            source_session = title_result.scalar_one_or_none()
+
+                        # 这条证据覆盖 production 接线，而不仅是 title writer 单独可用：
+                        # HTTP Chat 完成 -> ChatService 完成边界 -> 共享 submitter ->
+                        # PostgreSQL claim -> 真实 structured title -> 条件提交。
+                        source_title_generated = (
+                            source_session is not None
+                            and source_session.title != DEFAULT_CHAT_SESSION_TITLE
+                            and source_session.title_generated_at is not None
+                            and source_session.title_claim_token is None
+                            and source_session.title_claimed_at is None
+                        )
 
                         matching_rows = tuple(row for row in rows_after_source if "中文" in row.content)
                         memory_persisted = len(matching_rows) == 1
@@ -706,6 +724,7 @@ async def _exercise_smoke(database: str) -> dict[str, bool | int | float | str]:
                 not hasattr(app.state, "resources")
                 and not hasattr(app.state, "chat_service")
                 and not hasattr(app.state, "chat_memory_writer")
+                and not hasattr(app.state, "chat_title_writer")
                 and not hasattr(app.state, "background_task_submitter")
             )
             postgres_pool_closed_after_shutdown = resources.postgres_pool.closed
@@ -715,6 +734,7 @@ async def _exercise_smoke(database: str) -> dict[str, bool | int | float | str]:
         "model": settings.DEFAULT_LLM_MODEL,
         "source_completed": source_completed,
         "source_tasks_drained": source_tasks_drained,
+        "source_title_generated": source_title_generated,
         "memory_persisted": memory_persisted,
         "memory_owner_and_source_match": memory_owner_and_source_match,
         "memory_count_after_source": len(rows_after_source),

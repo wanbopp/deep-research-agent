@@ -217,6 +217,30 @@ class Settings:
                 "MEMORY_CACHE_GENERATION_TTL_SECONDS must not be shorter than MEMORY_SEARCH_CACHE_TTL_SECONDS"
             )
 
+        # ---- 后台会话增强 ----
+        # 聊天会话在创建后需要异步生成标题和提取记忆，这些任务由后台 worker
+        # 执行。以下两个参数分别控制任务认领的租约机制和进程关闭时的优雅等待。
+        #
+        # CHAT_TITLE_CLAIM_LEASE_SECONDS：后台标题生成任务的分布式租约（秒）。
+        # 多个 worker 并发时，只有成功 claim 的 worker 才会执行标题生成。
+        # 租约到期后其他 worker 可以接管（防止 worker 崩溃导致任务永久阻塞）。
+        # 必须明显长于 LLM_TOTAL_TIMEOUT，确保一次正常调用不会在租约内超时。
+        self.CHAT_TITLE_CLAIM_LEASE_SECONDS = float(os.getenv("CHAT_TITLE_CLAIM_LEASE_SECONDS", "300"))
+        # BACKGROUND_TASK_SHUTDOWN_TIMEOUT_SECONDS：进程关闭时等待后台任务完成的
+        # 最大时间（秒）。shutdown 流程先停止接收新任务，再在该预算内等待记忆提取
+        # 和标题生成任务自然完成；超时后强制取消遗留任务，随后才关闭数据库、
+        # Redis 和 provider 等共享依赖。
+        self.BACKGROUND_TASK_SHUTDOWN_TIMEOUT_SECONDS = float(
+            os.getenv("BACKGROUND_TASK_SHUTDOWN_TIMEOUT_SECONDS", "15")
+        )
+        # 租约必须大于单次 LLM 调用超时，否则正常调用还没完成租约就过期了，
+        # 其他 worker 会重复执行同一个标题生成任务。
+        if self.CHAT_TITLE_CLAIM_LEASE_SECONDS <= self.LLM_TOTAL_TIMEOUT:
+            raise ValueError("CHAT_TITLE_CLAIM_LEASE_SECONDS must be greater than LLM_TOTAL_TIMEOUT")
+        # 关闭超时可以设为 0（立即取消所有后台任务），但不能为负数。
+        if self.BACKGROUND_TASK_SHUTDOWN_TIMEOUT_SECONDS < 0:
+            raise ValueError("BACKGROUND_TASK_SHUTDOWN_TIMEOUT_SECONDS must not be negative")
+
         # ---- JWT 认证 ----
         # Secret 不提供可工作的默认值：示例 secret 一旦被误带到部署环境，攻击者
         # 就能自行签发任意身份 token。TokenService 还会执行长度与已知弱值检查。

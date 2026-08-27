@@ -30,6 +30,11 @@ from app.schemas.llm import ModelSpec
 from app.services.chat import ChatService
 from app.services.cache import Cache
 from app.services.chat_session_cleanup import ChatSessionCleanupService
+from app.services.chat_title import (
+    BackgroundChatTitleWriter,
+    ChatTitleWriter,
+    LLMChatTitleGenerator,
+)
 from app.services.llm.factory import create_openai_chat_model
 from app.services.llm.registry import LLMRegistry
 from app.services.llm.service import LLMService
@@ -48,6 +53,7 @@ CHAT_GRAPH_TIMEOUT_SECONDS = 90.0
 # 释放；进程崩溃时 Redis 仍会在 120 秒内自动清除遗留锁。
 CHAT_GUARD_LEASE_SECONDS = 120.0
 MEMORY_EXTRACTION_MODEL_ALIAS = "memory-extraction"
+CHAT_TITLE_MODEL_ALIAS = "chat-title"
 REQUIRED_DEPENDENCIES = frozenset({DependencyName.POSTGRES})
 
 
@@ -124,13 +130,32 @@ def get_application_chat_memory_writer(app: FastAPI) -> ChatMemoryWriter:
     return cast(ChatMemoryWriter, writer)
 
 
+def get_application_chat_title_writer(app: FastAPI) -> ChatTitleWriter:
+    """读取 lifespan 创建并注入 ChatService 的自动命名边界.
+
+    Args:
+        app: 当前 FastAPI 应用实例。
+
+    Returns:
+        与 production ChatService 共用的无请求状态 title writer。
+
+    Raises:
+        RuntimeError: startup 尚未发布 writer，或 shutdown 已撤下引用。
+    """
+    try:
+        writer = app.state.chat_title_writer
+    except AttributeError as exc:
+        raise RuntimeError("Application chat title writer is not initialized") from exc
+    return cast(ChatTitleWriter, writer)
+
+
 def get_application_background_task_submitter(
     app: FastAPI,
 ) -> AsyncioBackgroundTaskSubmitter:
     """读取当前 worker 的后台任务提交器.
 
-    12D 暴露该对象是为了验证 production 只使用一个任务集合；12E 会在同一对象上
-    增加 shutdown drain/cancel，而不是再创建第二套无法统一收敛的任务跟踪器。
+    记忆写入和会话命名共用该对象。它在 shutdown 统一 drain/cancel，避免创建
+    两套任务集合后只等待其中一套。
     """
     try:
         submitter = app.state.background_task_submitter
@@ -259,6 +284,53 @@ def _create_memory_extractor(config: Settings) -> LLMMemoryExtractor:
     )
 
 
+def _create_chat_title_generator(config: Settings) -> LLMChatTitleGenerator:
+    """根据当前环境组合真实结构化标题生成器.
+
+    Args:
+        config: 当前 lifespan 使用的配置快照。
+
+    Returns:
+        只保存无请求状态 LLMService 和 alias 的标题生成器。
+
+    Raises:
+        RuntimeError: 没有配置 provider API key。
+        ValidationError: 模型配置违反 ModelSpec 边界。
+
+    Notes:
+        标题与 Agent 对话、长期记忆提取共享 provider 配置，但拥有独立 alias、
+        输出预算和 LLMService。构造不会发网络请求；只有成功取得数据库 claim 的
+        后台任务才会执行真实 ``call_structured``。
+    """
+    if not config.OPENAI_API_KEY:
+        raise RuntimeError("OPENAI_API_KEY is required to create chat title generator")
+
+    title_spec = ModelSpec(
+        alias=CHAT_TITLE_MODEL_ALIAS,
+        provider_model=config.DEFAULT_LLM_MODEL,
+        api_key=SecretStr(config.OPENAI_API_KEY),
+        base_url=config.OPENAI_BASE_URL,
+        temperature=0.0,
+        # 标题 schema 只有一个短字符串，不需要普通 Agent 的完整输出预算。
+        max_tokens=min(config.MAX_TOKENS, 200),
+        request_timeout_seconds=max(1.0, config.LLM_TOTAL_TIMEOUT * 0.75),
+    )
+    registry = LLMRegistry(
+        specs=(title_spec,),
+        factory=create_openai_chat_model,
+    )
+    llm_service = LLMService(
+        registry,
+        max_attempts=config.MAX_LLM_CALL_RETRIES,
+        retry_wait_multiplier=0.2,
+        total_timeout_seconds=config.LLM_TOTAL_TIMEOUT,
+    )
+    return LLMChatTitleGenerator(
+        llm_service,
+        aliases=(CHAT_TITLE_MODEL_ALIAS,),
+    )
+
+
 @asynccontextmanager
 async def lifespan(
     app: FastAPI,
@@ -373,14 +445,21 @@ async def lifespan(
         # - extractor 只把对话转换成不含身份的 content/kind 候选；
         # - writer 在每次 submit_turn() 中接收可信 user_id/source_thread_id；
         # - submitter 为本 worker 的任务保留强引用并消费异常。
-        # 12D 的 submitter 尚不在 shutdown 等待任务；12E 会在同一实例上补齐
-        # drain/cancel，避免应用退出时底层 Redis/ORM 已关闭而任务仍在使用它们。
+        # 同一个 submitter 同时管理记忆与标题任务；shutdown 会先 drain/cancel，
+        # 避免底层 Redis/ORM 已关闭而后台任务仍在使用它们。
         background_task_submitter = AsyncioBackgroundTaskSubmitter()
         memory_extractor = _create_memory_extractor(config)
         chat_memory_writer = BackgroundChatMemoryWriter(
             extractor=memory_extractor,
             memory_service=memory_service,
             task_submitter=background_task_submitter,
+        )
+        chat_title_writer = BackgroundChatTitleWriter(
+            generator=_create_chat_title_generator(config),
+            session_factory=resources.orm_session_factory,
+            cache=cache,
+            task_submitter=background_task_submitter,
+            claim_lease_seconds=config.CHAT_TITLE_CLAIM_LEASE_SECONDS,
         )
 
         # Graph 编译时只把共享 MemoryService 放入 memory node 闭包。当前用户身份
@@ -432,6 +511,7 @@ async def lifespan(
             ownership_verifier=ownership_verifier,
             graph_timeout_seconds=CHAT_GRAPH_TIMEOUT_SECONDS,
             memory_writer=chat_memory_writer,
+            title_writer=chat_title_writer,
         )
 
         # 7. cleanup coordinator 与 ChatService 共用同一 guard，确保删除和 Graph
@@ -454,6 +534,7 @@ async def lifespan(
         app.state.memory_service = memory_service
         app.state.background_task_submitter = background_task_submitter
         app.state.chat_memory_writer = chat_memory_writer
+        app.state.chat_title_writer = chat_title_writer
         app.state.chat_service = chat_service
         app.state.chat_session_cleanup_service = chat_session_cleanup_service
 
@@ -466,14 +547,20 @@ async def lifespan(
             # yield 之后，FastAPI 才开始对外处理 HTTP/Agent 请求。
             yield
         finally:
-            # shutdown 先撤下依赖资源的上层 service，再撤下底层资源引用。
-            # 真正的客户端和连接池随后由 AsyncExitStack 按逆序关闭。
+            logger.info("infrastructure_shutdown_started")
+            # shutdown 先撤下会继续提交任务的上层 service。FastAPI 正常流程会先
+            # 停止接收请求；这里再移除严格 getter 的公开引用，防止生命周期外误用。
             del app.state.chat_session_cleanup_service
             del app.state.chat_service
-            # ChatService 先撤下，新的 HTTP 请求便无法再提交任务。writer 和
-            # submitter 随后撤下公开入口；当前 12D 不主动取消已提交任务，12E 会在
-            # 删除这些引用前执行有界 drain/cancel。
+            del app.state.chat_title_writer
             del app.state.chat_memory_writer
+
+            # Writer 已不可从 app.state 获取，但运行中的 Task 仍持有完成当前操作
+            # 所需依赖。先等待或取消它们，再关闭 Redis、ORM 和 provider 资源；顺序
+            # 反过来会让正常任务在 shutdown 中制造连接已关闭错误。
+            await background_task_submitter.shutdown(
+                timeout_seconds=config.BACKGROUND_TASK_SHUTDOWN_TIMEOUT_SECONDS,
+            )
             del app.state.background_task_submitter
             # 先撤下所有会调用 MemoryService 的上层对象，再撤下 service 本身。
             # MemoryService 没有 close 方法，因为 Redis client 和 ORM engine 的唯一
@@ -483,7 +570,6 @@ async def lifespan(
             del app.state.rate_limiter
             del app.state.cache
             del app.state.resources
-            logger.info("infrastructure_shutdown_started")
 
     # 离开 AsyncExitStack 时，三个 close callback 已经执行完毕。
     logger.info("infrastructure_shutdown_completed")

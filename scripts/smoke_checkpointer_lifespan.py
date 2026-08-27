@@ -2,9 +2,9 @@
 
 Checkpoint 10A 已证明 saver 可以读写，10B 已证明 saver 的生命周期。本 smoke 继续
 覆盖 10C：startup 使用同一个 saver 编译 production Chat graph、创建唯一 ChatService，
-请求依赖只读取该服务，shutdown 后 accessor 再次拒绝访问。12D 在这条既有证据链上
-继续验证：lifespan 只创建一个 MemoryService，并把同一对象交给启用 memory node 的
-production Graph；shutdown 后同样撤下公开访问入口。
+请求依赖只读取该服务，shutdown 后 accessor 再次拒绝访问。12D 在这条证据链上
+验证唯一 MemoryService 和 writer；12E 继续验证 title writer 与记忆 writer 共用
+submitter，并在底层资源关闭前完成停止接单和任务收敛。
 
 脚本使用随机临时 PostgreSQL 数据库，并调用真实 Neo4j/Redis probe。它会构造真实
 LLM/Tool/Graph 对象但不会执行图，因此不会发送 provider 请求，也不会输出连接参数、
@@ -42,6 +42,7 @@ from app.infrastructure.lifespan import (
     get_application_background_task_submitter,
     get_application_chat_memory_writer,
     get_application_chat_service,
+    get_application_chat_title_writer,
     get_application_memory_service,
     get_application_resources,
     lifespan,
@@ -144,6 +145,7 @@ async def _exercise_lifespan(database: str) -> dict[str, bool | float | int]:
         and not hasattr(app.state, "chat_service")
         and not hasattr(app.state, "memory_service")
         and not hasattr(app.state, "chat_memory_writer")
+        and not hasattr(app.state, "chat_title_writer")
         and not hasattr(app.state, "background_task_submitter")
     )
 
@@ -169,6 +171,13 @@ async def _exercise_lifespan(database: str) -> dict[str, bool | float | int]:
         writer_accessor_rejects_before_startup = str(error) == "Application chat memory writer is not initialized"
     else:
         writer_accessor_rejects_before_startup = False
+
+    try:
+        get_application_chat_title_writer(app)
+    except RuntimeError as error:
+        title_writer_accessor_rejects_before_startup = str(error) == "Application chat title writer is not initialized"
+    else:
+        title_writer_accessor_rejects_before_startup = False
 
     try:
         get_application_background_task_submitter(app)
@@ -225,6 +234,8 @@ async def _exercise_lifespan(database: str) -> dict[str, bool | float | int]:
                 second_memory_service = get_application_memory_service(app)
                 first_memory_writer = get_application_chat_memory_writer(app)
                 second_memory_writer = get_application_chat_memory_writer(app)
+                first_title_writer = get_application_chat_title_writer(app)
+                second_title_writer = get_application_chat_title_writer(app)
                 first_task_submitter = get_application_background_task_submitter(app)
                 second_task_submitter = get_application_background_task_submitter(app)
 
@@ -238,17 +249,28 @@ async def _exercise_lifespan(database: str) -> dict[str, bool | float | int]:
                     and hasattr(app.state, "chat_service")
                     and hasattr(app.state, "memory_service")
                     and hasattr(app.state, "chat_memory_writer")
+                    and hasattr(app.state, "chat_title_writer")
                     and hasattr(app.state, "background_task_submitter")
                 )
                 resource_identity_is_stable = first_resources is second_resources
                 service_identity_is_stable = first_service is second_service is dependency_service
                 memory_service_identity_is_stable = first_memory_service is second_memory_service
                 memory_writer_identity_is_stable = first_memory_writer is second_memory_writer
+                title_writer_identity_is_stable = first_title_writer is second_title_writer
                 task_submitter_identity_is_stable = first_task_submitter is second_task_submitter
                 chat_service_received_lifespan_memory_writer = (
                     getattr(first_service, "_memory_writer", None) is first_memory_writer
                 )
-                background_task_set_starts_empty = first_task_submitter.active_count == 0
+                chat_service_received_lifespan_title_writer = (
+                    getattr(first_service, "_title_writer", None) is first_title_writer
+                )
+                writers_share_task_submitter = (
+                    getattr(first_memory_writer, "_task_submitter", None) is first_task_submitter
+                    and getattr(first_title_writer, "_task_submitter", None) is first_task_submitter
+                )
+                background_task_set_starts_empty = (
+                    first_task_submitter.active_count == 0 and first_task_submitter.accepting
+                )
                 runtime_constructed_once = len(captured_graphs) == 1
                 runtime_received_lifespan_saver = (
                     len(captured_checkpointers) == 1 and captured_checkpointers[0] is first_resources.checkpointer
@@ -301,7 +323,11 @@ async def _exercise_lifespan(database: str) -> dict[str, bool | float | int]:
             and not hasattr(app.state, "chat_service")
             and not hasattr(app.state, "memory_service")
             and not hasattr(app.state, "chat_memory_writer")
+            and not hasattr(app.state, "chat_title_writer")
             and not hasattr(app.state, "background_task_submitter")
+        )
+        background_submitter_closed_after_shutdown = (
+            first_task_submitter.active_count == 0 and not first_task_submitter.accepting
         )
         pool_closed_after_shutdown = first_resources.postgres_pool.closed
         try:
@@ -331,6 +357,15 @@ async def _exercise_lifespan(database: str) -> dict[str, bool | float | int]:
             writer_accessor_rejects_after_shutdown = str(error) == "Application chat memory writer is not initialized"
         else:
             writer_accessor_rejects_after_shutdown = False
+
+        try:
+            get_application_chat_title_writer(app)
+        except RuntimeError as error:
+            title_writer_accessor_rejects_after_shutdown = (
+                str(error) == "Application chat title writer is not initialized"
+            )
+        else:
+            title_writer_accessor_rejects_after_shutdown = False
 
         try:
             get_application_background_task_submitter(app)
@@ -384,6 +419,7 @@ async def _exercise_lifespan(database: str) -> dict[str, bool | float | int]:
             and not hasattr(failure_app.state, "chat_service")
             and not hasattr(failure_app.state, "memory_service")
             and not hasattr(failure_app.state, "chat_memory_writer")
+            and not hasattr(failure_app.state, "chat_title_writer")
             and not hasattr(failure_app.state, "background_task_submitter")
             and captured_resources[0].postgres_pool.closed
         )
@@ -395,14 +431,18 @@ async def _exercise_lifespan(database: str) -> dict[str, bool | float | int]:
         "service_accessor_rejects_before_startup": service_accessor_rejects_before_startup,
         "memory_accessor_rejects_before_startup": memory_accessor_rejects_before_startup,
         "writer_accessor_rejects_before_startup": writer_accessor_rejects_before_startup,
+        "title_writer_accessor_rejects_before_startup": title_writer_accessor_rejects_before_startup,
         "submitter_accessor_rejects_before_startup": submitter_accessor_rejects_before_startup,
         "state_available_after_setup": state_available_after_setup,
         "resource_identity_is_stable": resource_identity_is_stable,
         "service_identity_is_stable": service_identity_is_stable,
         "memory_service_identity_is_stable": memory_service_identity_is_stable,
         "memory_writer_identity_is_stable": memory_writer_identity_is_stable,
+        "title_writer_identity_is_stable": title_writer_identity_is_stable,
         "task_submitter_identity_is_stable": task_submitter_identity_is_stable,
         "chat_service_received_lifespan_memory_writer": chat_service_received_lifespan_memory_writer,
+        "chat_service_received_lifespan_title_writer": chat_service_received_lifespan_title_writer,
+        "writers_share_task_submitter": writers_share_task_submitter,
         "background_task_set_starts_empty": background_task_set_starts_empty,
         "runtime_constructed_once": runtime_constructed_once,
         "runtime_received_lifespan_saver": runtime_received_lifespan_saver,
@@ -416,11 +456,13 @@ async def _exercise_lifespan(database: str) -> dict[str, bool | float | int]:
         "all_internal_migrations_applied": all_internal_migrations_applied,
         "migration_count": migration_count,
         "state_removed_after_shutdown": state_removed_after_shutdown,
+        "background_submitter_closed_after_shutdown": background_submitter_closed_after_shutdown,
         "pool_closed_after_shutdown": pool_closed_after_shutdown,
         "accessor_rejects_after_shutdown": accessor_rejects_after_shutdown,
         "service_accessor_rejects_after_shutdown": service_accessor_rejects_after_shutdown,
         "memory_accessor_rejects_after_shutdown": memory_accessor_rejects_after_shutdown,
         "writer_accessor_rejects_after_shutdown": writer_accessor_rejects_after_shutdown,
+        "title_writer_accessor_rejects_after_shutdown": title_writer_accessor_rejects_after_shutdown,
         "submitter_accessor_rejects_after_shutdown": submitter_accessor_rejects_after_shutdown,
         "setup_failure_blocks_publish_and_cleans_up": setup_failure_blocks_publish_and_cleans_up,
         "within_total_budget": within_total_budget,

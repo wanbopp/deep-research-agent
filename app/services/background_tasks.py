@@ -1,8 +1,8 @@
 """后台任务提交协议.
 
-应用服务依赖这个小接口，不直接调用 ``asyncio.create_task()``。这样当前 12D 可以
-先获得“立即提交且异常可观察”的语义，12E 再在 infrastructure 实现中加入 shutdown
-等待、超时取消和任务分组，而不需要重新修改 ChatService。
+应用服务依赖这个小接口，不直接调用 ``asyncio.create_task()``。应用层只需要
+“立即提交且异常可观察”的语义；shutdown 等待和取消属于 infrastructure 生命周期，
+因此不扩大本 Protocol，也不让 ChatService 管理进程关闭。
 """
 
 from collections.abc import Awaitable, Callable

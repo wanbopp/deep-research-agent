@@ -10,8 +10,7 @@ from uuid import UUID
 
 from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, field_validator, model_validator
 
-DEFAULT_CHAT_SESSION_TITLE = "New chat"
-MAX_CHAT_SESSION_TITLE_LENGTH = 200
+from app.models.chat_session import DEFAULT_CHAT_SESSION_TITLE, MAX_CHAT_SESSION_TITLE_LENGTH
 
 
 def _normalize_title(value: object) -> object:

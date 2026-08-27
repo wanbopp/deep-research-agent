@@ -16,6 +16,7 @@ from langchain_core.runnables import RunnableConfig
 from langgraph.types import Command
 
 from app.services.memory_extraction import ChatMemoryWriter
+from app.services.chat_title import ChatTitleWriter
 from app.agents.chat.context import ChatRuntimeContext
 from app.agents.chat.graph import ChatGraph
 from app.agents.chat.state import ChatState
@@ -74,6 +75,7 @@ class ChatService:
         ownership_verifier: ChatSessionOwnershipVerifier,
         graph_timeout_seconds: float = 90.0,
         memory_writer: ChatMemoryWriter | None = None,
+        title_writer: ChatTitleWriter | None = None,
     ) -> None:
         """保存共享 graph，并验证单轮图执行的时间预算.
 
@@ -88,6 +90,8 @@ class ChatService:
             graph_timeout_seconds: 单次 ainvoke/astream 的总执行时间上限，必须大于 0。
             memory_writer:可选的后台记忆写入边界。None 用于兼容尚未启用长期记忆的最小 Graph 和旧 smoke；production
                 lifespan 后续必须显式注入，并由真实 smoke 证明该能力没有被静默关闭。
+            title_writer: 可选的后台会话命名边界。production 注入数据库 claim
+                实现；旧的单图 smoke 可保持 None，避免测试被迫构造 ORM 资源。
         Raises:
             ValueError: graph_timeout_seconds 小于或等于 0。
 
@@ -102,6 +106,7 @@ class ChatService:
         self._graph_timeout_seconds = graph_timeout_seconds
         self._ownership_verifier = ownership_verifier
         self._memory_writer = memory_writer
+        self._title_writer = title_writer
 
     @staticmethod
     def _build_checkpoint_thread_id(user_id: UUID, public_thread_id: UUID) -> str:
@@ -416,7 +421,7 @@ class ChatService:
             ),
         )
 
-    def _submit_memory_write_if_completed(
+    def _submit_completed_turn_enhancements(
         self,
         result: ChatTurnResult,
         *,
@@ -424,7 +429,7 @@ class ChatService:
         source_thread_id: UUID,
         user_message: str,
     ) -> None:
-        """只为已经验证完成的最终回复提交后台记忆写入.
+        """只为已经验证完成的最终回复提交独立后台增强任务.
 
         Args:
             result: Graph 解析后的稳定应用结果，可能是完成响应或人工中断。
@@ -434,26 +439,43 @@ class ChatService:
 
         Notes:
             本方法不等待提取和数据库写入。interrupt 没有最终助手回复，因此不能提交；
-            writer 未启用时保持旧 runtime 行为，production 是否正确注入由 smoke 验证。
+            两个 writer 分别提交独立 Task。一个提交器接线失败时仍继续尝试另一个，
+            并且都不能把已经完成的聊天响应改成失败。
         """
-        if self._memory_writer is None or not isinstance(result, ChatResponse):
+        if not isinstance(result, ChatResponse):
             return
 
-        try:
-            self._memory_writer.submit_turn(
-                user_id=user_id,
-                source_thread_id=source_thread_id,
-                user_message=user_message,
-                assistant_message=result.message.content,
-            )
-        except Exception as error:
-            # submit_turn 理论上只负责创建后台任务，但 event loop 或接线故障仍可能
-            # 导致同步提交失败。记忆是增强能力，不能把已经完成的聊天改成 500/error。
-            # 日志只记录异常类型，不记录用户、thread、Prompt 或记忆正文。
-            logger.exception(
-                "memory_write_submission_failed",
-                error_type=type(error).__name__,
-            )
+        if self._memory_writer is not None:
+            try:
+                self._memory_writer.submit_turn(
+                    user_id=user_id,
+                    source_thread_id=source_thread_id,
+                    user_message=user_message,
+                    assistant_message=result.message.content,
+                )
+            except Exception as error:
+                # submit_turn 理论上只负责创建后台任务，但 event loop 或 shutdown
+                # 竞态仍可能同步拒绝。长期记忆是增强能力，不能逆转 ChatResponse。
+                logger.exception(
+                    "memory_write_submission_failed",
+                    error_type=type(error).__name__,
+                )
+
+        if self._title_writer is not None:
+            try:
+                self._title_writer.submit_turn(
+                    user_id=user_id,
+                    source_thread_id=source_thread_id,
+                    user_message=user_message,
+                    assistant_message=result.message.content,
+                )
+            except Exception as error:
+                # 自动标题同样采用最终一致性。提交失败只影响列表稍后仍显示默认
+                # 标题，不影响本轮 Agent 已经完成的业务结果。
+                logger.exception(
+                    "chat_title_submission_failed",
+                    error_type=type(error).__name__,
+                )
 
     async def run_turn(
         self,
@@ -508,7 +530,7 @@ class ChatService:
         #   ChatResponse 只提交一次。
         #   后台提取失败不会修改已经生成的 turn_result。
         #   不要在 _parse_graph_result() 中提交，因为它只应负责解析，不应隐藏副作用
-        self._submit_memory_write_if_completed(
+        self._submit_completed_turn_enhancements(
             turn_result,
             user_id=user_id,
             source_thread_id=request.thread_id,
@@ -571,7 +593,7 @@ class ChatService:
                 )
         # 此时 checkpoint 的读取、恢复、结果解析和 guard 释放都已经完成。
         # 如果恢复后再次 interrupt，helper 会识别 ChatInterrupt 并跳过提交。
-        self._submit_memory_write_if_completed(
+        self._submit_completed_turn_enhancements(
             turn_result,
             user_id=user_id,
             source_thread_id=request.thread_id,
@@ -700,7 +722,7 @@ class ChatService:
             # 此处已经离开 Graph timeout 和 thread execution guard。
             # completed_result 为 None 时，说明当前流是 interrupted，不能提交。
             if completed_result is not None:
-                self._submit_memory_write_if_completed(
+                self._submit_completed_turn_enhancements(
                     completed_result,
                     user_id=user_id,
                     source_thread_id=request.thread_id,
