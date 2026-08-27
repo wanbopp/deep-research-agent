@@ -93,6 +93,38 @@ class MemoryCreate(_StrictMemoryModel):
     )
 
 
+class MemoryExtractionCandidate(_StrictMemoryModel):
+    """模型可以提出、但尚未绑定任何可信归属的记忆候选.
+
+    结构化提取模型只能决定记忆正文和分类，不能输出 ``user_id``、数据库主键、
+    来源 thread 或审计时间。可信身份与来源会话必须由认证后的服务端调用链补充，
+    防止 Prompt 内容把记忆写入其他用户的 namespace。
+    """
+
+    content: str = Field(
+        min_length=1,
+        max_length=MAX_MEMORY_CONTENT_LENGTH,
+        description="从当前对话提炼出的单条稳定用户记忆",
+    )
+    kind: MemoryKind = Field(
+        description="候选记忆的固定分类",
+    )
+
+
+class MemoryExtractionResult(_StrictMemoryModel):
+    """一次结构化记忆提取的显式结果.
+
+    ``candidate=None`` 是正常结果，表示当前对话没有值得跨会话保存的稳定偏好、
+    事实或约束。显式包装对象比直接要求模型返回 nullable 根对象更容易被不同的
+    OpenAI-compatible provider 稳定实现。
+    """
+
+    candidate: MemoryExtractionCandidate | None = Field(
+        default=None,
+        description="至多一条长期记忆候选；没有稳定信息时为 null",
+    )
+
+
 class MemoryItem(MemoryCreate):
     """存储层成功持久化后返回的不可变权威记忆条目.
 
@@ -205,6 +237,8 @@ __all__ = [
     "MAX_QUERY_LENGTH",
     "MAX_QUERY_LIMIT",
     "MemoryCreate",
+    "MemoryExtractionCandidate",
+    "MemoryExtractionResult",
     "MemoryItem",
     "MemoryKind",
     "MemoryQuery",
