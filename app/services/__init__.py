@@ -21,6 +21,8 @@ from app.services.persistence import (
     UserNotFoundError,
     UserWorkspaceService,
 )
+from app.services.memory_service import MemoryService
+from app.services.memory_policy import MemoryRejectedError
 
 __all__ = [
     "Cache",
@@ -30,6 +32,8 @@ __all__ = [
     "ChatSessionCleanupService",
     "ChatSessionOwnershipVerifier",
     "InProcessChatSessionOwnershipVerifier",
+    "MemoryRejectedError",
+    "MemoryService",
     "ChatSessionService",
     "ChatSessionServiceError",
     "CreatedUserWorkspace",

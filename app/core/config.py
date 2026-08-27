@@ -204,6 +204,19 @@ class Settings:
         if self.CACHE_TTL_SECONDS <= 0:
             raise ValueError("CACHE_TTL_SECONDS must be greater than 0")
 
+        # ---- 长期记忆缓存 ----
+        # 查询结果只保存较短时间，限制缓存失效失败时的最大陈旧窗口。
+        self.MEMORY_SEARCH_CACHE_TTL_SECONDS = int(os.getenv("MEMORY_SEARCH_CACHE_TTL_SECONDS", "60"))
+        # generation 是用户查询缓存的 namespace 版本。它应明显长于结果 TTL；
+        # generation 过期只会造成缓存 miss，不会影响 PostgreSQL 权威数据。
+        self.MEMORY_CACHE_GENERATION_TTL_SECONDS = int(os.getenv("MEMORY_CACHE_GENERATION_TTL_SECONDS", "86400"))
+        if self.MEMORY_SEARCH_CACHE_TTL_SECONDS <= 0:
+            raise ValueError("MEMORY_SEARCH_CACHE_TTL_SECONDS must be greater than 0")
+        if self.MEMORY_CACHE_GENERATION_TTL_SECONDS < self.MEMORY_SEARCH_CACHE_TTL_SECONDS:
+            raise ValueError(
+                "MEMORY_CACHE_GENERATION_TTL_SECONDS must not be shorter than MEMORY_SEARCH_CACHE_TTL_SECONDS"
+            )
+
         # ---- JWT 认证 ----
         # Secret 不提供可工作的默认值：示例 secret 一旦被误带到部署环境，攻击者
         # 就能自行签发任意身份 token。TokenService 还会执行长度与已知弱值检查。

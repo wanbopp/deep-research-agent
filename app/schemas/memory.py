@@ -38,6 +38,17 @@ class MemoryKind(StrEnum):
     CONSTRAINT = "constraint"
 
 
+class MemorySearchStatus(StrEnum):
+    """长期记忆搜索的可观察结果状态."""
+
+    # AVAILABLE 同时包含“查到若干条”和“正常查到零条”。调用方应查看 items，
+    # 不能把空元组自动解释成基础设施故障。
+    AVAILABLE = "available"
+    # DEGRADED 表示真实 MemoryStore 当前不可用。Agent 后续可以不带长期记忆
+    # 继续回答，但日志、SSE 或 tracing 仍能观察到这次降级。
+    DEGRADED = "degraded"
+
+
 class _StrictMemoryModel(BaseModel):
     """为记忆模型提供统一的严格输入边界.
 
@@ -149,6 +160,46 @@ class MemoryQuery(_StrictMemoryModel):
     )
 
 
+class MemorySearchResult(_StrictMemoryModel):
+    """MemoryService 返回的可观察搜索结果.
+
+    普通空结果与后端故障使用不同 status。这样未来 Agent node 可以在故障时继续
+    工作，同时不会把“降级为空”误记成用户确实没有长期记忆。
+    """
+
+    items: tuple[MemoryItem, ...] = Field(
+        default=(),
+        description="按相关性排序的用户长期记忆",
+    )
+    status: MemorySearchStatus = Field(
+        default=MemorySearchStatus.AVAILABLE,
+        description="搜索是否由真实存储正常完成",
+    )
+    error_code: str | None = Field(
+        default=None,
+        description="降级时使用的稳定错误代码",
+    )
+
+    @model_validator(mode="after")
+    def validate_status_fields(self) -> "MemorySearchResult":
+        """保持状态、错误码和结果集合语义一致."""
+        if self.status is MemorySearchStatus.AVAILABLE:
+            if self.error_code is not None:
+                raise ValueError("available result must not contain error_code")
+            return self
+
+        if self.items:
+            raise ValueError("degraded result must not contain memory items")
+        if self.error_code != "MEMORY_UNAVAILABLE":
+            raise ValueError("degraded result requires MEMORY_UNAVAILABLE")
+        return self
+
+    @property
+    def is_degraded(self) -> bool:
+        """返回本次搜索是否因后端故障而降级."""
+        return self.status is MemorySearchStatus.DEGRADED
+
+
 __all__ = [
     "MAX_MEMORY_CONTENT_LENGTH",
     "MAX_QUERY_LENGTH",
@@ -157,4 +208,6 @@ __all__ = [
     "MemoryItem",
     "MemoryKind",
     "MemoryQuery",
+    "MemorySearchResult",
+    "MemorySearchStatus",
 ]
