@@ -1,4 +1,4 @@
-"""Manage shared infrastructure resources across the FastAPI lifespan."""
+"""在 FastAPI lifespan 中创建、发布并关闭共享基础设施与应用服务."""
 
 import asyncio
 from collections.abc import AsyncIterator
@@ -15,7 +15,9 @@ from app.infrastructure.chat_session_ownership import (
 )
 from app.infrastructure.chat_guard import RedisChatExecutionGuard
 from app.infrastructure.cache import RedisCache
+from app.infrastructure.embeddings import OpenAITextEmbedder
 from app.infrastructure.factory import create_application_resources
+from app.infrastructure.memory import PostgresMemoryStore
 from app.infrastructure.neo4j import probe_neo4j
 from app.infrastructure.postgres import probe_postgres
 from app.infrastructure.probes import DependencyName, DependencyProbeResult
@@ -25,6 +27,7 @@ from app.infrastructure.resources import ApplicationResources
 from app.services.chat import ChatService
 from app.services.cache import Cache
 from app.services.chat_session_cleanup import ChatSessionCleanupService
+from app.services.memory_service import MemoryService
 from app.services.rate_limit import RateLimiter, RateLimitPolicies, RateLimitPolicy
 
 STARTUP_PROBE_TIMEOUT_SECONDS = 5.0
@@ -64,6 +67,30 @@ def get_application_chat_service(app: FastAPI) -> ChatService:
         raise RuntimeError("Application chat service is not initialized") from exc
     # cast 只帮助静态类型检查，不会在运行时转换或复制 ChatService。
     return cast(ChatService, chat_service)
+
+
+def get_application_memory_service(app: FastAPI) -> MemoryService:
+    """读取 lifespan 已创建的共享长期记忆应用服务.
+
+    Args:
+        app: 当前 FastAPI 应用实例。
+
+    Returns:
+        与 production Graph 共用的无请求状态 ``MemoryService``。它内部只保存
+        Store、Cache 和策略对象，不保存当前 user_id、query 或检索结果。
+
+    Raises:
+        RuntimeError: startup 尚未发布服务，或 shutdown 已撤下服务引用。
+
+    Notes:
+        严格 getter 不创建 fallback service。若生命周期边界外偷偷构造另一个
+        MemoryService，Graph 和后台写入可能使用不同缓存 generation 与资源配置。
+    """
+    try:
+        memory_service = app.state.memory_service
+    except AttributeError as exc:
+        raise RuntimeError("Application memory service is not initialized") from exc
+    return cast(MemoryService, memory_service)
 
 
 def get_application_resources(app: FastAPI) -> ApplicationResources:
@@ -225,9 +252,31 @@ async def lifespan(
             backend="postgres",
         )
 
-        # 3. 编译 production Graph。
+        # 3. 先组合长期记忆依赖，再编译 production Graph。
+        #
+        # RedisCache 只借用 resources.redis_client，不拥有连接；MemoryStore 只保存
+        # sessionmaker，每次调用才创建独立 AsyncSession；Embedder 客户端也是无请求
+        # 状态的惰性适配器，构造时不会发送真实 provider 请求。因此三者和
+        # MemoryService 都可以跨请求共享，同时不会共享某个用户或数据库事务。
+        cache = RedisCache(resources.redis_client)
+        memory_embedder = OpenAITextEmbedder.from_settings(config)
+        memory_store = PostgresMemoryStore(
+            session_factory=resources.orm_session_factory,
+            embedder=memory_embedder,
+        )
+        memory_service = MemoryService(
+            memory_store,
+            cache,
+            search_cache_ttl_seconds=config.MEMORY_SEARCH_CACHE_TTL_SECONDS,
+            generation_ttl_seconds=config.MEMORY_CACHE_GENERATION_TTL_SECONDS,
+        )
+
+        # Graph 编译时只把共享 MemoryService 放入 memory node 闭包。当前用户身份
+        # 仍要等每次 ChatService 调用时通过 ChatRuntimeContext 注入，绝不能在
+        # startup 阶段绑定到共享 Graph 或 MemoryService 实例。
         graph = create_chat_runtime(
             checkpointer=resources.checkpointer,
+            memory_service=memory_service,
         )
 
         # 4. guard 复用 lifespan 的共享 Redis client，但每次 hold 创建独立 Lock 和
@@ -244,11 +293,6 @@ async def lifespan(
         ownership_verifier = PostgresChatSessionOwnershipVerifier(
             resources.orm_session_factory,
         )
-
-        # RedisCache 是无状态适配器，只借用 lifespan 共享 client。把它作为单例
-        # 发布可以让请求级业务 service 与共享 cleanup coordinator 使用完全相同
-        # 的缓存语义；它不登记 close callback，底层 client 仍由 resources 关闭。
-        cache = RedisCache(resources.redis_client)
 
         # RateLimiter 与 Cache 可以借用同一个 Redis client，但两者语义完全独立。
         # 缓存读取失败允许业务回源数据库；限流无法判断时，高成本 Agent 请求必须
@@ -293,6 +337,7 @@ async def lifespan(
         app.state.cache = cache
         app.state.rate_limiter = rate_limiter
         app.state.rate_limit_policies = rate_limit_policies
+        app.state.memory_service = memory_service
         app.state.chat_service = chat_service
         app.state.chat_session_cleanup_service = chat_session_cleanup_service
 
@@ -309,6 +354,10 @@ async def lifespan(
             # 真正的客户端和连接池随后由 AsyncExitStack 按逆序关闭。
             del app.state.chat_session_cleanup_service
             del app.state.chat_service
+            # 先撤下所有会调用 MemoryService 的上层对象，再撤下 service 本身。
+            # MemoryService 没有 close 方法，因为 Redis client 和 ORM engine 的唯一
+            # 所有者仍是 ApplicationResources，随后由 AsyncExitStack 统一关闭。
+            del app.state.memory_service
             del app.state.rate_limit_policies
             del app.state.rate_limiter
             del app.state.cache

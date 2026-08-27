@@ -1,4 +1,4 @@
-"""Build the chat StateGraph."""
+"""构建支持可选长期记忆、工具循环和 checkpoint 的聊天 StateGraph."""
 
 from collections.abc import Awaitable
 from typing import Literal, Protocol
@@ -10,7 +10,7 @@ from langgraph.graph.state import CompiledStateGraph
 from langgraph.runtime import Runtime
 
 from app.agents.chat.context import ChatRuntimeContext
-from app.agents.chat.state import ChatState
+from app.agents.chat.state import ChatState, ChatStateUpdate
 
 # CompiledStateGraph 的四个泛型参数依次描述 state、runtime context、图输入和
 # 图输出。集中定义别名可以防止 runtime/service 某一层退回裸类型，并错误地把
@@ -36,7 +36,7 @@ class StateNode(Protocol):
         state: ChatState,
         *,
         runtime: Runtime[ChatRuntimeContext],
-    ) -> ChatState | Awaitable[ChatState]:
+    ) -> ChatStateUpdate | Awaitable[ChatStateUpdate]:
         """根据当前状态和本次可信上下文返回同步或异步状态增量."""
         ...
 
@@ -56,9 +56,28 @@ def route_after_chat(state: ChatState) -> Literal["tools", "end"]:
     return "tools" if last_message.tool_calls else "end"
 
 
+def route_after_tools(state: ChatState) -> Literal["chat", "memory"]:
+    """根据当前 invocation 是否仍有完整记忆上下文决定工具后的去向.
+
+    ``UntrackedValue`` 在同一次 invocation 的多个节点之间持续可用，所以普通
+    ``chat -> tools -> chat`` 循环可以直接复用检索结果。HITL 或进程恢复会从
+    checkpoint 创建新的 invocation；由于临时记忆从不写入 checkpoint，此时
+    tools 完成后必须先回到 memory node 补查一次。
+
+    Notes:
+        这里判断字段是否存在，而不是判断 ``memory_context`` 是否为真。空元组
+        同样表示 memory node 已正常执行，只是没有找到相关记忆；若按真值判断，
+        每次正常空结果都会造成不必要的重复检索。
+    """
+    has_complete_memory_result = "memory_context" in state and "memory_status" in state
+
+    return "chat" if has_complete_memory_result else "memory"
+
+
 def build_chat_graph(
     chat_node: StateNode,
     *,
+    memory_node: StateNode | None = None,
     tool_node: StateNode | None = None,
     checkpointer: BaseCheckpointSaver[str] | None = None,
 ) -> ChatGraph:
@@ -66,8 +85,11 @@ def build_chat_graph(
 
     Args:
         chat_node: 负责调用模型并返回消息增量的节点。
+        memory_node: 可选长期记忆检索节点。提供后，Graph 从 memory 开始；不提供
+            时保留原有 ``START -> chat`` 行为，供旧 smoke 和无记忆场景使用。
         tool_node: 可选工具执行节点；不传时构建不含工具循环的最小图。
-        checkpointer: 可选状态保存器；生产 runtime 当前默认提供 InMemorySaver。
+        checkpointer: 可选状态保存器。它保存消息和节点进度，但不会保存声明为
+            ``UntrackedValue`` 的当前检索结果。
 
     Returns:
         已编译的 ChatGraph。它的可变状态是 ChatState，单次执行上下文是
@@ -77,14 +99,27 @@ def build_chat_graph(
         ``context_schema=ChatRuntimeContext`` 这里只声明类型。图在应用启动或首次
         获取 service 时编译；具体 ``ChatRuntimeContext`` 实例要到每次 ainvoke /
         astream 时再传入，不能在共享图上绑定某个用户。
+
+        构建器支持三种主要形态：仅 chat、memory + chat，以及
+        memory + chat + tools。可选参数使历史 smoke 不必为了测试其他能力而构造
+        MemoryService，同时 production runtime 可以显式启用完整记忆链。
     """
     builder = StateGraph(
         state_schema=ChatState,
         context_schema=ChatRuntimeContext,
     )
 
-    builder.add_node("chat", chat_node)  # chat_node 是一个调用LLM执行一次请求
-    builder.add_edge(START, "chat")  # 图的开始节点从这里开始
+    # chat 是所有图形态都必须存在的核心节点；memory 和 tools 则按依赖注入决定。
+    builder.add_node("chat", chat_node)
+
+    if memory_node is None:
+        # 未启用长期记忆时保持原入口，避免改变历史最小图和工具 smoke 的行为。
+        builder.add_edge(START, "chat")
+    else:
+        # memory 只在每次 invocation 的入口执行；普通工具循环不会重新经过 START。
+        builder.add_node("memory", memory_node)
+        builder.add_edge(START, "memory")
+        builder.add_edge("memory", "chat")
 
     if tool_node is None:
         # 未注入工具节点时保留 Lab 08 的最小聊天图：
@@ -103,9 +138,20 @@ def build_chat_graph(
             },
         )
 
-        # 工具结果写入 ToolMessage 后必须回到 chat，
-        # 让模型读取工具结果并决定继续调用工具还是生成最终答案。
-        builder.add_edge("tools", "chat")
+        if memory_node is None:
+            # 无记忆能力时，工具结果直接回 chat 交给模型继续推理。
+            builder.add_edge("tools", "chat")
+        else:
+            # 有记忆能力时，同 invocation 直接复用检索结果；HITL 恢复后的新
+            # invocation 因临时 channel 缺失而回 memory 补查。
+            builder.add_conditional_edges(
+                "tools",
+                route_after_tools,
+                {
+                    "chat": "chat",
+                    "memory": "memory",
+                },
+            )
 
     # checkpointer=None 时保持无持久状态行为；调用方注入
     # InMemorySaver 等实现后，LangGraph 会按 thread_id 保存状态。

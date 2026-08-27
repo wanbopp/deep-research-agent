@@ -1,8 +1,10 @@
-"""Verify PostgreSQL-backed ChatService ownership in the real lifespan.
+"""验证真实 lifespan 中 ChatService、checkpointer 与 MemoryService 的所有权.
 
 Checkpoint 10A 已证明 saver 可以读写，10B 已证明 saver 的生命周期。本 smoke 继续
 覆盖 10C：startup 使用同一个 saver 编译 production Chat graph、创建唯一 ChatService，
-请求依赖只读取该服务，shutdown 后 accessor 再次拒绝访问。
+请求依赖只读取该服务，shutdown 后 accessor 再次拒绝访问。12D 在这条既有证据链上
+继续验证：lifespan 只创建一个 MemoryService，并把同一对象交给启用 memory node 的
+production Graph；shutdown 后同样撤下公开访问入口。
 
 脚本使用随机临时 PostgreSQL 数据库，并调用真实 Neo4j/Redis probe。它会构造真实
 LLM/Tool/Graph 对象但不会执行图，因此不会发送 provider 请求，也不会输出连接参数、
@@ -38,10 +40,12 @@ from app.infrastructure.database import build_orm_database_url
 import app.infrastructure.lifespan as lifespan_module
 from app.infrastructure.lifespan import (
     get_application_chat_service,
+    get_application_memory_service,
     get_application_resources,
     lifespan,
 )
 from app.infrastructure.resources import ApplicationResources
+from app.services.memory_service import MemoryService
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 CONNECTION_TIMEOUT_SECONDS = 10
@@ -133,13 +137,14 @@ async def _exercise_lifespan(database: str) -> dict[str, bool | float | int]:
     """
     started_at = perf_counter()
     app = FastAPI()
-    state_absent_before_startup = not hasattr(app.state, "resources") and not hasattr(
-        app.state,
-        "chat_service",
+    state_absent_before_startup = (
+        not hasattr(app.state, "resources")
+        and not hasattr(app.state, "chat_service")
+        and not hasattr(app.state, "memory_service")
     )
 
     # 严格 accessor 只能在 lifespan 的 yield 区间使用。startup 前拒绝访问，
-    # 可以防止测试或请求悄悄得到一个绕开 PostgreSQL 的临时内存 Graph。
+    # 可以防止测试或请求悄悄得到绕开真实资源的临时 Graph 或 MemoryService。
     try:
         get_application_chat_service(app)
     except RuntimeError as error:
@@ -147,25 +152,43 @@ async def _exercise_lifespan(database: str) -> dict[str, bool | float | int]:
     else:
         service_accessor_rejects_before_startup = False
 
+    try:
+        get_application_memory_service(app)
+    except RuntimeError as error:
+        memory_accessor_rejects_before_startup = str(error) == "Application memory service is not initialized"
+    else:
+        memory_accessor_rejects_before_startup = False
+
     captured_checkpointers: list[BaseCheckpointSaver[str] | None] = []
+    captured_memory_services: list[MemoryService | None] = []
     captured_graphs: list[ChatGraph] = []
 
     def capture_runtime(
         *,
         checkpointer: BaseCheckpointSaver[str] | None = None,
+        memory_service: MemoryService | None = None,
     ) -> ChatGraph:
         """Capture the real production assembly boundary.
 
         Args:
             checkpointer: lifespan 注入 production runtime 的 saver。10C 要求它必须
                 是当前 ApplicationResources 中已经 setup 的 PostgreSQL saver。
+            memory_service: lifespan 组合的长期记忆应用服务。wrapper 必须把它
+                原样转发给真实工厂，再通过对象身份和节点结构证明 production
+                Graph 没有遗漏长期记忆能力。
 
         Returns:
             由真实 create_chat_runtime 构造的完整 ChatGraph。脚本只检查对象关系，
             不调用 ainvoke/astream，因此不会发送模型请求。
         """
+        # 捕获的是对象引用而不是配置副本。后续的 ``is`` 断言可以证明 lifespan、
+        # runtime 和 app.state 三个入口没有各自偷偷构造 MemoryService。
         captured_checkpointers.append(checkpointer)
-        graph = create_chat_runtime(checkpointer=checkpointer)
+        captured_memory_services.append(memory_service)
+        graph = create_chat_runtime(
+            checkpointer=checkpointer,
+            memory_service=memory_service,
+        )
         captured_graphs.append(graph)
         return graph
 
@@ -178,18 +201,22 @@ async def _exercise_lifespan(database: str) -> dict[str, bool | float | int]:
                 second_resources = get_application_resources(app)
                 first_service = get_application_chat_service(app)
                 second_service = get_application_chat_service(app)
+                first_memory_service = get_application_memory_service(app)
+                second_memory_service = get_application_memory_service(app)
 
                 # FastAPI dependency 通过 Request.app 找到当前应用，不能依赖无参数
                 # lru_cache。最小 Scope 足以验证这条纯本地依赖解析路径。
                 scope: Scope = {"type": "http", "app": app}
                 dependency_service = get_chat_service(Request(scope))
 
-                state_available_after_setup = hasattr(app.state, "resources") and hasattr(
-                    app.state,
-                    "chat_service",
+                state_available_after_setup = (
+                    hasattr(app.state, "resources")
+                    and hasattr(app.state, "chat_service")
+                    and hasattr(app.state, "memory_service")
                 )
                 resource_identity_is_stable = first_resources is second_resources
                 service_identity_is_stable = first_service is second_service is dependency_service
+                memory_service_identity_is_stable = first_memory_service is second_memory_service
                 runtime_constructed_once = len(captured_graphs) == 1
                 runtime_received_lifespan_saver = (
                     len(captured_checkpointers) == 1 and captured_checkpointers[0] is first_resources.checkpointer
@@ -197,6 +224,10 @@ async def _exercise_lifespan(database: str) -> dict[str, bool | float | int]:
                 graph_uses_lifespan_saver = (
                     len(captured_graphs) == 1 and captured_graphs[0].checkpointer is first_resources.checkpointer
                 )
+                runtime_received_lifespan_memory_service = (
+                    len(captured_memory_services) == 1 and captured_memory_services[0] is first_memory_service
+                )
+                graph_has_memory_node = len(captured_graphs) == 1 and "memory" in captured_graphs[0].get_graph().nodes
                 saver_reuses_lifespan_pool = first_resources.checkpointer.conn is first_resources.postgres_pool
                 pool_open_after_setup = not first_resources.postgres_pool.closed
 
@@ -233,9 +264,10 @@ async def _exercise_lifespan(database: str) -> dict[str, bool | float | int]:
                 all_internal_migrations_applied = migration_count == len(first_resources.checkpointer.MIGRATIONS)
 
         # These checks happen only after lifespan's finally block and AsyncExitStack finish.
-        state_removed_after_shutdown = not hasattr(app.state, "resources") and not hasattr(
-            app.state,
-            "chat_service",
+        state_removed_after_shutdown = (
+            not hasattr(app.state, "resources")
+            and not hasattr(app.state, "chat_service")
+            and not hasattr(app.state, "memory_service")
         )
         pool_closed_after_shutdown = first_resources.postgres_pool.closed
         try:
@@ -251,6 +283,13 @@ async def _exercise_lifespan(database: str) -> dict[str, bool | float | int]:
             service_accessor_rejects_after_shutdown = str(error) == "Application chat service is not initialized"
         else:
             service_accessor_rejects_after_shutdown = False
+
+        try:
+            get_application_memory_service(app)
+        except RuntimeError as error:
+            memory_accessor_rejects_after_shutdown = str(error) == "Application memory service is not initialized"
+        else:
+            memory_accessor_rejects_after_shutdown = False
 
         # 正常真实 setup 已在上面完成。这里仅注入一个“setup 抛异常”的控制流，
         # 验证我们自己的 lifespan/AsyncExitStack 行为，不把它当作数据库能力证据。
@@ -293,6 +332,7 @@ async def _exercise_lifespan(database: str) -> dict[str, bool | float | int]:
             and len(captured_resources) == 1
             and not hasattr(failure_app.state, "resources")
             and not hasattr(failure_app.state, "chat_service")
+            and not hasattr(failure_app.state, "memory_service")
             and captured_resources[0].postgres_pool.closed
         )
 
@@ -301,12 +341,16 @@ async def _exercise_lifespan(database: str) -> dict[str, bool | float | int]:
     return {
         "state_absent_before_startup": state_absent_before_startup,
         "service_accessor_rejects_before_startup": service_accessor_rejects_before_startup,
+        "memory_accessor_rejects_before_startup": memory_accessor_rejects_before_startup,
         "state_available_after_setup": state_available_after_setup,
         "resource_identity_is_stable": resource_identity_is_stable,
         "service_identity_is_stable": service_identity_is_stable,
+        "memory_service_identity_is_stable": memory_service_identity_is_stable,
         "runtime_constructed_once": runtime_constructed_once,
         "runtime_received_lifespan_saver": runtime_received_lifespan_saver,
         "graph_uses_lifespan_saver": graph_uses_lifespan_saver,
+        "runtime_received_lifespan_memory_service": runtime_received_lifespan_memory_service,
+        "graph_has_memory_node": graph_has_memory_node,
         "saver_reuses_lifespan_pool": saver_reuses_lifespan_pool,
         "pool_open_after_setup": pool_open_after_setup,
         "empty_checkpoint_read_succeeded": empty_checkpoint_read_succeeded,
@@ -317,6 +361,7 @@ async def _exercise_lifespan(database: str) -> dict[str, bool | float | int]:
         "pool_closed_after_shutdown": pool_closed_after_shutdown,
         "accessor_rejects_after_shutdown": accessor_rejects_after_shutdown,
         "service_accessor_rejects_after_shutdown": service_accessor_rejects_after_shutdown,
+        "memory_accessor_rejects_after_shutdown": memory_accessor_rejects_after_shutdown,
         "setup_failure_blocks_publish_and_cleans_up": setup_failure_blocks_publish_and_cleans_up,
         "within_total_budget": within_total_budget,
         "elapsed_ms": elapsed_ms,

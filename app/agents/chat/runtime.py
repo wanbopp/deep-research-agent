@@ -1,11 +1,15 @@
-"""Production runtime assembly for the chat Agent."""
+"""组合 production Chat Agent 的模型、工具、记忆节点与 checkpointer."""
 
 from langgraph.checkpoint.base import BaseCheckpointSaver
 from langgraph.checkpoint.memory import InMemorySaver
 from pydantic import SecretStr
 
 from app.agents.chat.graph import ChatGraph, build_chat_graph
-from app.agents.chat.nodes import create_chat_node, create_tool_node
+from app.agents.chat.nodes import (
+    create_chat_node,
+    create_memory_node,
+    create_tool_node,
+)
 from app.agents.chat.tools.ask_human import ask_human
 from app.agents.chat.tools.current_time import get_current_utc_time
 from app.agents.chat.tools.registry import ToolRegistry
@@ -14,17 +18,21 @@ from app.schemas.llm import ModelSpec
 from app.services.llm.factory import create_openai_chat_model
 from app.services.llm.registry import LLMRegistry
 from app.services.llm.service import LLMService
+from app.services.memory_service import MemoryService
 
 
 def create_chat_runtime(
     *,
     checkpointer: BaseCheckpointSaver[str] | None = None,
+    memory_service: MemoryService | None = None,
 ) -> ChatGraph:
     """创建一个可跨请求复用、支持可信 runtime context 的聊天图.
 
     Args:
         checkpointer: 调用方注入的状态保存器。未提供时使用进程内
             InMemorySaver；保存器只拥有图状态，不拥有当前用户身份。
+        memory_service: 可选的共享长期记忆应用服务。提供时启用
+            ``START -> memory -> chat``；不提供时保留历史无长期记忆图。
 
     Returns:
         context 类型固定为 ChatRuntimeContext 的已编译 ChatGraph。具体用户实例
@@ -32,6 +40,11 @@ def create_chat_runtime(
 
     Raises:
         RuntimeError: 模型 API key 未配置，无法构造生产聊天 runtime。
+
+    Notes:
+        ``memory_service`` 是 Graph 编译时固定的共享依赖；可信 user_id 则属于
+        每次 invocation，通过 ``ChatRuntimeContext`` 动态提供。两者不能合并成
+        一个共享的“当前用户 service”。
     """
     # 配置缺失时尽早失败，但错误信息不能包含 key 本身。
     # Settings 使用空字符串表示未配置，因此不能只判断 None。
@@ -85,12 +98,17 @@ def create_chat_runtime(
         tool_timeout_seconds=20,
     )
 
+    # 可选注入保留历史 smoke 的最小图，同时让 production lifespan 显式开启
+    # 长期记忆。memory node 闭包只保存无状态 service，不保存当前用户身份。
+    memory_node = create_memory_node(memory_service) if memory_service is not None else None
+
     # 调用方没有注入 checkpointer 时使用 InMemorySaver。
     runtime_checkpointer = checkpointer if checkpointer is not None else InMemorySaver()
 
     # 编译并返回 graph。
     return build_chat_graph(
         chat_node,
+        memory_node=memory_node,
         tool_node=tool_node,
         checkpointer=runtime_checkpointer,
     )
