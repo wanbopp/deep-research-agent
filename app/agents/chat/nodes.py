@@ -119,6 +119,10 @@ def _build_model_messages(state: ChatState) -> tuple[AnyMessage, ...]:
     记忆正文来自历史用户数据，可能包含类似指令的文本，因此只能作为
     低信任背景资料。这里不能把它提升成 SystemMessage，也不能追加回
     state["messages"]。
+
+
+    记忆消息只存在于 model_messages 这个临时变量中，传给 LLM 后就被丢弃了。
+    ·chat_node 只返回 {"messages": [response]}，LangGraph 只会把节点返回值合并进 state 并写入 checkpoint——记忆消息从未出现在返回值里，所以永远不会被持久化
     """
     messages = tuple(state["messages"])
     memory_items = state.get("memory_context", ())
