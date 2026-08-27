@@ -6,10 +6,12 @@ from contextlib import AsyncExitStack, asynccontextmanager
 from typing import cast
 
 from fastapi import FastAPI
+from pydantic import SecretStr
 
 from app.agents.chat.runtime import create_chat_runtime
 from app.core.config import Settings, settings
 from app.core.logging import logger
+from app.infrastructure.background_tasks import AsyncioBackgroundTaskSubmitter
 from app.infrastructure.chat_session_ownership import (
     PostgresChatSessionOwnershipVerifier,
 )
@@ -24,9 +26,18 @@ from app.infrastructure.probes import DependencyName, DependencyProbeResult
 from app.infrastructure.rate_limit import RedisRateLimiter
 from app.infrastructure.redis import probe_redis
 from app.infrastructure.resources import ApplicationResources
+from app.schemas.llm import ModelSpec
 from app.services.chat import ChatService
 from app.services.cache import Cache
 from app.services.chat_session_cleanup import ChatSessionCleanupService
+from app.services.llm.factory import create_openai_chat_model
+from app.services.llm.registry import LLMRegistry
+from app.services.llm.service import LLMService
+from app.services.memory_extraction import (
+    BackgroundChatMemoryWriter,
+    ChatMemoryWriter,
+    LLMMemoryExtractor,
+)
 from app.services.memory_service import MemoryService
 from app.services.rate_limit import RateLimiter, RateLimitPolicies, RateLimitPolicy
 
@@ -36,6 +47,7 @@ CHAT_GRAPH_TIMEOUT_SECONDS = 90.0
 # Lease 必须长于 Graph 总超时。额外 30 秒用于事件循环调度和 finally 中的 Redis
 # 释放；进程崩溃时 Redis 仍会在 120 秒内自动清除遗留锁。
 CHAT_GUARD_LEASE_SECONDS = 120.0
+MEMORY_EXTRACTION_MODEL_ALIAS = "memory-extraction"
 REQUIRED_DEPENDENCIES = frozenset({DependencyName.POSTGRES})
 
 
@@ -91,6 +103,40 @@ def get_application_memory_service(app: FastAPI) -> MemoryService:
     except AttributeError as exc:
         raise RuntimeError("Application memory service is not initialized") from exc
     return cast(MemoryService, memory_service)
+
+
+def get_application_chat_memory_writer(app: FastAPI) -> ChatMemoryWriter:
+    """读取 lifespan 已创建并注入 ChatService 的后台记忆写入边界.
+
+    Args:
+        app: 当前 FastAPI 应用实例。
+
+    Returns:
+        与 production ChatService 共用的无请求状态 writer。
+
+    Raises:
+        RuntimeError: startup 尚未发布 writer，或 shutdown 已撤下引用。
+    """
+    try:
+        writer = app.state.chat_memory_writer
+    except AttributeError as exc:
+        raise RuntimeError("Application chat memory writer is not initialized") from exc
+    return cast(ChatMemoryWriter, writer)
+
+
+def get_application_background_task_submitter(
+    app: FastAPI,
+) -> AsyncioBackgroundTaskSubmitter:
+    """读取当前 worker 的后台任务提交器.
+
+    12D 暴露该对象是为了验证 production 只使用一个任务集合；12E 会在同一对象上
+    增加 shutdown drain/cancel，而不是再创建第二套无法统一收敛的任务跟踪器。
+    """
+    try:
+        submitter = app.state.background_task_submitter
+    except AttributeError as exc:
+        raise RuntimeError("Application background task submitter is not initialized") from exc
+    return cast(AsyncioBackgroundTaskSubmitter, submitter)
 
 
 def get_application_resources(app: FastAPI) -> ApplicationResources:
@@ -159,6 +205,58 @@ def get_application_rate_limit_policies(app: FastAPI) -> RateLimitPolicies:
     except AttributeError as exc:
         raise RuntimeError("Application rate limit policies are not initialized") from exc
     return cast(RateLimitPolicies, policies)
+
+
+def _create_memory_extractor(config: Settings) -> LLMMemoryExtractor:
+    """根据当前环境配置组合长期记忆结构化提取器.
+
+    Args:
+        config: lifespan 本次启动使用的配置快照。不能读取另一个全局 Settings，
+            否则临时数据库 smoke 或多环境启动可能出现两套 provider 配置。
+
+    Returns:
+        只保存 LLMService 与 alias 快照的无请求状态提取器。
+
+    Raises:
+        RuntimeError: 没有配置模型 API key。
+        ValidationError: 模型名称、token 或 timeout 配置违反 ModelSpec 边界。
+
+    Notes:
+        Chat Agent 与记忆提取使用相同 provider 配置，但分别拥有 Registry/LLMService。
+        两个服务都不保存当前请求状态；独立 alias 让后续可以单独调整提取模型、温度
+        和输出预算。构造 ChatOpenAI 所需配置不会发送网络请求，只有后台真正执行
+        ``call_structured()`` 时才会访问 provider。
+    """
+    if not config.OPENAI_API_KEY:
+        raise RuntimeError("OPENAI_API_KEY is required to create memory extractor")
+
+    extraction_spec = ModelSpec(
+        alias=MEMORY_EXTRACTION_MODEL_ALIAS,
+        provider_model=config.DEFAULT_LLM_MODEL,
+        api_key=SecretStr(config.OPENAI_API_KEY),
+        base_url=config.OPENAI_BASE_URL,
+        temperature=0.0,
+        # 结构化结果至多包含一条短记忆，无需占用普通聊天的全部输出预算。
+        max_tokens=min(config.MAX_TOKENS, 800),
+        request_timeout_seconds=max(
+            1.0,
+            config.LLM_TOTAL_TIMEOUT * 0.75,
+        ),
+    )
+    extraction_registry = LLMRegistry(
+        specs=(extraction_spec,),
+        factory=create_openai_chat_model,
+    )
+    extraction_llm_service = LLMService(
+        extraction_registry,
+        max_attempts=config.MAX_LLM_CALL_RETRIES,
+        retry_wait_multiplier=0.2,
+        total_timeout_seconds=config.LLM_TOTAL_TIMEOUT,
+    )
+    return LLMMemoryExtractor(
+        extraction_llm_service,
+        aliases=(MEMORY_EXTRACTION_MODEL_ALIAS,),
+    )
 
 
 @asynccontextmanager
@@ -271,6 +369,20 @@ async def lifespan(
             generation_ttl_seconds=config.MEMORY_CACHE_GENERATION_TTL_SECONDS,
         )
 
+        # 记忆写入链也在 startup 组合一次，但不绑定当前用户或会话：
+        # - extractor 只把对话转换成不含身份的 content/kind 候选；
+        # - writer 在每次 submit_turn() 中接收可信 user_id/source_thread_id；
+        # - submitter 为本 worker 的任务保留强引用并消费异常。
+        # 12D 的 submitter 尚不在 shutdown 等待任务；12E 会在同一实例上补齐
+        # drain/cancel，避免应用退出时底层 Redis/ORM 已关闭而任务仍在使用它们。
+        background_task_submitter = AsyncioBackgroundTaskSubmitter()
+        memory_extractor = _create_memory_extractor(config)
+        chat_memory_writer = BackgroundChatMemoryWriter(
+            extractor=memory_extractor,
+            memory_service=memory_service,
+            task_submitter=background_task_submitter,
+        )
+
         # Graph 编译时只把共享 MemoryService 放入 memory node 闭包。当前用户身份
         # 仍要等每次 ChatService 调用时通过 ChatRuntimeContext 注入，绝不能在
         # startup 阶段绑定到共享 Graph 或 MemoryService 实例。
@@ -311,13 +423,15 @@ async def lifespan(
             ),
         )
 
-        # 6. ChatService 持有共享 Graph、guard 和无状态 verifier。三者都不保存
-        # 当前用户；身份和公开 thread ID 仍由每次请求传入并构造独立内部 key。
+        # 6. ChatService 持有共享 Graph、guard、无状态 verifier 和 memory writer。
+        # 它们都不保存当前用户；身份、公开 thread ID 和本轮消息仍由每次请求传入。
+        # writer.submit_turn() 只提交任务，所以已完成响应不等待第二次模型调用。
         chat_service = ChatService(
             graph,
             execution_guard=execution_guard,
             ownership_verifier=ownership_verifier,
             graph_timeout_seconds=CHAT_GRAPH_TIMEOUT_SECONDS,
+            memory_writer=chat_memory_writer,
         )
 
         # 7. cleanup coordinator 与 ChatService 共用同一 guard，确保删除和 Graph
@@ -338,6 +452,8 @@ async def lifespan(
         app.state.rate_limiter = rate_limiter
         app.state.rate_limit_policies = rate_limit_policies
         app.state.memory_service = memory_service
+        app.state.background_task_submitter = background_task_submitter
+        app.state.chat_memory_writer = chat_memory_writer
         app.state.chat_service = chat_service
         app.state.chat_session_cleanup_service = chat_session_cleanup_service
 
@@ -354,6 +470,11 @@ async def lifespan(
             # 真正的客户端和连接池随后由 AsyncExitStack 按逆序关闭。
             del app.state.chat_session_cleanup_service
             del app.state.chat_service
+            # ChatService 先撤下，新的 HTTP 请求便无法再提交任务。writer 和
+            # submitter 随后撤下公开入口；当前 12D 不主动取消已提交任务，12E 会在
+            # 删除这些引用前执行有界 drain/cancel。
+            del app.state.chat_memory_writer
+            del app.state.background_task_submitter
             # 先撤下所有会调用 MemoryService 的上层对象，再撤下 service 本身。
             # MemoryService 没有 close 方法，因为 Redis client 和 ORM engine 的唯一
             # 所有者仍是 ApplicationResources，随后由 AsyncExitStack 统一关闭。

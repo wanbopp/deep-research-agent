@@ -39,6 +39,8 @@ from app.core.config import Settings, settings
 from app.infrastructure.database import build_orm_database_url
 import app.infrastructure.lifespan as lifespan_module
 from app.infrastructure.lifespan import (
+    get_application_background_task_submitter,
+    get_application_chat_memory_writer,
     get_application_chat_service,
     get_application_memory_service,
     get_application_resources,
@@ -141,6 +143,8 @@ async def _exercise_lifespan(database: str) -> dict[str, bool | float | int]:
         not hasattr(app.state, "resources")
         and not hasattr(app.state, "chat_service")
         and not hasattr(app.state, "memory_service")
+        and not hasattr(app.state, "chat_memory_writer")
+        and not hasattr(app.state, "background_task_submitter")
     )
 
     # 严格 accessor 只能在 lifespan 的 yield 区间使用。startup 前拒绝访问，
@@ -158,6 +162,22 @@ async def _exercise_lifespan(database: str) -> dict[str, bool | float | int]:
         memory_accessor_rejects_before_startup = str(error) == "Application memory service is not initialized"
     else:
         memory_accessor_rejects_before_startup = False
+
+    try:
+        get_application_chat_memory_writer(app)
+    except RuntimeError as error:
+        writer_accessor_rejects_before_startup = str(error) == "Application chat memory writer is not initialized"
+    else:
+        writer_accessor_rejects_before_startup = False
+
+    try:
+        get_application_background_task_submitter(app)
+    except RuntimeError as error:
+        submitter_accessor_rejects_before_startup = (
+            str(error) == "Application background task submitter is not initialized"
+        )
+    else:
+        submitter_accessor_rejects_before_startup = False
 
     captured_checkpointers: list[BaseCheckpointSaver[str] | None] = []
     captured_memory_services: list[MemoryService | None] = []
@@ -203,6 +223,10 @@ async def _exercise_lifespan(database: str) -> dict[str, bool | float | int]:
                 second_service = get_application_chat_service(app)
                 first_memory_service = get_application_memory_service(app)
                 second_memory_service = get_application_memory_service(app)
+                first_memory_writer = get_application_chat_memory_writer(app)
+                second_memory_writer = get_application_chat_memory_writer(app)
+                first_task_submitter = get_application_background_task_submitter(app)
+                second_task_submitter = get_application_background_task_submitter(app)
 
                 # FastAPI dependency 通过 Request.app 找到当前应用，不能依赖无参数
                 # lru_cache。最小 Scope 足以验证这条纯本地依赖解析路径。
@@ -213,10 +237,18 @@ async def _exercise_lifespan(database: str) -> dict[str, bool | float | int]:
                     hasattr(app.state, "resources")
                     and hasattr(app.state, "chat_service")
                     and hasattr(app.state, "memory_service")
+                    and hasattr(app.state, "chat_memory_writer")
+                    and hasattr(app.state, "background_task_submitter")
                 )
                 resource_identity_is_stable = first_resources is second_resources
                 service_identity_is_stable = first_service is second_service is dependency_service
                 memory_service_identity_is_stable = first_memory_service is second_memory_service
+                memory_writer_identity_is_stable = first_memory_writer is second_memory_writer
+                task_submitter_identity_is_stable = first_task_submitter is second_task_submitter
+                chat_service_received_lifespan_memory_writer = (
+                    getattr(first_service, "_memory_writer", None) is first_memory_writer
+                )
+                background_task_set_starts_empty = first_task_submitter.active_count == 0
                 runtime_constructed_once = len(captured_graphs) == 1
                 runtime_received_lifespan_saver = (
                     len(captured_checkpointers) == 1 and captured_checkpointers[0] is first_resources.checkpointer
@@ -268,6 +300,8 @@ async def _exercise_lifespan(database: str) -> dict[str, bool | float | int]:
             not hasattr(app.state, "resources")
             and not hasattr(app.state, "chat_service")
             and not hasattr(app.state, "memory_service")
+            and not hasattr(app.state, "chat_memory_writer")
+            and not hasattr(app.state, "background_task_submitter")
         )
         pool_closed_after_shutdown = first_resources.postgres_pool.closed
         try:
@@ -290,6 +324,22 @@ async def _exercise_lifespan(database: str) -> dict[str, bool | float | int]:
             memory_accessor_rejects_after_shutdown = str(error) == "Application memory service is not initialized"
         else:
             memory_accessor_rejects_after_shutdown = False
+
+        try:
+            get_application_chat_memory_writer(app)
+        except RuntimeError as error:
+            writer_accessor_rejects_after_shutdown = str(error) == "Application chat memory writer is not initialized"
+        else:
+            writer_accessor_rejects_after_shutdown = False
+
+        try:
+            get_application_background_task_submitter(app)
+        except RuntimeError as error:
+            submitter_accessor_rejects_after_shutdown = (
+                str(error) == "Application background task submitter is not initialized"
+            )
+        else:
+            submitter_accessor_rejects_after_shutdown = False
 
         # 正常真实 setup 已在上面完成。这里仅注入一个“setup 抛异常”的控制流，
         # 验证我们自己的 lifespan/AsyncExitStack 行为，不把它当作数据库能力证据。
@@ -333,6 +383,8 @@ async def _exercise_lifespan(database: str) -> dict[str, bool | float | int]:
             and not hasattr(failure_app.state, "resources")
             and not hasattr(failure_app.state, "chat_service")
             and not hasattr(failure_app.state, "memory_service")
+            and not hasattr(failure_app.state, "chat_memory_writer")
+            and not hasattr(failure_app.state, "background_task_submitter")
             and captured_resources[0].postgres_pool.closed
         )
 
@@ -342,10 +394,16 @@ async def _exercise_lifespan(database: str) -> dict[str, bool | float | int]:
         "state_absent_before_startup": state_absent_before_startup,
         "service_accessor_rejects_before_startup": service_accessor_rejects_before_startup,
         "memory_accessor_rejects_before_startup": memory_accessor_rejects_before_startup,
+        "writer_accessor_rejects_before_startup": writer_accessor_rejects_before_startup,
+        "submitter_accessor_rejects_before_startup": submitter_accessor_rejects_before_startup,
         "state_available_after_setup": state_available_after_setup,
         "resource_identity_is_stable": resource_identity_is_stable,
         "service_identity_is_stable": service_identity_is_stable,
         "memory_service_identity_is_stable": memory_service_identity_is_stable,
+        "memory_writer_identity_is_stable": memory_writer_identity_is_stable,
+        "task_submitter_identity_is_stable": task_submitter_identity_is_stable,
+        "chat_service_received_lifespan_memory_writer": chat_service_received_lifespan_memory_writer,
+        "background_task_set_starts_empty": background_task_set_starts_empty,
         "runtime_constructed_once": runtime_constructed_once,
         "runtime_received_lifespan_saver": runtime_received_lifespan_saver,
         "graph_uses_lifespan_saver": graph_uses_lifespan_saver,
@@ -362,6 +420,8 @@ async def _exercise_lifespan(database: str) -> dict[str, bool | float | int]:
         "accessor_rejects_after_shutdown": accessor_rejects_after_shutdown,
         "service_accessor_rejects_after_shutdown": service_accessor_rejects_after_shutdown,
         "memory_accessor_rejects_after_shutdown": memory_accessor_rejects_after_shutdown,
+        "writer_accessor_rejects_after_shutdown": writer_accessor_rejects_after_shutdown,
+        "submitter_accessor_rejects_after_shutdown": submitter_accessor_rejects_after_shutdown,
         "setup_failure_blocks_publish_and_cleans_up": setup_failure_blocks_publish_and_cleans_up,
         "within_total_budget": within_total_budget,
         "elapsed_ms": elapsed_ms,

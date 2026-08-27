@@ -6,7 +6,6 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from typing import Any
 from uuid import UUID
-
 from langchain_core.messages import (
     AIMessage,
     AIMessageChunk,
@@ -16,6 +15,7 @@ from langchain_core.messages import (
 from langchain_core.runnables import RunnableConfig
 from langgraph.types import Command
 
+from app.services.memory_extraction import ChatMemoryWriter
 from app.agents.chat.context import ChatRuntimeContext
 from app.agents.chat.graph import ChatGraph
 from app.agents.chat.state import ChatState
@@ -73,6 +73,7 @@ class ChatService:
         execution_guard: ChatExecutionGuard,
         ownership_verifier: ChatSessionOwnershipVerifier,
         graph_timeout_seconds: float = 90.0,
+        memory_writer: ChatMemoryWriter | None = None,
     ) -> None:
         """保存共享 graph，并验证单轮图执行的时间预算.
 
@@ -85,7 +86,8 @@ class ChatService:
                 协议。production 注入只保存 sessionmaker 的 PostgreSQL 实现；它不
                 让共享 ChatService 持有请求级 AsyncSession。
             graph_timeout_seconds: 单次 ainvoke/astream 的总执行时间上限，必须大于 0。
-
+            memory_writer:可选的后台记忆写入边界。None 用于兼容尚未启用长期记忆的最小 Graph 和旧 smoke；production
+                lifespan 后续必须显式注入，并由真实 smoke 证明该能力没有被静默关闭。
         Raises:
             ValueError: graph_timeout_seconds 小于或等于 0。
 
@@ -99,6 +101,7 @@ class ChatService:
         self._execution_guard = execution_guard
         self._graph_timeout_seconds = graph_timeout_seconds
         self._ownership_verifier = ownership_verifier
+        self._memory_writer = memory_writer
 
     @staticmethod
     def _build_checkpoint_thread_id(user_id: UUID, public_thread_id: UUID) -> str:
@@ -325,6 +328,43 @@ class ChatService:
 
         return tuple(events)
 
+    @staticmethod
+    def _latest_human_message_text(
+        state_values: dict[str, Any],
+    ) -> str:
+        """从 Graph 状态中读取最近一条纯文本用户消息.
+
+        Args:
+            state_values: LangGraph result 或 snapshot.values 中的完整状态字典。
+
+        Returns:
+            去除首尾空白后的最近一条 HumanMessage 文本。
+
+        Raises:
+            RuntimeError: 状态没有消息、没有 HumanMessage，或者当前消息不是纯文本。
+
+        Notes:
+            HITL 的 resume 值通常进入 ToolMessage，并不代表触发本轮 Agent 的原始问题。
+            后台记忆提取需要使用 checkpoint 中最近的 HumanMessage，避免把简单的
+            “approved”或“继续”错误保存为长期记忆。
+        """
+        messages = state_values.get("messages")
+        if not isinstance(messages, list) or not messages:
+            raise RuntimeError("chat state must contain messages")
+
+        human_message = next(
+            (message for message in reversed(messages) if isinstance(message, HumanMessage)),
+            None,
+        )
+        if human_message is None:
+            raise RuntimeError("chat state must contain a HumanMessage")
+
+        content = human_message.content
+        if not isinstance(content, str) or not content.strip():
+            raise RuntimeError("HumanMessage must contain text content")
+
+        return content.strip()
+
     async def _parse_graph_result(
         self,
         result: dict[str, Any],
@@ -376,6 +416,45 @@ class ChatService:
             ),
         )
 
+    def _submit_memory_write_if_completed(
+        self,
+        result: ChatTurnResult,
+        *,
+        user_id: UUID,
+        source_thread_id: UUID,
+        user_message: str,
+    ) -> None:
+        """只为已经验证完成的最终回复提交后台记忆写入.
+
+        Args:
+            result: Graph 解析后的稳定应用结果，可能是完成响应或人工中断。
+            user_id: 认证链提供的可信用户 UUID。
+            source_thread_id: 已通过所有权检查的业务会话 UUID。
+            user_message: 触发本轮 Graph 的用户输入。
+
+        Notes:
+            本方法不等待提取和数据库写入。interrupt 没有最终助手回复，因此不能提交；
+            writer 未启用时保持旧 runtime 行为，production 是否正确注入由 smoke 验证。
+        """
+        if self._memory_writer is None or not isinstance(result, ChatResponse):
+            return
+
+        try:
+            self._memory_writer.submit_turn(
+                user_id=user_id,
+                source_thread_id=source_thread_id,
+                user_message=user_message,
+                assistant_message=result.message.content,
+            )
+        except Exception as error:
+            # submit_turn 理论上只负责创建后台任务，但 event loop 或接线故障仍可能
+            # 导致同步提交失败。记忆是增强能力，不能把已经完成的聊天改成 500/error。
+            # 日志只记录异常类型，不记录用户、thread、Prompt 或记忆正文。
+            logger.exception(
+                "memory_write_submission_failed",
+                error_type=type(error).__name__,
+            )
+
     async def run_turn(
         self,
         request: ChatRequest,
@@ -414,11 +493,29 @@ class ChatService:
                     context=runtime_context,
                 )
 
-                return await self._parse_graph_result(
+                turn_result = await self._parse_graph_result(
                     result,
                     config=config,
                     thread_id=request.thread_id,
                 )
+
+        # 执行到这里说明 timeout 和 guard 都已经正常退出。
+        # 后台模型调用不能占用同一 thread 的 Graph 执行权。所以必须放到外面
+        # 关键点:
+        #   Graph 异常时不会执行提交。
+        #   timeout 时不会执行提交。
+        #   ChatInterrupt 会进入 helper，但立即返回。
+        #   ChatResponse 只提交一次。
+        #   后台提取失败不会修改已经生成的 turn_result。
+        #   不要在 _parse_graph_result() 中提交，因为它只应负责解析，不应隐藏副作用
+        self._submit_memory_write_if_completed(
+            turn_result,
+            user_id=user_id,
+            source_thread_id=request.thread_id,
+            user_message=request.message,
+        )
+
+        return turn_result
 
     async def resume_turn(
         self,
@@ -461,11 +558,27 @@ class ChatService:
                     context=runtime_context,
                 )
 
-                return await self._parse_graph_result(
+                turn_result = await self._parse_graph_result(
                     result,
                     config=config,
                     thread_id=request.thread_id,
                 )
+
+                # resume 值会返回给被中断的工具；长期记忆的用户来源仍应是
+                # checkpoint 中触发当前 Agent 流程的最近一条 HumanMessage。
+                source_user_message = self._latest_human_message_text(
+                    dict(snapshot.values),
+                )
+        # 此时 checkpoint 的读取、恢复、结果解析和 guard 释放都已经完成。
+        # 如果恢复后再次 interrupt，helper 会识别 ChatInterrupt 并跳过提交。
+        self._submit_memory_write_if_completed(
+            turn_result,
+            user_id=user_id,
+            source_thread_id=request.thread_id,
+            user_message=source_user_message,
+        )
+
+        return turn_result
 
     async def stream_turn(
         self,
@@ -489,6 +602,10 @@ class ChatService:
         }
 
         try:
+            # 只有 Graph 被最终 snapshot 证明已经到达 END 时才赋值。
+            # interrupted、timeout、异常和取消路径始终保持 None。
+            completed_result: ChatResponse | None = None
+
             # 异步生成器的函数体要到第一次迭代才执行，因此 SSE 响应头通常已经发出。
             # busy 不能再改成 HTTP 409，必须在下面转换为稳定 ErrorStreamEvent。
             async with self._hold_thread_execution(
@@ -561,8 +678,37 @@ class ChatService:
                         # 为空。若 next 仍有节点，说明图在未知的非终态停止。
                         if snapshot.next:
                             raise RuntimeError("chat stream ended before graph reached a terminal state")
+
+                        # 不拼接之前 yield 的 token。token 可能来自多个模型阶段，也可能因网络
+                        # 断开而不完整。checkpoint 中经过 reducer 合并的最终 AIMessage 才是
+                        # 后台记忆提取可以信任的完整助手回复。
+                        parsed_result = await self._parse_graph_result(
+                            dict(snapshot.values),
+                            config=config,
+                            thread_id=request.thread_id,
+                        )
+
+                        # 当前分支已经排除了 interrupt；若解析器仍返回 ChatInterrupt，说明
+                        # snapshot 状态与控制流判断矛盾，不能静默提交记忆。
+                        if not isinstance(parsed_result, ChatResponse):
+                            raise RuntimeError("completed chat stream must produce a ChatResponse")
+
+                        completed_result = parsed_result
+
                         terminal_event = DoneStreamEvent(status="completed")
 
+            # 此处已经离开 Graph timeout 和 thread execution guard。
+            # completed_result 为 None 时，说明当前流是 interrupted，不能提交。
+            if completed_result is not None:
+                self._submit_memory_write_if_completed(
+                    completed_result,
+                    user_id=user_id,
+                    source_thread_id=request.thread_id,
+                    user_message=request.message,
+                )
+
+            # submit 只创建后台任务，不等待模型提取或数据库写入。
+            # 客户端仍然可以立即收到最终 done 事件。
             # 先正常离开 guard 上下文并确认 Redis owner token 已释放，再发送 done。
             # 因此客户端看到 done 时，本轮执行权已经可供下一请求获取。
             yield terminal_event
