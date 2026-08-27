@@ -14,6 +14,7 @@
 
 import asyncio
 import json
+import logging
 import os
 import secrets
 import selectors
@@ -54,6 +55,7 @@ from app.api.v1.chat import router as chat_router  # noqa: E402
 from app.api.v1.chat_sessions import router as chat_sessions_router  # noqa: E402
 from app.core.config import Settings, settings  # noqa: E402
 from app.core.exception_handlers import register_exception_handlers  # noqa: E402
+import app.infrastructure.background_tasks as background_tasks_module  # noqa: E402
 from app.infrastructure.cache import RedisCache  # noqa: E402
 from app.infrastructure.database import build_orm_database_url  # noqa: E402
 import app.infrastructure.lifespan as lifespan_module  # noqa: E402
@@ -63,8 +65,16 @@ from app.infrastructure.lifespan import (  # noqa: E402
     lifespan,
 )
 from app.models import Memory  # noqa: E402
+from app.schemas.memory import (  # noqa: E402
+    MemoryCreate,
+    MemoryItem,
+    MemoryQuery,
+    MemorySearchResult,
+)
 from app.services.auth import TokenService  # noqa: E402
 from app.services.chat import ChatService  # noqa: E402
+from app.services.memory import MemoryUnavailableError  # noqa: E402
+import app.services.memory_service as memory_service_module  # noqa: E402
 from app.services.memory_service import MemoryService  # noqa: E402
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -77,6 +87,83 @@ TEMPORARY_DATABASE_PREFIX = "deep_research_chat_memory_"
 # lifespan 会把 RedisCache 用于业务会话缓存和长期记忆缓存。smoke 不能扫描或清空
 # 共享 Redis，因此用这个列表精确记录并删除本次运行触碰过的哈希 key。
 _TRACKING_CACHES: list["_TrackingRedisCache"] = []
+
+
+class _MemoryLogHandler(logging.Handler):
+    """在内存中捕获结构化 LogRecord，用于事件和泄漏检查."""
+
+    def __init__(self) -> None:
+        """创建不会向控制台或文件额外写入内容的观察 handler."""
+        super().__init__(level=logging.NOTSET)
+        self.records: list[str] = []
+
+    def emit(self, record: logging.LogRecord) -> None:
+        """保存防御性记录表示，不主动格式化可能含异常正文的消息.
+
+        Args:
+            record: 应用 logging/structlog 最终交给标准库的日志记录。
+
+        Notes:
+            handler 只用于当前进程内断言。若记录无法安全表示，则写入固定标记，
+            让最终泄漏检查 fail-closed，而不是让日志观察器破坏业务请求。
+        """
+        try:
+            self.records.append(repr(record.__dict__))
+        except Exception:
+            self.records.append("<unrepresentable-log-record>")
+
+
+class _ControlledUnavailableMemoryStore:
+    """在 Agent 层故障验收中提供可暂停的稳定 Store 失败.
+
+    这个类不模拟 LLM。memory node 和后台 writer 仍分别调用真实 Chat 模型与真实
+    structured extraction；只有 MemoryStore 协议边界被故意置为不可用，以验证
+    上层的降级和异常隔离，而不依赖偶发的真实数据库中断。
+    """
+
+    def __init__(self) -> None:
+        """创建调用计数和控制后台写入失败时机的两个事件."""
+        self.search_calls = 0
+        self.add_calls = 0
+        self.add_started = asyncio.Event()
+        self.release_add_failure = asyncio.Event()
+
+    async def search(
+        self,
+        *,
+        user_id: UUID,
+        query: MemoryQuery,
+    ) -> tuple[MemoryItem, ...]:
+        """把一次真实 Agent 记忆查询映射为稳定的 Store 不可用错误."""
+        _ = (user_id, query)
+        self.search_calls += 1
+        raise MemoryUnavailableError()
+
+    async def add(
+        self,
+        *,
+        user_id: UUID,
+        memory: MemoryCreate,
+    ) -> MemoryItem:
+        """暂停后台写入，待 HTTP 完成证据取得后再抛稳定错误.
+
+        Args:
+            user_id: ChatService 后台 writer 绑定的可信用户身份。
+            memory: 真实 structured extraction 生成并由服务端补齐来源的候选。
+
+        Raises:
+            MemoryUnavailableError: smoke 放行后始终抛出，模拟写入后端不可用。
+        """
+        _ = (user_id, memory)
+        self.add_calls += 1
+        self.add_started.set()
+        await self.release_add_failure.wait()
+        raise MemoryUnavailableError()
+
+    async def delete(self, *, user_id: UUID, memory_id: UUID) -> None:
+        """保持 MemoryStore 协议完整；本 smoke 不应调用删除."""
+        _ = (user_id, memory_id)
+        raise MemoryUnavailableError()
 
 
 class _TrackingRedisCache(RedisCache):
@@ -279,6 +366,23 @@ async def _wait_for_background_idle(active_count: Callable[[], int]) -> bool:
     return True
 
 
+async def _wait_for_event(event: asyncio.Event) -> bool:
+    """在后台任务预算内等待一个确定性阶段信号.
+
+    Args:
+        event: 由受控 Store 在进入 ``add()`` 后设置的 asyncio 事件。
+
+    Returns:
+        事件在预算内出现时返回 ``True``，超时时返回 ``False``。
+    """
+    try:
+        async with asyncio.timeout(BACKGROUND_TASK_TIMEOUT_SECONDS):
+            await event.wait()
+    except TimeoutError:
+        return False
+    return True
+
+
 async def _exercise_smoke(database: str) -> dict[str, bool | int | float | str]:
     """运行真实长期记忆闭环并返回脱敏检查结果.
 
@@ -351,8 +455,12 @@ async def _exercise_smoke(database: str) -> dict[str, bool | int | float | str]:
                 if len(captured_graphs) != 1 or len(captured_memory_services) != 1:
                     raise RuntimeError("lifespan must create exactly one memory-enabled Graph")
                 graph = captured_graphs[0]
+                memory_service = captured_memory_services[0]
 
                 transport = ASGITransport(app=app, raise_app_exceptions=False)
+                log_handler = _MemoryLogHandler()
+                root_logger = logging.getLogger()
+                root_logger.addHandler(log_handler)
                 try:
                     async with AsyncClient(
                         transport=transport,
@@ -360,7 +468,6 @@ async def _exercise_smoke(database: str) -> dict[str, bool | int | float | str]:
                         timeout=HTTP_TIMEOUT_SECONDS,
                     ) as client:
                         suffix = uuid4().hex
-                        marker = f"ATLAS-{suffix[:10].upper()}"
                         email = f"memory-smoke-{suffix}@example.com"
                         password = f"Memory-Smoke-{secrets.token_urlsafe(18)}!"
 
@@ -382,17 +489,19 @@ async def _exercise_smoke(database: str) -> dict[str, bool | int | float | str]:
                             title="Long-term memory target",
                         )
 
+                        source_prompt = (
+                            "这是需要长期保存的稳定学习偏好，不是验证码、密码或"
+                            "临时任务：技术教学回答必须使用中文，并且先解释 Agent "
+                            "状态变化。不要调用工具，"
+                            "只需确认已经记录。"
+                        )
+
                         source_response = await client.post(
                             "/api/v1/chat",
                             headers=headers,
                             json={
                                 "thread_id": str(source_thread_id),
-                                "message": (
-                                    "这是需要长期保存的稳定学习偏好，不是验证码、密码或"
-                                    f"临时任务：我的技术教学风格名称是 {marker}，它表示"
-                                    "回答要使用中文并先解释 Agent 状态变化。不要调用工具，"
-                                    "只需确认已经记录。"
-                                ),
+                                "message": source_prompt,
                             },
                         )
                         source_completed = _is_completed_chat(source_response)
@@ -406,10 +515,7 @@ async def _exercise_smoke(database: str) -> dict[str, bool | int | float | str]:
                             result = await session.execute(select(Memory).where(Memory.user_id == user_id))
                             rows_after_source = tuple(result.scalars().all())
 
-                        marker_folded = marker.casefold()
-                        matching_rows = tuple(
-                            row for row in rows_after_source if marker_folded in row.content.casefold()
-                        )
+                        matching_rows = tuple(row for row in rows_after_source if "中文" in row.content)
                         memory_persisted = len(matching_rows) == 1
                         memory_owner_and_source_match = (
                             memory_persisted
@@ -417,17 +523,53 @@ async def _exercise_smoke(database: str) -> dict[str, bool | int | float | str]:
                             and matching_rows[0].source_thread_id == source_thread_id
                         )
 
-                        target_response = await client.post(
-                            "/api/v1/chat",
-                            headers=headers,
-                            json={
-                                "thread_id": str(target_thread_id),
-                                "message": ("我长期使用的技术教学风格名称是什么？不要调用工具，只回复名称。"),
-                            },
+                        target_prompt = (
+                            "根据我已经保存的长期偏好，技术教学回答应该使用什么语言？不要调用工具，只回复语言名称。"
                         )
+                        target_search_results: list[MemorySearchResult] = []
+                        original_memory_search = memory_service.search
+
+                        async def observe_target_memory_search(
+                            *,
+                            user_id: UUID,
+                            query: MemoryQuery,
+                        ) -> MemorySearchResult:
+                            """委托真实搜索，并记录 target invocation 的检索结果."""
+                            result = await original_memory_search(
+                                user_id=user_id,
+                                query=query,
+                            )
+                            target_search_results.append(result)
+                            return result
+
+                        with patch.object(
+                            memory_service,
+                            "search",
+                            observe_target_memory_search,
+                        ):
+                            target_response = await client.post(
+                                "/api/v1/chat",
+                                headers=headers,
+                                json={
+                                    "thread_id": str(target_thread_id),
+                                    "message": target_prompt,
+                                },
+                            )
                         target_completed = _is_completed_chat(target_response)
                         target_content = _chat_content(target_response)
-                        target_used_cross_thread_memory = marker_folded in target_content.casefold()
+                        target_search_retrieved_source = (
+                            len(target_search_results) == 1
+                            and not target_search_results[0].is_degraded
+                            and any(
+                                item.source_thread_id == source_thread_id for item in target_search_results[0].items
+                            )
+                        )
+                        target_answer_reflects_memory = (
+                            "中文" in target_content or "chinese" in target_content.casefold()
+                        )
+                        target_used_cross_thread_memory = (
+                            target_search_retrieved_source and target_answer_reflects_memory
+                        )
 
                         # target 回答也会经过同一 completed 提交边界。即使提取器判断
                         # 该问答没有新候选，任务仍必须被观察并在 shutdown 前结束。
@@ -453,10 +595,103 @@ async def _exercise_smoke(database: str) -> dict[str, bool | int | float | str]:
                             len(snapshot_messages) == 2
                             and isinstance(snapshot_messages[0], HumanMessage)
                             and isinstance(snapshot_messages[1], AIMessage)
-                            and marker_folded not in str(snapshot_messages[0].content).casefold()
+                            and snapshot_messages[0].content == target_prompt
                             and "memory_context" not in snapshot_values
                             and "memory_status" not in snapshot_values
                         )
+
+                        # 正常闭环已完成后才替换 Store 协议边界。Graph 和 writer 持有
+                        # 同一个 MemoryService，因此一次替换可以同时观察：
+                        # 1. memory node 的 search 故障是否降级；
+                        # 2. completed 后后台 add 故障是否被 submitter 消费。
+                        controlled_store = _ControlledUnavailableMemoryStore()
+                        memory_service._store = controlled_store
+
+                        async with resources.orm_session_factory() as session:
+                            baseline_result = await session.execute(select(Memory).where(Memory.user_id == user_id))
+                            memory_count_before_failure = len(baseline_result.scalars().all())
+
+                        degraded_thread_id = await _create_session(
+                            client,
+                            headers=headers,
+                            title="Long-term memory degraded boundary",
+                        )
+                        degraded_marker = f"FAULT-{suffix[10:20].upper()}"
+                        degraded_prompt = (
+                            "这是稳定的长期学习偏好，不是凭据或临时任务："
+                            f"我的故障演练教学风格名称是 {degraded_marker}，回答应使用"
+                            "中文。即使长期记忆暂时不可用，也不要调用工具并正常确认。"
+                        )
+                        # spy 保留真实日志调用，只记录固定事件名和结构化字段是否出现。
+                        # 它比读取已渲染日志文本稳定，也不会把异常或正文替换成 fake。
+                        with (
+                            patch.object(
+                                memory_service_module.logger,
+                                "warning",
+                                wraps=memory_service_module.logger.warning,
+                            ) as warning_spy,
+                            patch.object(
+                                background_tasks_module.logger,
+                                "error",
+                                wraps=background_tasks_module.logger.error,
+                            ) as error_spy,
+                        ):
+                            degraded_response = await client.post(
+                                "/api/v1/chat",
+                                headers=headers,
+                                json={
+                                    "thread_id": str(degraded_thread_id),
+                                    "message": degraded_prompt,
+                                },
+                            )
+                            degraded_chat_completed = _is_completed_chat(degraded_response)
+
+                            # HTTP 已经返回后，真实 structured extraction 才会推进到
+                            # 受控 Store.add。任务仍活跃证明主响应没有等待写入结果。
+                            background_add_started = await _wait_for_event(controlled_store.add_started)
+                            response_returned_before_background_failure = (
+                                degraded_chat_completed and background_add_started and submitter.active_count == 1
+                            )
+
+                            controlled_store.release_add_failure.set()
+                            degraded_tasks_drained = await _wait_for_background_idle(
+                                lambda: submitter.active_count,
+                            )
+
+                            degraded_search_logged = any(
+                                call.args
+                                and call.args[0] == "memory_search_degraded"
+                                and call.kwargs.get("error_type") == "MemoryUnavailableError"
+                                for call in warning_spy.call_args_list
+                            )
+                            background_failure_logged = any(
+                                call.args
+                                and call.args[0] == "background_task_failed"
+                                and call.kwargs.get("error_type") == "MemoryUnavailableError"
+                                for call in error_spy.call_args_list
+                            )
+
+                        async with resources.orm_session_factory() as session:
+                            failed_result = await session.execute(select(Memory).where(Memory.user_id == user_id))
+                            memory_count_after_failure = len(failed_result.scalars().all())
+
+                        captured_log_text = "\n".join(log_handler.records)
+                        failure_logs_hide_sensitive_data = all(
+                            marker_text not in captured_log_text
+                            for marker_text in (
+                                degraded_marker,
+                                email,
+                                password,
+                                token,
+                                source_prompt,
+                                target_prompt,
+                                degraded_prompt,
+                            )
+                        )
+                        degraded_store_calls_match = (
+                            controlled_store.search_calls == 1 and controlled_store.add_calls == 1
+                        )
+                        failed_write_preserved_database = memory_count_after_failure == memory_count_before_failure
                 finally:
                     # 正常路径已等待两次任务；异常路径也尽力等待，避免关闭 ORM/Redis
                     # 后还有受管任务继续访问资源。12E 会把这项能力移入 submitter 本身。
@@ -465,6 +700,7 @@ async def _exercise_smoke(database: str) -> dict[str, bool | int | float | str]:
                     )
                     cleanup_results = [await cache.cleanup() for cache in _TRACKING_CACHES]
                     cache_cleanup_ok = all(cleanup_results)
+                    root_logger.removeHandler(log_handler)
 
             state_removed_after_shutdown = (
                 not hasattr(app.state, "resources")
@@ -483,9 +719,20 @@ async def _exercise_smoke(database: str) -> dict[str, bool | int | float | str]:
         "memory_owner_and_source_match": memory_owner_and_source_match,
         "memory_count_after_source": len(rows_after_source),
         "target_completed": target_completed,
+        "target_search_retrieved_source": target_search_retrieved_source,
+        "target_answer_reflects_memory": target_answer_reflects_memory,
         "target_used_cross_thread_memory": target_used_cross_thread_memory,
         "target_tasks_drained": target_tasks_drained,
         "checkpoint_keeps_memory_context_temporary": checkpoint_keeps_memory_context_temporary,
+        "degraded_chat_completed": degraded_chat_completed,
+        "background_add_started": background_add_started,
+        "response_returned_before_background_failure": response_returned_before_background_failure,
+        "degraded_tasks_drained": degraded_tasks_drained,
+        "degraded_search_logged": degraded_search_logged,
+        "background_failure_logged": background_failure_logged,
+        "failure_logs_hide_sensitive_data": failure_logs_hide_sensitive_data,
+        "degraded_store_calls_match": degraded_store_calls_match,
+        "failed_write_preserved_database": failed_write_preserved_database,
         "background_idle_before_shutdown": background_idle_before_shutdown,
         "cache_cleanup_ok": cache_cleanup_ok,
         "state_removed_after_shutdown": state_removed_after_shutdown,
