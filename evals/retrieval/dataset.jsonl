@@ -1,4 +1,3 @@
 {"id":"semantic-001","query":"服务无法启动时如何恢复","relevant_chunk_ids":["recovery-guide"],"rankings":{"vector":["recovery-guide","product-code","noise"],"bm25":["noise","recovery-guide","product-code"],"hybrid":["recovery-guide","noise","product-code"],"hybrid_rerank":["recovery-guide","product-code","noise"]}}
 {"id":"exact-001","query":"ZX-9000 额定功率","relevant_chunk_ids":["product-code"],"rankings":{"vector":["noise","product-code","recovery-guide"],"bm25":["product-code","noise","recovery-guide"],"hybrid":["product-code","noise","recovery-guide"],"hybrid_rerank":["product-code","recovery-guide","noise"]}}
 {"id":"distractor-001","query":"数据库恢复步骤与连接池无关的操作","relevant_chunk_ids":["recovery-guide"],"rankings":{"vector":["noise","recovery-guide","product-code"],"bm25":["product-code","recovery-guide","noise"],"hybrid":["recovery-guide","product-code","noise"],"hybrid_rerank":["recovery-guide","noise","product-code"]}}
-
