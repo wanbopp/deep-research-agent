@@ -15,7 +15,9 @@ from uuid import uuid4
 
 from alembic import command
 from alembic.config import Config
+from langchain_core.messages import HumanMessage
 import psycopg
+from pydantic import SecretStr
 from psycopg import sql
 from psycopg.conninfo import make_conninfo
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
@@ -32,7 +34,11 @@ from app.rag.parsers import MarkdownParser, ParserRegistry
 from app.rag.pipeline import DocumentIndexProcessor
 from app.rag.reranker import TokenOverlapReranker
 from app.rag.vector_store import PostgresDocumentChunkStore
+from app.schemas.llm import ModelSpec
 from app.services.index_worker import IndexSource
+from app.services.llm.factory import create_openai_chat_model
+from app.services.llm.registry import LLMRegistry
+from app.services.llm.service import LLMService
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 ADMIN_DATABASE = "postgres"
@@ -194,15 +200,56 @@ async def run(database: str) -> dict[str, object]:
         citations_valid = bool(context.citations) and all(
             any(str(result.chunk_id) == citation.chunk_id for result in results) for citation in context.citations
         )
+        citation_id = context.citations[0].citation_id if context.citations else ""
+        llm = LLMService(
+            LLMRegistry(
+                (
+                    ModelSpec(
+                        alias="primary",
+                        provider_model=settings.DEFAULT_LLM_MODEL,
+                        api_key=SecretStr(settings.OPENAI_API_KEY),
+                        base_url=settings.OPENAI_BASE_URL,
+                        temperature=0,
+                        max_tokens=80,
+                    ),
+                ),
+                create_openai_chat_model,
+            ),
+            max_attempts=1,
+            total_timeout_seconds=90,
+        )
+        answer_message = await llm.call(
+            (
+                HumanMessage(
+                    content=(
+                        "Use only the evidence below. Answer the rated power of ZX-9000 in one short sentence, "
+                        "and include the evidence citation exactly as written.\n\n" + context.text
+                    )
+                ),
+            ),
+            aliases=("primary",),
+        )
+        answer_text = answer_message.content if isinstance(answer_message.content, str) else ""
+        answer_has_fact = "1200" in answer_text
+        answer_has_citation = bool(citation_id) and f"[{citation_id}]" in answer_text
         summary.update(
             {
-                "ok": owner_isolated and exact_fact_retrieved and citations_valid,
+                "ok": (
+                    owner_isolated
+                    and exact_fact_retrieved
+                    and citations_valid
+                    and answer_has_fact
+                    and answer_has_citation
+                ),
                 "embedding_model": settings.EMBEDDING_MODEL,
+                "answer_model": settings.DEFAULT_LLM_MODEL,
                 "owner_filter_applied": owner_isolated,
                 "exact_fact_retrieved": exact_fact_retrieved,
                 "citation_count": len(context.citations),
                 "citations_valid": citations_valid,
                 "context_within_budget": context.token_count <= 180,
+                "answer_has_fact": answer_has_fact,
+                "answer_has_citation": answer_has_citation,
                 "result_count": len(results),
             }
         )
