@@ -37,12 +37,13 @@ from app.infrastructure.database import build_orm_database_url
 # 从 PowerShell、PyCharm 或其他工作目录启动脚本时都能找到同一个配置文件。
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
-# Alembic 只拥有这五张业务表。集合精确比较可以同时发现“少创建”和“误创建”。
+# Alembic 只拥有这六张业务表。集合精确比较可以同时发现“少创建”和“误创建”。
 MANAGED_TABLES = frozenset(
     {
         "users",
         "chat_sessions",
         "documents",
+        "index_jobs",
         "memories",
         "research_tasks",
     }

@@ -241,6 +241,33 @@ class Settings:
         if self.BACKGROUND_TASK_SHUTDOWN_TIMEOUT_SECONDS < 0:
             raise ValueError("BACKGROUND_TASK_SHUTDOWN_TIMEOUT_SECONDS must not be negative")
 
+        # ---- 知识文档上传与索引任务 ----
+        # 原始文件与 PostgreSQL 元数据属于两个资源边界。路径只用于构造
+        # FileStorage adapter，绝不会作为客户端可控路径或公开响应字段。
+        self.KNOWLEDGE_STORAGE_ROOT = Path(os.getenv("KNOWLEDGE_STORAGE_ROOT", "data/documents"))
+        self.KNOWLEDGE_MAX_UPLOAD_BYTES = int(os.getenv("KNOWLEDGE_MAX_UPLOAD_BYTES", str(10 * 1024 * 1024)))
+        self.KNOWLEDGE_UPLOAD_READ_CHUNK_BYTES = int(os.getenv("KNOWLEDGE_UPLOAD_READ_CHUNK_BYTES", str(64 * 1024)))
+        allowed_content_types = os.getenv(
+            "KNOWLEDGE_ALLOWED_CONTENT_TYPES",
+            "application/pdf,text/markdown,text/plain,application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        )
+        self.KNOWLEDGE_ALLOWED_CONTENT_TYPES = frozenset(
+            item.strip().lower() for item in allowed_content_types.split(",") if item.strip()
+        )
+        self.KNOWLEDGE_INDEX_MAX_ATTEMPTS = int(os.getenv("KNOWLEDGE_INDEX_MAX_ATTEMPTS", "3"))
+        self.KNOWLEDGE_INDEX_LEASE_SECONDS = float(os.getenv("KNOWLEDGE_INDEX_LEASE_SECONDS", "300"))
+        for name in (
+            "KNOWLEDGE_MAX_UPLOAD_BYTES",
+            "KNOWLEDGE_UPLOAD_READ_CHUNK_BYTES",
+            "KNOWLEDGE_INDEX_MAX_ATTEMPTS",
+        ):
+            if getattr(self, name) <= 0:
+                raise ValueError(f"{name} must be greater than 0")
+        if not self.KNOWLEDGE_ALLOWED_CONTENT_TYPES:
+            raise ValueError("KNOWLEDGE_ALLOWED_CONTENT_TYPES must not be empty")
+        if self.KNOWLEDGE_INDEX_LEASE_SECONDS <= 0:
+            raise ValueError("KNOWLEDGE_INDEX_LEASE_SECONDS must be greater than 0")
+
         # ---- JWT 认证 ----
         # Secret 不提供可工作的默认值：示例 secret 一旦被误带到部署环境，攻击者
         # 就能自行签发任意身份 token。TokenService 还会执行长度与已知弱值检查。

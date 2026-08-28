@@ -6,6 +6,7 @@
 2. B 在 A 持锁期间仍能取得不同 key，证明不是全局锁；
 3. 正常退出、代码块异常和 asyncio task 取消后，同 key 都能再次取得；
 4. Redis 中的锁名只包含摘要，不包含内部 thread ID 原文。
+5. guard 后端不可用时快速 fail-closed，绝不降级为无锁执行。
 
 最终 JSON 不输出 Redis 地址、密码、原始内部 key、摘要 key 或 owner token。
 """
@@ -17,14 +18,21 @@ from time import perf_counter
 from uuid import uuid4
 
 from redis.asyncio import Redis
+from redis.asyncio.retry import Retry
+from redis.backoff import NoBackoff
 
 from app.core.config import settings
 from app.infrastructure.chat_guard import RedisChatExecutionGuard
-from app.services.chat_guard import ChatThreadBusyError
+from app.services.chat_guard import (
+    ChatExecutionGuardUnavailableError,
+    ChatThreadBusyError,
+)
 
 LEASE_SECONDS = 30.0
 TOTAL_TIMEOUT_SECONDS = 15.0
 BUSY_BUDGET_SECONDS = 0.5
+UNAVAILABLE_BUDGET_SECONDS = 2.0
+UNAVAILABLE_PORT = 1
 
 
 class _ExpectedBlockError(RuntimeError):
@@ -36,7 +44,7 @@ def _elapsed_ms(started_at: float) -> float:
     return round((perf_counter() - started_at) * 1000, 2)
 
 
-def _create_redis_client() -> Redis:
+def _create_redis_client(*, port: int | None = None) -> Redis:
     """创建一个指向当前真实 Redis 的独立异步客户端.
 
     Returns:
@@ -45,11 +53,17 @@ def _create_redis_client() -> Redis:
     """
     return Redis(
         host=settings.REDIS_HOST,
-        port=settings.REDIS_PORT,
+        # port=1 用于受控不可用分支。它仍通过真实 redis-py client 发起连接，
+        # 只是目标端口预期没有 Redis 服务，不是内存 fake adapter。
+        port=settings.REDIS_PORT if port is None else port,
         db=settings.REDIS_DB,
         password=settings.REDIS_PASSWORD or None,
-        socket_connect_timeout=5.0,
-        socket_timeout=5.0,
+        # 不可用分支使用 100ms socket 预算，并通过 Retry(..., 0) 禁止客户端
+        # 内部重试。否则外层只能观察到整个 smoke 超时，无法证明 guard 把第一次
+        # Redis 连接错误转换成了稳定的 fail-closed 业务异常。
+        socket_connect_timeout=0.1 if port is not None else 5.0,
+        socket_timeout=0.1 if port is not None else 5.0,
+        retry=Retry(NoBackoff(), 0),
         decode_responses=True,
     )
 
@@ -72,12 +86,17 @@ async def _exercise_guard() -> dict[str, bool | float]:
     started_at = perf_counter()
     first_client = _create_redis_client()
     second_client = _create_redis_client()
+    unavailable_client = _create_redis_client(port=UNAVAILABLE_PORT)
     first_guard = RedisChatExecutionGuard(
         first_client,
         lease_seconds=LEASE_SECONDS,
     )
     second_guard = RedisChatExecutionGuard(
         second_client,
+        lease_seconds=LEASE_SECONDS,
+    )
+    unavailable_guard = RedisChatExecutionGuard(
+        unavailable_client,
         lease_seconds=LEASE_SECONDS,
     )
 
@@ -145,6 +164,17 @@ async def _exercise_guard() -> dict[str, bool | float]:
             async with second_guard.hold(cancellation_key):
                 cancellation_release_reacquired = True
 
+            # guard 与普通 cache 的故障策略不同。cache 可以回源 PostgreSQL，guard
+            # 一旦无法确认“当前是否已有执行者”，继续调用 Graph 就可能让同一个
+            # checkpoint 出现并发分支。因此 Redis 连接失败必须 fail-closed。
+            unavailable_started_at = perf_counter()
+            try:
+                async with unavailable_guard.hold(f"user:{uuid4().hex}:thread:{uuid4().hex}"):
+                    raise AssertionError("unavailable guard unexpectedly entered")
+            except ChatExecutionGuardUnavailableError:
+                unavailable_failed_closed = True
+            unavailable_elapsed_ms = _elapsed_ms(unavailable_started_at)
+
         return {
             "same_key_rejected": same_key_rejected,
             "busy_failed_fast": busy_elapsed_ms <= BUSY_BUDGET_SECONDS * 1000,
@@ -154,12 +184,16 @@ async def _exercise_guard() -> dict[str, bool | float]:
             "exception_release_reacquired": exception_release_reacquired,
             "cancellation_propagated": cancellation_propagated,
             "cancellation_release_reacquired": cancellation_release_reacquired,
+            "unavailable_failed_closed": unavailable_failed_closed,
+            "unavailable_failed_fast": (unavailable_elapsed_ms <= UNAVAILABLE_BUDGET_SECONDS * 1000),
             "busy_elapsed_ms": busy_elapsed_ms,
+            "unavailable_elapsed_ms": unavailable_elapsed_ms,
             "elapsed_ms": _elapsed_ms(started_at),
         }
     finally:
         await first_client.aclose()
         await second_client.aclose()
+        await unavailable_client.aclose()
 
 
 def _run_smoke() -> dict[str, object]:

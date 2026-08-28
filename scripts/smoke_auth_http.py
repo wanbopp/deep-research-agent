@@ -305,6 +305,9 @@ async def _exercise_auth_http(database: str) -> dict[str, bool | int | float]:
                     user_id=second_claims.sub,
                     original_filename="authorization-smoke.txt",
                     content_type="text/plain",
+                    size_bytes=1,
+                    content_sha256="a" * 64,
+                    storage_key=f"smoke/auth/{uuid4().hex}",
                 )
                 owned_research_task = await research_tasks.create(
                     user_id=second_claims.sub,

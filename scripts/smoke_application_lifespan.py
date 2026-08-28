@@ -45,7 +45,10 @@ from httpx import ASGITransport, AsyncClient
 from sqlalchemy import text
 
 from app.core.config import settings
-from app.infrastructure.lifespan import get_application_resources
+from app.infrastructure.lifespan import (
+    get_application_file_storage,
+    get_application_resources,
+)
 from app.main import app
 
 TOTAL_TIMEOUT_SECONDS = 15.0
@@ -78,7 +81,7 @@ def _selector_loop_factory() -> asyncio.AbstractEventLoop:
 async def _run_smoke() -> dict[str, object]:
     """Enter the real lifespan, inspect ownership, then verify shutdown state."""
     started_at = perf_counter()
-    state_absent_before_startup = not hasattr(app.state, "resources")
+    state_absent_before_startup = not hasattr(app.state, "resources") and not hasattr(app.state, "file_storage")
 
     # 外层预算覆盖 startup probes、一次本地 ASGI 请求以及 shutdown。
     async with asyncio.timeout(TOTAL_TIMEOUT_SECONDS):
@@ -87,9 +90,12 @@ async def _run_smoke() -> dict[str, object]:
             # 证明请求期间复用的是 lifespan 创建的资源，而不是每次重新构造。
             first_resources = get_application_resources(app)
             second_resources = get_application_resources(app)
+            first_storage = get_application_file_storage(app)
+            second_storage = get_application_file_storage(app)
 
-            state_available_during_lifespan = hasattr(app.state, "resources")
+            state_available_during_lifespan = hasattr(app.state, "resources") and hasattr(app.state, "file_storage")
             resource_identity_is_stable = first_resources is second_resources
+            file_storage_identity_is_stable = first_storage is second_storage
             postgres_pool_open_during_lifespan = not first_resources.postgres_pool.closed
             orm_engine_identity_is_stable = first_resources.orm_engine is second_resources.orm_engine
             orm_session_factory_identity_is_stable = (
@@ -139,7 +145,7 @@ async def _run_smoke() -> dict[str, object]:
             health_status_code = response.status_code
 
         # 离开 context 后，lifespan 的 finally 与 AsyncExitStack 均已执行。
-        state_removed_after_shutdown = not hasattr(app.state, "resources")
+        state_removed_after_shutdown = not hasattr(app.state, "resources") and not hasattr(app.state, "file_storage")
         postgres_pool_closed_after_shutdown = first_resources.postgres_pool.closed
         # dispose() 会关闭池内空闲连接；此处至少还要保证没有连接被 Session 遗留占用。
         orm_connections_released_after_shutdown = orm_pool.checkedout() == 0
@@ -151,6 +157,13 @@ async def _run_smoke() -> dict[str, object]:
         else:
             accessor_rejects_after_shutdown = False
 
+        try:
+            get_application_file_storage(app)
+        except RuntimeError:
+            storage_accessor_rejects_after_shutdown = True
+        else:
+            storage_accessor_rejects_after_shutdown = False
+
     elapsed_ms = _elapsed_ms(started_at)
     within_total_budget = elapsed_ms <= TOTAL_TIMEOUT_SECONDS * 1000
     ok = all(
@@ -158,6 +171,7 @@ async def _run_smoke() -> dict[str, object]:
             state_absent_before_startup,
             state_available_during_lifespan,
             resource_identity_is_stable,
+            file_storage_identity_is_stable,
             postgres_pool_open_during_lifespan,
             orm_engine_identity_is_stable,
             orm_session_factory_identity_is_stable,
@@ -172,6 +186,7 @@ async def _run_smoke() -> dict[str, object]:
             postgres_pool_closed_after_shutdown,
             orm_connections_released_after_shutdown,
             accessor_rejects_after_shutdown,
+            storage_accessor_rejects_after_shutdown,
             within_total_budget,
         )
     )
@@ -181,6 +196,7 @@ async def _run_smoke() -> dict[str, object]:
         "state_absent_before_startup": state_absent_before_startup,
         "state_available_during_lifespan": state_available_during_lifespan,
         "resource_identity_is_stable": resource_identity_is_stable,
+        "file_storage_identity_is_stable": file_storage_identity_is_stable,
         "postgres_pool_open_during_lifespan": postgres_pool_open_during_lifespan,
         "orm_engine_identity_is_stable": orm_engine_identity_is_stable,
         "orm_session_factory_identity_is_stable": orm_session_factory_identity_is_stable,
@@ -195,6 +211,7 @@ async def _run_smoke() -> dict[str, object]:
         "postgres_pool_closed_after_shutdown": postgres_pool_closed_after_shutdown,
         "orm_connections_released_after_shutdown": orm_connections_released_after_shutdown,
         "accessor_rejects_after_shutdown": accessor_rejects_after_shutdown,
+        "storage_accessor_rejects_after_shutdown": storage_accessor_rejects_after_shutdown,
         "within_total_budget": within_total_budget,
         "elapsed_ms": elapsed_ms,
     }

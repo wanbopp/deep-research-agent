@@ -3,12 +3,14 @@
 from app.repositories.base import RepositoryConflictError, RepositoryError
 from app.repositories.chat_session import ChatSessionRepository
 from app.repositories.document import DocumentRepository
+from app.repositories.index_job import IndexJobRepository
 from app.repositories.research_task import ResearchTaskRepository
 from app.repositories.user import UserRepository
 
 __all__ = [
     "ChatSessionRepository",
     "DocumentRepository",
+    "IndexJobRepository",
     "RepositoryConflictError",
     "RepositoryError",
     "ResearchTaskRepository",

@@ -57,6 +57,7 @@ from app.schemas.chat import ChatRequest, ChatResponse, ErrorStreamEvent
 from app.services.chat import ChatService
 from app.services.chat_guard import ChatThreadBusyError
 from app.services.chat_session_ownership import ChatSessionNotFoundError
+from app.services.memory_service import MemoryService
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 CONNECTION_TIMEOUT_SECONDS = 10
@@ -276,16 +277,23 @@ async def _exercise_guard(database: str) -> dict[str, bool | float | str]:
     def capture_runtime(
         *,
         checkpointer: BaseCheckpointSaver[str] | None = None,
+        memory_service: MemoryService | None = None,
     ) -> ChatGraph:
         """捕获 lifespan 构建的真实 Graph，同时保持 production 装配路径.
 
         Args:
             checkpointer: lifespan 已 setup 的真实 PostgreSQL saver。
+            memory_service: lifespan 创建的共享长期记忆服务。包装函数必须透明
+                转发该依赖，否则生产构造函数新增参数后，smoke 会在调用模型前
+                因包装器签名过期而失败。
 
         Returns:
             使用真实 provider、tools 和传入 saver 编译的 ChatGraph。
         """
-        graph = create_chat_runtime(checkpointer=checkpointer)
+        graph = create_chat_runtime(
+            checkpointer=checkpointer,
+            memory_service=memory_service,
+        )
         captured_graphs.append(graph)
         return graph
 

@@ -18,6 +18,17 @@ from app.services.chat_guard import (
     ChatThreadBusyError,
 )
 from app.services.chat_session_cleanup import ChatCheckpointCleanupError
+from app.services.knowledge import (
+    KnowledgeDocumentBusyError,
+    KnowledgeDocumentNotFoundError,
+    KnowledgeDocumentNotRetryableError,
+    KnowledgeDocumentTooLargeError,
+    KnowledgeEmptyDocumentError,
+    KnowledgeInvalidFilenameError,
+    KnowledgeServiceError,
+    KnowledgeStorageUnavailableError,
+    KnowledgeUnsupportedMediaTypeError,
+)
 from app.services.rate_limit import (
     RateLimitBackendUnavailableError,
     RateLimitExceededError,
@@ -271,6 +282,90 @@ async def rate_limit_unavailable_exception_handler(
     )
 
 
+async def knowledge_exception_handler(
+    request: Request,
+    exc: KnowledgeServiceError,
+) -> JSONResponse:
+    """把知识文档业务错误转换为稳定且不泄漏存储细节的 HTTP 响应.
+
+    Args:
+        request: 当前请求，只记录 method/path。
+        exc: Service 抛出的固定类型错误；异常文本不进入响应或结构化字段。
+
+    Returns:
+        与错误语义匹配的 4xx/503 响应，不包含文件内容、hash、storage key、
+        worker ID、claim token 或底层文件系统路径。
+    """
+    if isinstance(exc, KnowledgeDocumentNotFoundError):
+        status_code, code, message = (
+            status.HTTP_404_NOT_FOUND,
+            "KNOWLEDGE_DOCUMENT_NOT_FOUND",
+            "Knowledge document was not found",
+        )
+    elif isinstance(exc, KnowledgeUnsupportedMediaTypeError):
+        status_code, code, message = (
+            status.HTTP_415_UNSUPPORTED_MEDIA_TYPE,
+            "KNOWLEDGE_UNSUPPORTED_MEDIA_TYPE",
+            "Document media type is not supported",
+        )
+    elif isinstance(exc, KnowledgeDocumentTooLargeError):
+        status_code, code, message = (
+            status.HTTP_413_CONTENT_TOO_LARGE,
+            "KNOWLEDGE_DOCUMENT_TOO_LARGE",
+            "Document exceeds the upload size limit",
+        )
+    elif isinstance(exc, KnowledgeEmptyDocumentError):
+        status_code, code, message = (
+            status.HTTP_422_UNPROCESSABLE_CONTENT,
+            "KNOWLEDGE_DOCUMENT_EMPTY",
+            "Document must not be empty",
+        )
+    elif isinstance(exc, KnowledgeInvalidFilenameError):
+        status_code, code, message = (
+            status.HTTP_422_UNPROCESSABLE_CONTENT,
+            "KNOWLEDGE_FILENAME_INVALID",
+            "Document filename is invalid",
+        )
+    elif isinstance(exc, KnowledgeDocumentNotRetryableError):
+        status_code, code, message = (
+            status.HTTP_409_CONFLICT,
+            "KNOWLEDGE_DOCUMENT_NOT_RETRYABLE",
+            "Document indexing cannot be retried in its current state",
+        )
+    elif isinstance(exc, KnowledgeDocumentBusyError):
+        status_code, code, message = (
+            status.HTTP_409_CONFLICT,
+            "KNOWLEDGE_DOCUMENT_BUSY",
+            "Knowledge document is currently being processed",
+        )
+    elif isinstance(exc, KnowledgeStorageUnavailableError):
+        status_code, code, message = (
+            status.HTTP_503_SERVICE_UNAVAILABLE,
+            "KNOWLEDGE_STORAGE_UNAVAILABLE",
+            "Knowledge file storage is temporarily unavailable",
+        )
+    else:
+        # KnowledgeServiceError 新增子类却没有显式协议映射时，不能静默伪装成
+        # 业务 4xx。使用固定 500 能让遗漏在 Gate 中暴露，同时不泄漏异常文本。
+        status_code, code, message = (
+            status.HTTP_500_INTERNAL_SERVER_ERROR,
+            "INTERNAL_SERVER_ERROR",
+            "Internal server error",
+        )
+
+    logger.warning(
+        "knowledge_request_failed",
+        method=request.method,
+        path=request.url.path,
+        error_type=type(exc).__name__,
+        status_code=status_code,
+    )
+    return JSONResponse(
+        status_code=status_code,
+        content=build_error_content(code=code, message=message),
+    )
+
+
 async def unhandled_exception_handler(
     request: Request,
     exc: Exception,
@@ -355,6 +450,11 @@ def register_exception_handlers(app: FastAPI) -> None:
     app.add_exception_handler(
         RateLimitIdentityUnavailableError,
         cast(HTTPExceptionHandler, rate_limit_unavailable_exception_handler),
+    )
+
+    app.add_exception_handler(
+        KnowledgeServiceError,
+        cast(HTTPExceptionHandler, knowledge_exception_handler),
     )
 
     app.add_exception_handler(

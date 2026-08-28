@@ -18,6 +18,7 @@ from app.infrastructure.lifespan import (
     get_application_cache,
     get_application_chat_cleanup_service,
     get_application_chat_service,
+    get_application_file_storage,
     get_application_rate_limiter,
     get_application_rate_limit_policies,
     get_application_resources,
@@ -33,6 +34,7 @@ from app.services.auth import (
 from app.services.chat import ChatService
 from app.services.chat_session_cleanup import ChatSessionCleanupService
 from app.services.chat_sessions import ChatSessionService
+from app.services.knowledge import KnowledgeService
 from app.services.rate_limit import (
     RateLimiter,
     RateLimitIdentityUnavailableError,
@@ -178,6 +180,30 @@ def get_chat_session_service(
         session,
         cache=get_application_cache(request.app),
         cache_ttl_seconds=settings.CACHE_TTL_SECONDS,
+    )
+
+
+def get_knowledge_service(
+    request: Request,
+    session: Annotated[AsyncSession, Depends(get_db_session)],
+) -> KnowledgeService:
+    """为一次 HTTP 请求组合知识文档应用服务.
+
+    Args:
+        request: 用于读取 lifespan 发布的共享 FileStorage。
+        session: 当前请求独享的 AsyncSession；认证依赖会复用同一个对象，但在
+            route 执行前已经结束认证查询事务。
+
+    Returns:
+        使用请求级事务和固定上传策略的 KnowledgeService。
+    """
+    return KnowledgeService(
+        session,
+        storage=get_application_file_storage(request.app),
+        allowed_content_types=settings.KNOWLEDGE_ALLOWED_CONTENT_TYPES,
+        max_upload_bytes=settings.KNOWLEDGE_MAX_UPLOAD_BYTES,
+        read_chunk_bytes=settings.KNOWLEDGE_UPLOAD_READ_CHUNK_BYTES,
+        index_max_attempts=settings.KNOWLEDGE_INDEX_MAX_ATTEMPTS,
     )
 
 

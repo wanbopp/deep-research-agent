@@ -19,6 +19,7 @@ from app.infrastructure.chat_guard import RedisChatExecutionGuard
 from app.infrastructure.cache import RedisCache
 from app.infrastructure.embeddings import OpenAITextEmbedder
 from app.infrastructure.factory import create_application_resources
+from app.infrastructure.file_storage import LocalFileStorage
 from app.infrastructure.memory import PostgresMemoryStore
 from app.infrastructure.neo4j import probe_neo4j
 from app.infrastructure.postgres import probe_postgres
@@ -38,6 +39,7 @@ from app.services.chat_title import (
 from app.services.llm.factory import create_openai_chat_model
 from app.services.llm.registry import LLMRegistry
 from app.services.llm.service import LLMService
+from app.services.file_storage import FileStorage
 from app.services.memory_extraction import (
     BackgroundChatMemoryWriter,
     ChatMemoryWriter,
@@ -171,6 +173,25 @@ def get_application_resources(app: FastAPI) -> ApplicationResources:
     except AttributeError as exc:
         raise RuntimeError("Application resources are not initialized") from exc
     return cast(ApplicationResources, resources)  # 不做任何转换 声明返回值是 ApplicationResources
+
+
+def get_application_file_storage(app: FastAPI) -> FileStorage:
+    """读取 lifespan 发布的原始知识文件存储协议.
+
+    Args:
+        app: 当前 FastAPI 应用。
+
+    Returns:
+        开发环境为 LocalFileStorage；未来生产可替换对象存储 adapter。
+
+    Raises:
+        RuntimeError: startup 尚未发布 storage 或 shutdown 已撤下引用。
+    """
+    try:
+        storage = app.state.file_storage
+    except AttributeError as exc:
+        raise RuntimeError("Application file storage is not initialized") from exc
+    return cast(FileStorage, storage)
 
 
 def get_application_chat_cleanup_service(
@@ -429,6 +450,9 @@ async def lifespan(
         # 状态的惰性适配器，构造时不会发送真实 provider 请求。因此三者和
         # MemoryService 都可以跨请求共享，同时不会共享某个用户或数据库事务。
         cache = RedisCache(resources.redis_client)
+        # LocalFileStorage 没有网络连接或 close 生命周期，但仍在 startup 统一
+        # 校验根目录并发布为 Protocol。请求不能自行用客户端文件名拼接 Path。
+        file_storage = LocalFileStorage(config.KNOWLEDGE_STORAGE_ROOT)
         memory_embedder = OpenAITextEmbedder.from_settings(config)
         memory_store = PostgresMemoryStore(
             session_factory=resources.orm_session_factory,
@@ -529,6 +553,7 @@ async def lifespan(
         # yield 前 FastAPI 尚未接收请求，因此请求不会看到只发布一半的状态。
         app.state.resources = resources
         app.state.cache = cache
+        app.state.file_storage = file_storage
         app.state.rate_limiter = rate_limiter
         app.state.rate_limit_policies = rate_limit_policies
         app.state.memory_service = memory_service
@@ -566,6 +591,7 @@ async def lifespan(
             # MemoryService 没有 close 方法，因为 Redis client 和 ORM engine 的唯一
             # 所有者仍是 ApplicationResources，随后由 AsyncExitStack 统一关闭。
             del app.state.memory_service
+            del app.state.file_storage
             del app.state.rate_limit_policies
             del app.state.rate_limiter
             del app.state.cache

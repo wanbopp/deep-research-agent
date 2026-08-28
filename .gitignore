@@ -19,6 +19,10 @@ deploy/vm.env
 # ---- 日志 ----
 logs/
 
+# ---- 本地知识文件 ----
+# 数据库只保存 storage key；开发环境上传的原始文件不得进入版本库。
+data/
+
 # ---- 工具缓存 ----
 .pytest_cache/
 .mypy_cache/

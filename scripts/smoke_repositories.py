@@ -22,7 +22,7 @@ from pydantic import SecretStr
 
 from app.core.config import Settings, settings
 from app.infrastructure.database import build_orm_database_url, create_orm_runtime
-from app.models import DocumentStatus, ResearchTaskStatus
+from app.models import DocumentStatus, ResearchTaskStatus, utc_now
 from app.repositories import (
     ChatSessionRepository,
     DocumentRepository,
@@ -161,12 +161,22 @@ async def _exercise_repositories(database: str) -> dict[str, bool | int]:
                     user_id=first_workspace.user_id,
                     original_filename="first.pdf",
                     content_type="application/pdf",
+                    size_bytes=1,
+                    content_sha256="a" * 64,
+                    storage_key=f"smoke/repositories/{uuid4().hex}",
+                )
+                await documents.set_status(
+                    first_document,
                     status=DocumentStatus.READY,
+                    indexed_at=utc_now(),
                 )
                 await documents.create(
                     user_id=second_workspace.user_id,
                     original_filename="second.txt",
                     content_type="text/plain",
+                    size_bytes=1,
+                    content_sha256="b" * 64,
+                    storage_key=f"smoke/repositories/{uuid4().hex}",
                 )
                 first_task = await tasks.create(
                     user_id=first_workspace.user_id,

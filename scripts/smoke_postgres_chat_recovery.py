@@ -1,9 +1,10 @@
-"""验证普通聊天历史与 HITL 恢复跨运行时重建的正确性.
+"""验证普通聊天历史、HITL 与可信 owner 跨 lifespan 恢复的正确性.
 
-Checkpoint 10C 已证明 production Graph 绑定了 lifespan 的 PostgreSQL saver。本
-smoke 继续验证 10D 的行为结果：先用 lifespan A 写入普通历史并停在 ask_human
-interrupt，再完整关闭 A；随后为同一个随机数据库创建全新的 lifespan B，确认 B
-在任何新模型调用前已经能读取 A 的状态，并最终完成普通追问和 HITL resume。
+早期 Checkpoint 10D 已证明 PostgreSQL checkpoint 可以跨运行时恢复。本脚本在 12F-C
+重新对齐当前 production runtime：先用 lifespan A 写入普通历史并停在 ask_human
+interrupt，再完整关闭 A；随后为同一随机数据库创建全新的 lifespan B，确认 B 在
+任何新模型调用前已经能读取 A 的状态。错误用户必须得到空内部 key，并在 Graph 前被
+owner 查询拒绝；只有原 owner 可以继续普通追问和 HITL resume。
 
 脚本不会输出 API key、连接串、数据库名、用户 UUID、thread ID、Prompt、ToolCall ID、
 checkpoint 正文或模型完整响应；最终只输出对象身份、状态结构、恢复结果、清理状态和
@@ -36,7 +37,9 @@ from app.core.config import Settings, settings
 from app.infrastructure.database import build_orm_database_url
 import app.infrastructure.lifespan as lifespan_module
 from app.infrastructure.lifespan import (
+    get_application_background_task_submitter,
     get_application_chat_service,
+    get_application_memory_service,
     get_application_resources,
     lifespan,
 )
@@ -45,10 +48,13 @@ from app.models.chat_session import ChatSession
 from app.models.user import User
 from app.schemas.chat import ChatRequest, ChatResponse, ChatResumeRequest
 from app.services.chat import ChatInterrupt, ChatService
+from app.services.chat_session_ownership import ChatSessionNotFoundError
+from app.services.memory_service import MemoryService
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 CONNECTION_TIMEOUT_SECONDS = 10
 TOTAL_TIMEOUT_SECONDS = 360.0
+TEMPORARY_DATABASE_PREFIX = "deep_research_chat_recovery_"
 
 MEMORY_ACK = "POSTGRES_MEMORY_STORED"
 HITL_FINAL_REPLY = "POSTGRES_HITL_RESUMED_OK"
@@ -91,6 +97,8 @@ def _create_database(admin_database: str, test_database: str) -> None:
         admin_database: 用于打开管理员连接的已有数据库。
         test_database: 本进程生成的随机数据库名。
     """
+    if not test_database.startswith(TEMPORARY_DATABASE_PREFIX):
+        raise ValueError("refusing to create a database without the smoke prefix")
     with psycopg.connect(_conninfo(admin_database), autocommit=True) as connection:
         connection.execute(
             sql.SQL("CREATE DATABASE {}").format(sql.Identifier(test_database)),
@@ -104,6 +112,8 @@ def _drop_database(admin_database: str, test_database: str) -> None:
         admin_database: 用于打开管理员连接的已有数据库。
         test_database: 本进程早前创建的随机数据库名。
     """
+    if not test_database.startswith(TEMPORARY_DATABASE_PREFIX):
+        raise ValueError("refusing to drop a database without the smoke prefix")
     with psycopg.connect(_conninfo(admin_database), autocommit=True) as connection:
         connection.execute(
             """
@@ -174,6 +184,7 @@ async def _exercise_recovery(database: str) -> dict[str, bool | float | str]:
     """
     started_at = perf_counter()
     user_id = UUID("44444444-4444-4444-8444-444444444444")
+    outsider_user_id = UUID("55555555-5555-4555-8555-555555555555")
     memory_thread_id = uuid4()
     hitl_thread_id = uuid4()
     memory_marker = f"RECOVERY-{uuid4().hex[:12].upper()}"
@@ -205,27 +216,38 @@ async def _exercise_recovery(database: str) -> dict[str, bool | float | str]:
 
     captured_checkpointers: list[BaseCheckpointSaver[str] | None] = []
     captured_graphs: list[ChatGraph] = []
+    captured_memory_services: list[MemoryService] = []
 
     def capture_runtime(
         *,
         checkpointer: BaseCheckpointSaver[str] | None = None,
+        memory_service: MemoryService | None = None,
     ) -> ChatGraph:
-        """捕获每代 lifespan 构建的真实 production Graph，仅记录身份.
+        """捕获每代 lifespan 构建的真实 production Graph，仅记录对象身份.
 
         Args:
             checkpointer: 当前活跃 lifespan 代提供的 saver。
+            memory_service: 当前 lifespan 创建的长期记忆服务。它与 saver 一样会在
+                重启后重建，但不保存当前用户；用户身份仍由每次调用注入。
 
         Returns:
             包含真实模型和工具注册表的完整 production ChatGraph。
         """
+        if memory_service is None:
+            raise RuntimeError("recovery smoke requires production MemoryService")
         captured_checkpointers.append(checkpointer)
-        graph = create_chat_runtime(checkpointer=checkpointer)
+        captured_memory_services.append(memory_service)
+        graph = create_chat_runtime(
+            checkpointer=checkpointer,
+            memory_service=memory_service,
+        )
         captured_graphs.append(graph)
         return graph
 
     first_resources: ApplicationResources | None = None
     first_service: ChatService | None = None
     first_graph: ChatGraph | None = None
+    first_memory_service: MemoryService | None = None
     first_pending_tool_call_id: str | None = None
 
     async with asyncio.timeout(TOTAL_TIMEOUT_SECONDS):
@@ -236,6 +258,8 @@ async def _exercise_recovery(database: str) -> dict[str, bool | float | str]:
             async with lifespan(first_app, config=_runtime_settings(database)):
                 first_resources = get_application_resources(first_app)
                 first_service = get_application_chat_service(first_app)
+                first_memory_service = get_application_memory_service(first_app)
+                first_submitter = get_application_background_task_submitter(first_app)
                 if len(captured_graphs) != 1:
                     raise RuntimeError("lifespan A 必须恰好构建一个 Chat 图")
                 first_graph = captured_graphs[0]
@@ -244,12 +268,19 @@ async def _exercise_recovery(database: str) -> dict[str, bool | float | str]:
                 # 先写入真实业务所有权，后续 ChatService 才有资格读取或写入
                 # LangGraph checkpoint。第二代 lifespan 会复用这些持久化行。
                 async with first_resources.orm_session_factory() as session:
-                    session.add(
-                        User(
-                            id=user_id,
-                            email=f"recovery-{uuid4().hex}@example.com",
-                            password_hash="smoke-only-not-a-real-credential",
-                        )
+                    session.add_all(
+                        [
+                            User(
+                                id=user_id,
+                                email=f"recovery-owner-{uuid4().hex}@example.com",
+                                password_hash="smoke-only-not-a-real-credential",
+                            ),
+                            User(
+                                id=outsider_user_id,
+                                email=f"recovery-outsider-{uuid4().hex}@example.com",
+                                password_hash="smoke-only-not-a-real-credential",
+                            ),
+                        ]
                     )
 
                     # User 与 ChatSession 之间只有数据库 foreign key，没有配置 ORM
@@ -352,11 +383,14 @@ async def _exercise_recovery(database: str) -> dict[str, bool | float | str]:
                 first_app.state,
                 "resources",
             ) and not hasattr(first_app.state, "chat_service")
+            first_background_tasks_closed = not first_submitter.accepting and first_submitter.active_count == 0
 
             second_app = FastAPI()
             async with lifespan(second_app, config=_runtime_settings(database)):
                 second_resources = get_application_resources(second_app)
                 second_service = get_application_chat_service(second_app)
+                second_memory_service = get_application_memory_service(second_app)
+                second_submitter = get_application_background_task_submitter(second_app)
                 if len(captured_graphs) != 2:
                     raise RuntimeError("lifespan B 必须构建一个新的 Chat 图")
                 second_graph = captured_graphs[1]
@@ -367,9 +401,13 @@ async def _exercise_recovery(database: str) -> dict[str, bool | float | str]:
                     and second_resources.checkpointer is not first_resources.checkpointer
                     and second_service is not first_service
                     and second_graph is not first_graph
+                    and second_memory_service is not first_memory_service
                     and len(captured_checkpointers) == 2
+                    and len(captured_memory_services) == 2
                     and captured_checkpointers[0] is first_resources.checkpointer
                     and captured_checkpointers[1] is second_resources.checkpointer
+                    and captured_memory_services[0] is first_memory_service
+                    and captured_memory_services[1] is second_memory_service
                     and second_graph.checkpointer is second_resources.checkpointer
                 )
 
@@ -396,6 +434,43 @@ async def _exercise_recovery(database: str) -> dict[str, bool | float | str]:
                     and hitl_snapshot_before_b.next == ("tools",)
                     and len(hitl_interrupts_before_b) == 1
                 )
+
+                # public_thread_id 只是客户端可见的资源标识，不是访问凭据。错误用户
+                # 使用相同公开 UUID 时，ChatService 会构造另一个内部 checkpoint key：
+                #
+                # owner:    user:<owner>:thread:<public UUID>
+                # outsider: user:<outsider>:thread:<same public UUID>
+                #
+                # 因此直接读取 outsider key 得到空状态；正式 resume 还会再次执行
+                # owner-scoped SQL，并在 Graph/Command(resume=...) 之前拒绝访问。
+                outsider_hitl_config = ChatService._build_config(
+                    user_id=outsider_user_id,
+                    public_thread_id=hitl_thread_id,
+                )
+                outsider_snapshot = await second_graph.aget_state(outsider_hitl_config)
+                outsider_checkpoint_is_empty = (
+                    not outsider_snapshot.values and not outsider_snapshot.next and not outsider_snapshot.tasks
+                )
+
+                with patch.object(
+                    second_graph,
+                    "ainvoke",
+                    wraps=second_graph.ainvoke,
+                ) as ainvoke_spy:
+                    try:
+                        await second_service.resume_turn(
+                            ChatResumeRequest(
+                                thread_id=hitl_thread_id,
+                                response=HUMAN_RESPONSE,
+                            ),
+                            user_id=outsider_user_id,
+                        )
+                    except ChatSessionNotFoundError:
+                        outsider_resume_rejected = True
+                    else:
+                        outsider_resume_rejected = False
+
+                outsider_rejected_before_graph = outsider_resume_rejected and ainvoke_spy.await_count == 0
 
                 recovered_memory_result = await second_service.run_turn(
                     ChatRequest(
@@ -454,6 +529,7 @@ async def _exercise_recovery(database: str) -> dict[str, bool | float | str]:
                 second_app.state,
                 "resources",
             ) and not hasattr(second_app.state, "chat_service")
+            second_background_tasks_closed = not second_submitter.accepting and second_submitter.active_count == 0
 
     elapsed_ms = _elapsed_ms(started_at)
     return {
@@ -464,14 +540,18 @@ async def _exercise_recovery(database: str) -> dict[str, bool | float | str]:
         "hitl_checkpoint_is_paused": hitl_checkpoint_is_paused,
         "first_pool_closed_before_rebuild": first_pool_closed_before_rebuild,
         "first_state_removed_before_rebuild": first_state_removed_before_rebuild,
+        "first_background_tasks_closed": first_background_tasks_closed,
         "runtime_objects_were_rebuilt": runtime_objects_were_rebuilt,
         "ordinary_state_visible_before_provider": ordinary_state_visible_before_provider,
         "interrupt_visible_before_resume": interrupt_visible_before_resume,
+        "outsider_checkpoint_is_empty": outsider_checkpoint_is_empty,
+        "outsider_rejected_before_graph": outsider_rejected_before_graph,
         "ordinary_history_recovered": ordinary_history_recovered,
         "hitl_service_completed": hitl_service_completed,
         "hitl_message_chain_recovered": hitl_message_chain_recovered,
         "second_pool_closed_after_shutdown": second_pool_closed_after_shutdown,
         "second_state_removed_after_shutdown": second_state_removed_after_shutdown,
+        "second_background_tasks_closed": second_background_tasks_closed,
         "within_total_budget": elapsed_ms <= TOTAL_TIMEOUT_SECONDS * 1000,
         "elapsed_ms": elapsed_ms,
     }
@@ -489,7 +569,7 @@ def _run_smoke() -> dict[str, object]:
     """
     started_at = perf_counter()
     admin_database = settings.POSTGRES_DB
-    test_database = f"deep_research_chat_recovery_{uuid4().hex[:10]}"
+    test_database = f"{TEMPORARY_DATABASE_PREFIX}{uuid4().hex[:10]}"
     previous_override = os.environ.get("ALEMBIC_DATABASE_URL")
     database_created = False
     cleanup_ok = False
