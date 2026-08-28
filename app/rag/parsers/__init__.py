@@ -10,14 +10,22 @@ from app.rag.parsers.contracts import (
     ParsedDocument,
     SourceLocation,
 )
+from app.rag.parsers.docx import DocxParser
+from app.rag.parsers.markdown import MarkdownParser
+from app.rag.parsers.pdf import PdfParser
+from app.rag.parsers.registry import ParserRegistry
 
 __all__ = [
     "DocumentParseError",
     "DocumentParser",
+    "DocxParser",
+    "MarkdownParser",
     "ParseErrorCode",
     "ParseRequest",
     "ParsedBlock",
     "ParsedBlockKind",
     "ParsedDocument",
+    "ParserRegistry",
+    "PdfParser",
     "SourceLocation",
 ]

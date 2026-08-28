@@ -27,6 +27,10 @@ dependencies = [
     "pgvector>=0.4.0",
     "rank-bm25>=0.2.2",
     "sentence-transformers>=3.4.0",
+    # ---- 文档解析与确定性分词 ----
+    "pypdf>=6.0.0",
+    "python-docx>=1.2.0",
+    "tiktoken>=0.9.0",
     # ---- 认证 ----
     "python-jose[cryptography]>=3.4.0",
     "pwdlib[argon2]>=0.3.0",

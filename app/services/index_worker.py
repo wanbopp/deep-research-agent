@@ -22,6 +22,7 @@ class IndexSource:
     user_id: UUID
     original_filename: str
     content_type: str
+    content_sha256: str
     content: bytes
 
 
@@ -117,6 +118,7 @@ class IndexWorker:
                     document.user_id,
                     document.original_filename,
                     document.content_type,
+                    document.content_sha256,
                 )
 
         if claim_token is None:
@@ -131,6 +133,7 @@ class IndexWorker:
                 user_id=source_metadata[1],
                 original_filename=source_metadata[2],
                 content_type=source_metadata[3],
+                content_sha256=source_metadata[4],
                 content=content,
             )
             await self._processor.process(source)
