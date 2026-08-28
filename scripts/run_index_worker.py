@@ -5,7 +5,10 @@ import json
 import selectors
 from uuid import uuid4
 
+from neo4j import AsyncGraphDatabase
+
 from app.core.config import settings
+from app.graphrag.runtime import create_graphrag_runtime
 from app.infrastructure.database import create_orm_runtime
 from app.infrastructure.file_storage import LocalFileStorage
 from app.rag.runtime import create_rag_runtime
@@ -20,12 +23,22 @@ async def run_until_idle() -> dict[str, object]:
     接入；当前可由运维调度器重复启动。
     """
     engine, sessions = create_orm_runtime(settings)
+    neo4j_driver = AsyncGraphDatabase.driver(
+        settings.NEO4J_URI,
+        auth=(settings.NEO4J_USER, settings.NEO4J_PASSWORD),
+    )
+    graphrag_runtime = create_graphrag_runtime(
+        config=settings,
+        neo4j_driver=neo4j_driver,
+    )
+    await graphrag_runtime.repository.setup_schema()
     worker_id = f"manual-{uuid4().hex[:12]}"
     worker, _ = create_rag_runtime(
         config=settings,
         session_factory=sessions,
         storage=LocalFileStorage(settings.KNOWLEDGE_STORAGE_ROOT),
         worker_id=worker_id,
+        graphrag_runtime=graphrag_runtime,
     )
     completed = failed = stale = 0
     try:
@@ -40,6 +53,7 @@ async def run_until_idle() -> dict[str, object]:
             else:
                 stale += 1
     finally:
+        await neo4j_driver.close()
         await engine.dispose()
     return {"ok": failed == 0, "completed": completed, "failed": failed, "stale": stale}
 

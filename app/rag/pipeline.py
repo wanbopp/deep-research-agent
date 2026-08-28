@@ -18,11 +18,21 @@ class ChunkSink(Protocol):
 class DocumentIndexProcessor:
     """串联解析、分块和持久化，不承担 worker 租约或状态收敛."""
 
-    def __init__(self, *, registry: ParserRegistry, chunker: TokenAwareChunker, sink: ChunkSink) -> None:
+    def __init__(
+        self,
+        *,
+        registry: ParserRegistry,
+        chunker: TokenAwareChunker,
+        sink: ChunkSink,
+        graph_sink: ChunkSink | None = None,
+    ) -> None:
         """注入三个可独立测试和替换的管线阶段."""
         self._registry = registry
         self._chunker = chunker
         self._sink = sink
+        # graph_sink 是可选派生阶段。Phase 5 单元测试无需 Neo4j；正式 worker 在
+        # Phase 6 注入 GraphIndexSink，使同一个 IndexJob 覆盖 vector + graph。
+        self._graph_sink = graph_sink
 
     async def process(self, source: IndexSource) -> None:
         """把 worker 的可信原始文件输入转换为可检索 chunks."""
@@ -41,6 +51,8 @@ class DocumentIndexProcessor:
                 document=parsed,
             )
             await self._sink.replace(source=source, chunks=chunks)
+            if self._graph_sink is not None:
+                await self._graph_sink.replace(source=source, chunks=chunks)
         except DocumentParseError as error:
             # IndexWorker 只认识稳定 IndexProcessingError；这里是解析领域到任务领域
             # 的翻译点，不携带第三方异常或文档正文。

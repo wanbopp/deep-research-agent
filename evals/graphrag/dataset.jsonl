@@ -1,0 +1,6 @@
+{"id":"local-relationship-001","category":"local","query":"How is Orion Labs connected to the Nova Engine?","expected_route":"graph_local","required_terms":["Orion Labs","Nova Engine"]}
+{"id":"local-relationship-002","category":"local","query":"What relationship links Mira Chen and the Evidence Protocol?","expected_route":"graph_local","required_terms":["Mira Chen","Evidence Protocol"]}
+{"id":"global-theme-001","category":"global","query":"What overall system connects Orion Labs, GraphStore, and the Evidence Protocol?","expected_route":"graph_global","required_terms":["Orion Labs","GraphStore","Evidence Protocol"]}
+{"id":"global-theme-002","category":"global","query":"Summarize the main technical ecosystem represented across the documents.","expected_route":"graph_global","required_terms":["Nova Engine","GraphStore"]}
+{"id":"plain-fact-001","category":"plain_fact","query":"Who works for Orion Labs?","expected_route":"hybrid","required_terms":["Mira Chen"]}
+{"id":"plain-fact-002","category":"plain_fact","query":"Where is GraphStore located?","expected_route":"hybrid","required_terms":["Atlas Cloud"]}

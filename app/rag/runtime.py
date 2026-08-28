@@ -3,6 +3,8 @@
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.core.config import Settings
+from app.graphrag.pipeline import GraphIndexSink
+from app.graphrag.runtime import GraphRAGRuntime
 from app.infrastructure.embeddings import OpenAITextEmbedder
 from app.rag.bm25_store import BM25Retriever
 from app.rag.chunker import TokenAwareChunker
@@ -21,6 +23,7 @@ def create_rag_runtime(
     session_factory: async_sessionmaker[AsyncSession],
     storage: FileStorage,
     worker_id: str,
+    graphrag_runtime: GraphRAGRuntime | None = None,
 ) -> tuple[IndexWorker, HybridRetriever]:
     """创建共享 chunk store、索引 worker 与 Hybrid Retriever.
 
@@ -29,6 +32,8 @@ def create_rag_runtime(
         session_factory: lifespan 或 worker 进程拥有的 ORM Session 工厂。
         storage: 原始文档 FileStorage adapter。
         worker_id: 当前索引 worker 实例的非空内部标识。
+        graphrag_runtime: 可选 Phase 6 runtime。传入后，同一 IndexJob 会在向量
+            写入后继续完成真实图抽取；None 只运行 Phase 5 管线。
 
     Returns:
         可轮询 pending job 的 worker，以及供 API/Agent 后续注入的 retriever。
@@ -51,6 +56,7 @@ def create_rag_runtime(
             chunk_overlap=config.RAG_CHUNK_OVERLAP,
         ),
         sink=chunk_store,
+        graph_sink=GraphIndexSink(graphrag_runtime) if graphrag_runtime is not None else None,
     )
     worker = IndexWorker(
         session_factory=session_factory,

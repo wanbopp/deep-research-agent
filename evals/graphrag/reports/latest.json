@@ -1,0 +1,19 @@
+{
+  "generated_at": "2026-08-28",
+  "dataset_version": "phase6-v1",
+  "real_provider": true,
+  "real_neo4j": true,
+  "document_count": 10,
+  "entity_count": 10,
+  "fact_count": 10,
+  "community_count": 2,
+  "local_path_count": 18,
+  "idempotent_write": true,
+  "citation_grounding": true,
+  "owner_isolation": true,
+  "route_boundary": {
+    "graph_local": "实体关系、邻域和路径问题",
+    "graph_global": "跨文档主题与社区聚合问题",
+    "hybrid": "普通事实和实体未链接时的默认路径"
+  }
+}

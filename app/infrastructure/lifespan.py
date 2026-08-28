@@ -11,6 +11,7 @@ from pydantic import SecretStr
 from app.agents.chat.runtime import create_chat_runtime
 from app.core.config import Settings, settings
 from app.core.logging import logger
+from app.graphrag.runtime import GraphRAGRuntime, create_graphrag_runtime
 from app.infrastructure.background_tasks import AsyncioBackgroundTaskSubmitter
 from app.infrastructure.chat_session_ownership import (
     PostgresChatSessionOwnershipVerifier,
@@ -173,6 +174,19 @@ def get_application_resources(app: FastAPI) -> ApplicationResources:
     except AttributeError as exc:
         raise RuntimeError("Application resources are not initialized") from exc
     return cast(ApplicationResources, resources)  # 不做任何转换 声明返回值是 ApplicationResources
+
+
+def get_application_graphrag_runtime(app: FastAPI) -> GraphRAGRuntime:
+    """读取 lifespan 创建的共享 GraphRAG runtime.
+
+    runtime 只保存无请求状态组件和共享 driver 引用。当前 user_id、query、chunk
+    与检索结果都必须由每次调用显式传入，不能写进 app.state 的共享对象。
+    """
+    try:
+        runtime = app.state.graphrag_runtime
+    except AttributeError as exc:
+        raise RuntimeError("GraphRAG runtime is not initialized") from exc
+    return cast(GraphRAGRuntime, runtime)
 
 
 def get_application_file_storage(app: FastAPI) -> FileStorage:
@@ -465,6 +479,23 @@ async def lifespan(
             generation_ttl_seconds=config.MEMORY_CACHE_GENERATION_TTL_SECONDS,
         )
 
+        # GraphRAG runtime 与 MemoryService 一样只组合无请求状态组件。Neo4j 是
+        # optional dependency：健康时在 startup 幂等创建固定 schema；不健康时
+        # 仍发布 runtime，但实际图调用会明确失败，普通 Chat/Hybrid RAG 可继续。
+        graphrag_runtime = create_graphrag_runtime(
+            config=config,
+            neo4j_driver=resources.neo4j_driver,
+        )
+        neo4j_is_healthy = any(result.name is DependencyName.NEO4J and result.is_healthy for result in results)
+        if neo4j_is_healthy:
+            try:
+                await graphrag_runtime.repository.setup_schema()
+            except Exception as error:
+                logger.warning(
+                    "graphrag_schema_setup_failed",
+                    error_type=type(error).__name__,
+                )
+
         # 记忆写入链也在 startup 组合一次，但不绑定当前用户或会话：
         # - extractor 只把对话转换成不含身份的 content/kind 候选；
         # - writer 在每次 submit_turn() 中接收可信 user_id/source_thread_id；
@@ -557,6 +588,7 @@ async def lifespan(
         app.state.rate_limiter = rate_limiter
         app.state.rate_limit_policies = rate_limit_policies
         app.state.memory_service = memory_service
+        app.state.graphrag_runtime = graphrag_runtime
         app.state.background_task_submitter = background_task_submitter
         app.state.chat_memory_writer = chat_memory_writer
         app.state.chat_title_writer = chat_title_writer
@@ -591,6 +623,7 @@ async def lifespan(
             # MemoryService 没有 close 方法，因为 Redis client 和 ORM engine 的唯一
             # 所有者仍是 ApplicationResources，随后由 AsyncExitStack 统一关闭。
             del app.state.memory_service
+            del app.state.graphrag_runtime
             del app.state.file_storage
             del app.state.rate_limit_policies
             del app.state.rate_limiter
