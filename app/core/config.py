@@ -268,6 +268,19 @@ class Settings:
         if self.KNOWLEDGE_INDEX_LEASE_SECONDS <= 0:
             raise ValueError("KNOWLEDGE_INDEX_LEASE_SECONDS must be greater than 0")
 
+        # ---- RAG 解析、分块与向量版本 ----
+        # 这些值会改变 chunk 边界或向量兼容性，因此必须进入确定性 ID/数据库
+        # metadata。生产环境修改后应重新索引，不应把新旧版本静默混在同一查询中。
+        self.RAG_CHUNK_SIZE = int(os.getenv("RAG_CHUNK_SIZE", "500"))
+        self.RAG_CHUNK_OVERLAP = int(os.getenv("RAG_CHUNK_OVERLAP", "80"))
+        self.RAG_EMBEDDING_VERSION = os.getenv("RAG_EMBEDDING_VERSION", "v1").strip()
+        if self.RAG_CHUNK_SIZE <= 0:
+            raise ValueError("RAG_CHUNK_SIZE must be greater than 0")
+        if self.RAG_CHUNK_OVERLAP < 0 or self.RAG_CHUNK_OVERLAP >= self.RAG_CHUNK_SIZE:
+            raise ValueError("RAG_CHUNK_OVERLAP must be between zero and RAG_CHUNK_SIZE")
+        if not self.RAG_EMBEDDING_VERSION:
+            raise ValueError("RAG_EMBEDDING_VERSION must not be empty")
+
         # ---- JWT 认证 ----
         # Secret 不提供可工作的默认值：示例 secret 一旦被误带到部署环境，攻击者
         # 就能自行签发任意身份 token。TokenService 还会执行长度与已知弱值检查。

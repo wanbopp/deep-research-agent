@@ -13,6 +13,7 @@ from app.rag.parsers.contracts import (
 from app.rag.parsers.docx import DocxParser
 from app.rag.parsers.markdown import MarkdownParser
 from app.rag.parsers.pdf import PdfParser
+from app.rag.parsers.plain_text import PlainTextParser
 from app.rag.parsers.registry import ParserRegistry
 
 __all__ = [
@@ -27,5 +28,6 @@ __all__ = [
     "ParsedDocument",
     "ParserRegistry",
     "PdfParser",
+    "PlainTextParser",
     "SourceLocation",
 ]
