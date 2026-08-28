@@ -43,6 +43,7 @@ MANAGED_TABLES = frozenset(
         "users",
         "chat_sessions",
         "documents",
+        "document_chunks",
         "index_jobs",
         "memories",
         "research_tasks",

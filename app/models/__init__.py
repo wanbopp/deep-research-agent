@@ -14,6 +14,7 @@ from app.models.chat_session import (
     ChatSessionStatus,
 )
 from app.models.document import Document, DocumentStatus
+from app.models.document_chunk import DOCUMENT_EMBEDDING_DIMENSIONS, DocumentChunk
 from app.models.index_job import IndexJob, IndexJobStatus
 from app.models.memory import MEMORY_EMBEDDING_DIMENSIONS, Memory
 from app.models.research_task import ResearchTask, ResearchTaskStatus
@@ -24,6 +25,8 @@ __all__ = [
     "ChatSessionStatus",
     "DEFAULT_CHAT_SESSION_TITLE",
     "Document",
+    "DocumentChunk",
+    "DOCUMENT_EMBEDDING_DIMENSIONS",
     "DocumentStatus",
     "IndexJob",
     "IndexJobStatus",
