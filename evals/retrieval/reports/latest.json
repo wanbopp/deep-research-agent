@@ -1,0 +1,32 @@
+{
+  "generated_at": "2026-08-28T10:48:47.072895+00:00",
+  "code_revision": "7ecad9b237799b8dc2c4b118dffdd630f55c77ba",
+  "dataset_sha256": "856382c87d645371b5a24fc83878ccafc3431758b008fcb86c7abd664ec055e7",
+  "k": 3,
+  "configurations": {
+    "vector": {
+      "recall_at_k": 1.0,
+      "mrr": 0.666667,
+      "ndcg_at_k": 0.753953,
+      "query_count": 3
+    },
+    "bm25": {
+      "recall_at_k": 1.0,
+      "mrr": 0.666667,
+      "ndcg_at_k": 0.753953,
+      "query_count": 3
+    },
+    "hybrid": {
+      "recall_at_k": 1.0,
+      "mrr": 1.0,
+      "ndcg_at_k": 1.0,
+      "query_count": 3
+    },
+    "hybrid_rerank": {
+      "recall_at_k": 1.0,
+      "mrr": 1.0,
+      "ndcg_at_k": 1.0,
+      "query_count": 3
+    }
+  }
+}
