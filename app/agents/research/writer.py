@@ -80,11 +80,18 @@ class ResearchWriter:
 
         evidence = tuple(Evidence.model_validate(item) for item in state["evidence"])
         evidence_by_id = {item.evidence_id: item for item in evidence}
+        # 事实与冲突结论引用的证据都必须分配引用编号：冲突可能引用没有任何事实
+        # 使用的证据，遗漏它们会让下方查表抛出 KeyError 并使整个任务失败。
         used_evidence_ids = tuple(
             dict.fromkeys(
-                evidence_id
-                for fact in validation.facts
-                for evidence_id in (*fact.supporting_evidence_ids, *fact.contradicting_evidence_ids)
+                [
+                    *[
+                        evidence_id
+                        for fact in validation.facts
+                        for evidence_id in (*fact.supporting_evidence_ids, *fact.contradicting_evidence_ids)
+                    ],
+                    *[evidence_id for conflict in validation.conflicts for evidence_id in conflict.evidence_ids],
+                ]
             )
         )
         citation_id_by_evidence = {
