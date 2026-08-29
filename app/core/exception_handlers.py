@@ -34,6 +34,44 @@ from app.services.rate_limit import (
     RateLimitExceededError,
     RateLimitIdentityUnavailableError,
 )
+from app.services.research import (
+    ResearchServiceError,
+    ResearchTaskConflictError,
+    ResearchTaskNotFoundError,
+    ResearchTaskNotRetryableError,
+)
+
+
+async def research_exception_handler(request: Request, exc: ResearchServiceError) -> JSONResponse:
+    """把研究任务业务错误转换为不泄漏所有权和内部状态的响应."""
+    if isinstance(exc, ResearchTaskNotFoundError):
+        status_code, code, message = status.HTTP_404_NOT_FOUND, "RESEARCH_NOT_FOUND", "Research task not found"
+    elif isinstance(exc, ResearchTaskNotRetryableError):
+        status_code, code, message = (
+            status.HTTP_409_CONFLICT,
+            "RESEARCH_NOT_RETRYABLE",
+            "Research task cannot be retried in its current state",
+        )
+    elif isinstance(exc, ResearchTaskConflictError):
+        status_code, code, message = (
+            status.HTTP_409_CONFLICT,
+            "RESEARCH_CONFLICT",
+            "Research request conflicts with the current task state",
+        )
+    else:
+        status_code, code, message = (
+            status.HTTP_500_INTERNAL_SERVER_ERROR,
+            "INTERNAL_SERVER_ERROR",
+            "Internal server error",
+        )
+    logger.warning(
+        "research_request_failed",
+        method=request.method,
+        path=request.url.path,
+        error_type=type(exc).__name__,
+        status_code=status_code,
+    )
+    return JSONResponse(status_code=status_code, content=build_error_content(code=code, message=message))
 
 
 def get_request_id() -> str | None:
@@ -455,6 +493,11 @@ def register_exception_handlers(app: FastAPI) -> None:
     app.add_exception_handler(
         KnowledgeServiceError,
         cast(HTTPExceptionHandler, knowledge_exception_handler),
+    )
+
+    app.add_exception_handler(
+        ResearchServiceError,
+        cast(HTTPExceptionHandler, research_exception_handler),
     )
 
     app.add_exception_handler(

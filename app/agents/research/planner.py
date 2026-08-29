@@ -7,7 +7,7 @@ from app.agents.prompts.loader import render_prompt
 from app.agents.research.context import ResearchRuntimeContext
 from app.agents.research.state import ResearchState, ResearchStateUpdate
 from app.core.logging import logger
-from app.schemas.research import ResearchPlan, ResearchStatus
+from app.schemas.research import ResearchConfig, ResearchPlan, ResearchStatus
 from app.services.llm.service import LLMService
 
 
@@ -37,7 +37,9 @@ class ResearchPlanner:
         runtime.context.user_id 仅用于安全日志关联和下游授权，不进入 prompt。
         Planner 看到的是研究主题和服务端预算，不能看到连接对象或认证凭据。
         """
-        config = state["config"]
+        # Checkpoint 保存普通字典；节点入口负责恢复和校验业务模型。这样即使任务
+        # 在另一进程恢复，也不会依赖原进程中的 Python 对象身份。
+        config = ResearchConfig.model_validate(state["config"])
         prompt = render_prompt(
             "research_plan",
             topic=state["topic"],
@@ -70,7 +72,10 @@ class ResearchPlanner:
             step_count=len(plan.steps),
             needs_clarification=bool(plan.clarification_question),
         )
-        return {"plan": plan, "status": next_status}
+        return {
+            "plan": plan.model_dump(mode="json"),
+            "status": next_status.value,
+        }
 
 
 __all__ = ["ResearchPlanner"]

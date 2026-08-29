@@ -9,6 +9,7 @@ from app.api.v1.chat import router as chat_router
 from app.api.v1.chat_sessions import router as chat_sessions_router
 from app.api.v1.health import router as health_router
 from app.api.v1.knowledge import router as knowledge_router
+from app.api.v1.research import router as research_router
 from app.schemas.base import ErrorResponse
 
 # 这里 OPENAPI 元数据，不负责处理真正的异常
@@ -41,3 +42,5 @@ api_router.include_router(chat_sessions_router)
 api_router.include_router(auth_router)
 
 api_router.include_router(knowledge_router)
+
+api_router.include_router(research_router)

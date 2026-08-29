@@ -38,6 +38,7 @@ ALEMBIC_MANAGED_TABLES = frozenset(
         "index_jobs",
         "memories",
         "research_tasks",
+        "research_events",
     }
 )
 

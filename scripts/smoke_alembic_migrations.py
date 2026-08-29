@@ -37,7 +37,7 @@ from app.infrastructure.database import build_orm_database_url
 # 从 PowerShell、PyCharm 或其他工作目录启动脚本时都能找到同一个配置文件。
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
-# Alembic 只拥有这六张业务表。集合精确比较可以同时发现“少创建”和“误创建”。
+# Alembic 只拥有这些业务表。集合精确比较可以同时发现“少创建”和“误创建”。
 MANAGED_TABLES = frozenset(
     {
         "users",
@@ -47,6 +47,7 @@ MANAGED_TABLES = frozenset(
         "index_jobs",
         "memories",
         "research_tasks",
+        "research_events",
     }
 )
 # checkpoints 代表未来由 LangGraph checkpointer 自己管理的外部表。Alembic 的

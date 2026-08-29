@@ -41,6 +41,7 @@ from app.services.rate_limit import (
     RateLimitPolicies,
     enforce_rate_limit,
 )
+from app.services.research import ResearchService
 
 
 # 当前 /auth/login 接收 JSON，并不是 OAuth2 Password Flow 规定的 form token
@@ -205,6 +206,17 @@ def get_knowledge_service(
         read_chunk_bytes=settings.KNOWLEDGE_UPLOAD_READ_CHUNK_BYTES,
         index_max_attempts=settings.KNOWLEDGE_INDEX_MAX_ATTEMPTS,
     )
+
+
+def get_research_service(
+    session: Annotated[AsyncSession, Depends(get_db_session)],
+) -> ResearchService:
+    """为一次 HTTP 请求创建研究任务应用服务.
+
+    Session 只用于任务、事件和所有权的短事务；真正的长时间研究由独立 worker
+    从数据库领取，绝不能在 API 请求的 Session 或 BackgroundTasks 中执行。
+    """
+    return ResearchService(session)
 
 
 @lru_cache(maxsize=1)

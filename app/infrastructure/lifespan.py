@@ -9,6 +9,8 @@ from fastapi import FastAPI
 from pydantic import SecretStr
 
 from app.agents.chat.runtime import create_chat_runtime
+from app.agents.research.graph import ResearchGraph
+from app.agents.research.runtime import create_research_runtime
 from app.core.config import Settings, settings
 from app.core.logging import logger
 from app.graphrag.runtime import GraphRAGRuntime, create_graphrag_runtime
@@ -28,6 +30,7 @@ from app.infrastructure.probes import DependencyName, DependencyProbeResult
 from app.infrastructure.rate_limit import RedisRateLimiter
 from app.infrastructure.redis import probe_redis
 from app.infrastructure.resources import ApplicationResources
+from app.rag.runtime import create_rag_runtime
 from app.schemas.llm import ModelSpec
 from app.services.chat import ChatService
 from app.services.cache import Cache
@@ -187,6 +190,15 @@ def get_application_graphrag_runtime(app: FastAPI) -> GraphRAGRuntime:
     except AttributeError as exc:
         raise RuntimeError("GraphRAG runtime is not initialized") from exc
     return cast(GraphRAGRuntime, runtime)
+
+
+def get_application_research_graph(app: FastAPI) -> ResearchGraph:
+    """读取 startup 编译并与 PostgreSQL checkpointer 连接的研究图."""
+    try:
+        graph = app.state.research_graph
+    except AttributeError as exc:
+        raise RuntimeError("Research graph is not initialized") from exc
+    return cast(ResearchGraph, graph)
 
 
 def get_application_file_storage(app: FastAPI) -> FileStorage:
@@ -496,6 +508,23 @@ async def lifespan(
                     error_type=type(error).__name__,
                 )
 
+        # Phase 5 runtime 在这里主要提供 Hybrid Retriever；索引 worker 仍由独立
+        # run_index_worker.py 进程运行。随后把 Hybrid、GraphRAG 和同一个持久
+        # checkpointer 装配成共享研究图，任何请求都不会重复编译节点拓扑。
+        _, hybrid_retriever = create_rag_runtime(
+            config=config,
+            session_factory=resources.orm_session_factory,
+            storage=file_storage,
+            worker_id="api-unused-index-worker",
+            graphrag_runtime=graphrag_runtime,
+        )
+        research_graph = create_research_runtime(
+            config=config,
+            hybrid_retriever=hybrid_retriever,
+            graphrag_runtime=graphrag_runtime,
+            checkpointer=resources.checkpointer,
+        )
+
         # 记忆写入链也在 startup 组合一次，但不绑定当前用户或会话：
         # - extractor 只把对话转换成不含身份的 content/kind 候选；
         # - writer 在每次 submit_turn() 中接收可信 user_id/source_thread_id；
@@ -589,6 +618,7 @@ async def lifespan(
         app.state.rate_limit_policies = rate_limit_policies
         app.state.memory_service = memory_service
         app.state.graphrag_runtime = graphrag_runtime
+        app.state.research_graph = research_graph
         app.state.background_task_submitter = background_task_submitter
         app.state.chat_memory_writer = chat_memory_writer
         app.state.chat_title_writer = chat_title_writer
@@ -623,6 +653,7 @@ async def lifespan(
             # MemoryService 没有 close 方法，因为 Redis client 和 ORM engine 的唯一
             # 所有者仍是 ApplicationResources，随后由 AsyncExitStack 统一关闭。
             del app.state.memory_service
+            del app.state.research_graph
             del app.state.graphrag_runtime
             del app.state.file_storage
             del app.state.rate_limit_policies

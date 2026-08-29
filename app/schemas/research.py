@@ -235,6 +235,46 @@ class ResearchReport(_StrictResearchModel):
     citations: tuple[Citation, ...] = ()
 
 
+class ResearchCreateRequest(_StrictResearchModel):
+    """创建持久研究任务的公开请求."""
+
+    topic: str = Field(min_length=3, max_length=1000)
+    config: ResearchConfig = ResearchConfig()
+    chat_session_id: UUID | None = None
+
+
+class ResearchTaskResponse(_StrictResearchModel):
+    """不暴露 worker、心跳和内部 checkpoint key 的任务视图."""
+
+    research_id: UUID
+    topic: str
+    status: str
+    config: ResearchConfig
+    attempt_count: int
+    max_attempts: int
+    error_code: str | None
+    report: ResearchReport | None
+    markdown_report: str | None
+    created_at: datetime
+    updated_at: datetime
+    completed_at: datetime | None
+
+
+class ResearchTaskListResponse(_StrictResearchModel):
+    """当前用户研究任务列表."""
+
+    tasks: tuple[ResearchTaskResponse, ...]
+
+
+class ResearchEventResponse(_StrictResearchModel):
+    """可以编码为 SSE 的持久进度事件."""
+
+    event_id: int = Field(ge=1)
+    event: str = Field(min_length=1, max_length=64)
+    payload: dict[str, object]
+    created_at: datetime
+
+
 __all__ = [
     "Citation",
     "Conflict",
@@ -243,10 +283,14 @@ __all__ = [
     "MissingEvidenceRequest",
     "ReportSection",
     "ResearchConfig",
+    "ResearchCreateRequest",
+    "ResearchEventResponse",
     "ResearchPlan",
     "ResearchReport",
     "ResearchStatus",
     "ResearchStep",
+    "ResearchTaskListResponse",
+    "ResearchTaskResponse",
     "RouteDecision",
     "RetrievalFailure",
     "RetrievalStrategy",

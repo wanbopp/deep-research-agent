@@ -7,7 +7,14 @@ from langgraph.runtime import Runtime
 from app.agents.research.context import ResearchRuntimeContext
 from app.agents.research.state import ResearchState, ResearchStateUpdate
 from app.core.logging import logger
-from app.schemas.research import Citation, Evidence, ReportSection, ResearchReport, ResearchStatus
+from app.schemas.research import (
+    Citation,
+    Evidence,
+    ReportSection,
+    ResearchReport,
+    ResearchStatus,
+    ValidationResult,
+)
 from app.services.llm.service import LLMService
 
 
@@ -39,11 +46,40 @@ class ResearchWriter:
         runtime: Runtime[ResearchRuntimeContext],
     ) -> ResearchStateUpdate:
         """生成报告草稿，校验引用，并附加服务端构造的来源表."""
-        validation = state.get("validation")
-        if validation is None or not validation.facts:
-            raise ValueError("report writing requires validated facts")
+        validation_data = state.get("validation")
+        if validation_data is None:
+            raise ValueError("report writing requires a validation result")
+        validation = ValidationResult.model_validate(validation_data)
 
-        evidence_by_id = {item.evidence_id: item for item in state["evidence"]}
+        if not validation.facts:
+            # 没有足够证据也要形成可查询结果，而不是把“不知道”伪装成系统异常。
+            # 这里不用模型扩写，避免在无事实输入时诱发看似完整的编造报告。
+            report = ResearchReport(
+                title=f"受限研究结果：{state['topic'][:200]}",
+                executive_summary=validation.summary,
+                sections=(
+                    ReportSection(
+                        heading="当前结论",
+                        body="现有资料不足以形成可靠结论。",
+                    ),
+                ),
+                limitations=tuple(
+                    dict.fromkeys(
+                        [
+                            state.get("stop_reason", "证据不足"),
+                            *[item.objective for item in validation.missing],
+                            *[item.description for item in validation.conflicts],
+                        ]
+                    )
+                ),
+            )
+            return {
+                "report": report.model_dump(mode="json"),
+                "status": ResearchStatus.COMPLETED.value,
+            }
+
+        evidence = tuple(Evidence.model_validate(item) for item in state["evidence"])
+        evidence_by_id = {item.evidence_id: item for item in evidence}
         used_evidence_ids = tuple(
             dict.fromkeys(
                 evidence_id
@@ -119,7 +155,10 @@ class ResearchWriter:
             section_count=len(report.sections),
             citation_count=len(report.citations),
         )
-        return {"report": report, "status": ResearchStatus.COMPLETED}
+        return {
+            "report": report.model_dump(mode="json"),
+            "status": ResearchStatus.COMPLETED.value,
+        }
 
     @staticmethod
     def _make_citation(*, citation_id: str, evidence: Evidence) -> Citation:

@@ -61,6 +61,9 @@ def create_application_resources(config: Settings) -> ApplicationResources:
     # AsyncPostgresSaver 构造时会记录当前运行中的 event loop，但不会连接数据库
     # 或创建表。create_application_resources 因而必须由 async lifespan 调用，
     # 不能放在模块导入期。连接池 open 和 saver.setup 仍由 lifespan 按顺序负责。
+    # Checkpoint 保存的是跨进程、跨版本的长期状态，因此研究图只写入 JSON 可表达
+    # 的数据，不要求 saver 动态导入项目里的 Pydantic 类。节点入口再执行校验，既
+    # 保留类型安全，也降低应用升级后旧 checkpoint 无法恢复的风险。
     checkpointer = AsyncPostgresSaver(postgres_pool)
 
     # SQLModel Repository 使用 SQLAlchemy AsyncEngine，而 LangGraph checkpointer

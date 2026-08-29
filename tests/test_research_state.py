@@ -54,7 +54,8 @@ def test_parallel_evidence_is_deduplicated_by_stable_source_identity() -> None:
         provider="hybrid-rag",
     )
 
-    assert merge_evidence((first,), (first,)) == (first,)
+    serialized = first.model_dump(mode="json")
+    assert merge_evidence((serialized,), (serialized,)) == (serialized,)
 
 
 def test_router_adds_required_strategy_without_discarding_planner_choice() -> None:
@@ -75,18 +76,18 @@ def test_router_adds_required_strategy_without_discarding_planner_choice() -> No
     )
 
 
-def test_validation_route_stops_when_budget_is_exhausted() -> None:
-    """达到循环上限后必须结束，不能再次发起检索."""
+def test_validation_route_writes_limited_report_when_budget_is_exhausted() -> None:
+    """达到循环上限后不能再检索，但仍应写出明确受限报告."""
     state: ResearchState = {
         "topic": "测试",
-        "config": ResearchConfig(max_iterations=1),
-        "status": ResearchStatus.INSUFFICIENT_EVIDENCE,
+        "config": ResearchConfig(max_iterations=1).model_dump(mode="json"),
+        "status": ResearchStatus.INSUFFICIENT_EVIDENCE.value,
         "current_iteration": 1,
         "evidence": (),
         "retrieval_failures": (),
     }
 
-    assert route_after_validation(state) == "end"
+    assert route_after_validation(state) == "write"
 
 
 def test_report_markdown_is_rendered_without_another_model_call() -> None:

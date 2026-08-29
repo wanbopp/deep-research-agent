@@ -17,7 +17,7 @@ from app.models.document import Document, DocumentStatus
 from app.models.document_chunk import DOCUMENT_EMBEDDING_DIMENSIONS, DocumentChunk
 from app.models.index_job import IndexJob, IndexJobStatus
 from app.models.memory import MEMORY_EMBEDDING_DIMENSIONS, Memory
-from app.models.research_task import ResearchTask, ResearchTaskStatus
+from app.models.research_task import ResearchEvent, ResearchTask, ResearchTaskStatus
 from app.models.user import User
 
 __all__ = [
@@ -35,6 +35,7 @@ __all__ = [
     "MAX_CHAT_SESSION_TITLE_LENGTH",
     "ResearchTask",
     "ResearchTaskStatus",
+    "ResearchEvent",
     "UUIDTimestampModel",
     "User",
     "utc_now",

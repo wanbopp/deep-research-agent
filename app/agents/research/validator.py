@@ -7,7 +7,10 @@ from app.agents.research.context import ResearchRuntimeContext
 from app.agents.research.state import ResearchState, ResearchStateUpdate
 from app.core.logging import logger
 from app.schemas.research import (
+    Evidence,
     MissingEvidenceRequest,
+    ResearchConfig,
+    ResearchPlan,
     ResearchStatus,
     RetrievalStrategy,
     ValidationResult,
@@ -32,11 +35,12 @@ class ResearchValidator:
         runtime: Runtime[ResearchRuntimeContext],
     ) -> ResearchStateUpdate:
         """返回结构化验证结果，并拒绝模型编造不存在的证据 ID."""
-        plan = state.get("plan")
-        if plan is None:
+        plan_data = state.get("plan")
+        if plan_data is None:
             raise ValueError("validation requires a research plan")
+        plan = ResearchPlan.model_validate(plan_data)
+        evidence = tuple(Evidence.model_validate(item) for item in state["evidence"])
 
-        evidence = state["evidence"]
         if not evidence:
             missing = tuple(
                 MissingEvidenceRequest(
@@ -94,20 +98,24 @@ class ResearchValidator:
     def _next_update(state: ResearchState, result: ValidationResult) -> ResearchStateUpdate:
         """把验证判断转换成下一阶段状态，并实施硬循环上限."""
         if result.sufficient:
-            return {"validation": result, "status": ResearchStatus.WRITING}
+            return {
+                "validation": result.model_dump(mode="json"),
+                "status": ResearchStatus.WRITING.value,
+            }
 
         next_iteration = state["current_iteration"] + 1
-        if next_iteration >= state["config"].max_iterations:
+        config = ResearchConfig.model_validate(state["config"])
+        if next_iteration >= config.max_iterations:
             return {
-                "validation": result,
+                "validation": result.model_dump(mode="json"),
                 "current_iteration": next_iteration,
-                "status": ResearchStatus.INSUFFICIENT_EVIDENCE,
+                "status": ResearchStatus.INSUFFICIENT_EVIDENCE.value,
                 "stop_reason": "maximum validation iterations reached",
             }
         return {
-            "validation": result,
+            "validation": result.model_dump(mode="json"),
             "current_iteration": next_iteration,
-            "status": ResearchStatus.RESEARCHING,
+            "status": ResearchStatus.RESEARCHING.value,
         }
 
 

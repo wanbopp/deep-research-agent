@@ -35,14 +35,18 @@ class ResearchNode(Protocol):
 
 def route_after_planner(state: ResearchState) -> Literal["retrieve", "end"]:
     """模糊问题停在澄清状态，计划可执行时才进入查找."""
-    return "retrieve" if state["status"] is ResearchStatus.RESEARCHING else "end"
+    return "retrieve" if state["status"] == ResearchStatus.RESEARCHING.value else "end"
 
 
 def route_after_validation(state: ResearchState) -> Literal["retrieve", "write", "end"]:
     """根据验证结果补查、写报告或以明确不充分状态结束."""
-    if state["status"] is ResearchStatus.RESEARCHING:
+    if state["status"] == ResearchStatus.RESEARCHING.value:
         return "retrieve"
-    if state["status"] is ResearchStatus.WRITING:
+    if state["status"] in {
+        ResearchStatus.WRITING.value,
+        ResearchStatus.INSUFFICIENT_EVIDENCE.value,
+        ResearchStatus.BUDGET_EXHAUSTED.value,
+    }:
         return "write"
     return "end"
 

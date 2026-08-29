@@ -8,7 +8,7 @@ from datetime import UTC, datetime
 from typing import Protocol
 from uuid import UUID
 
-from duckduckgo_search import DDGS
+from ddgs import DDGS
 from langgraph.runtime import Runtime
 from pydantic import HttpUrl
 
@@ -22,10 +22,13 @@ from app.rag.hybrid import HybridRetriever
 from app.schemas.research import (
     Evidence,
     EvidenceSourceKind,
+    ResearchConfig,
+    ResearchPlan,
     ResearchStep,
     ResearchStatus,
     RetrievalFailure,
     RetrievalStrategy,
+    ValidationResult,
 )
 
 
@@ -201,12 +204,15 @@ class ParallelResearchRetriever:
         runtime: Runtime[ResearchRuntimeContext],
     ) -> ResearchStateUpdate:
         """并行展开步骤、查询和来源，汇合为证据增量与安全失败摘要."""
-        plan = state.get("plan")
-        if plan is None:
+        plan_data = state.get("plan")
+        if plan_data is None:
             raise ValueError("retrieval requires a research plan")
+        plan = ResearchPlan.model_validate(plan_data)
+        config = ResearchConfig.model_validate(state["config"])
 
         steps = plan.steps
-        validation = state.get("validation")
+        validation_data = state.get("validation")
+        validation = ValidationResult.model_validate(validation_data) if validation_data is not None else None
         if state["current_iteration"] > 0 and validation is not None and validation.missing:
             # 补查不能机械重复第一轮查询。Validator 已经指出具体缺口，这里把缺口
             # 转回对应步骤的临时执行视图；原计划仍保留在 state 中供审计和报告使用。
@@ -243,12 +249,12 @@ class ParallelResearchRetriever:
             if retriever is None:
                 return RetrievalFailure(step_id=step.step_id, strategy=strategy, error_type="UnavailableRetriever")
             try:
-                async with asyncio.timeout(min(30.0, state["config"].timeout_seconds)):
+                async with asyncio.timeout(min(30.0, config.timeout_seconds)):
                     return await retriever.search(
                         user_id=runtime.context.user_id,
                         step=step,
                         query=query,
-                        top_k=state["config"].max_evidence_per_step,
+                        top_k=config.max_evidence_per_step,
                     )
             except Exception as error:
                 logger.warning(
@@ -271,12 +277,14 @@ class ParallelResearchRetriever:
 
         # 全局上限在合并前执行，避免一个宽泛查询压垮 checkpoint 和 Writer 输入。
         limited = tuple(sorted(evidence, key=lambda item: (-item.score, item.evidence_id)))[
-            : state["config"].max_total_evidence
+            : config.max_total_evidence
         ]
         return {
-            "evidence": limited,
-            "retrieval_failures": tuple(failures),
-            "status": ResearchStatus.VALIDATING,
+            # 节点内部使用模型获得类型保护，跨节点边界则降为 JSON 数据交给
+            # checkpointer。下一节点会重新校验，不会因此失去数据约束。
+            "evidence": tuple(item.model_dump(mode="json") for item in limited),
+            "retrieval_failures": tuple(item.model_dump(mode="json") for item in failures),
+            "status": ResearchStatus.VALIDATING.value,
         }
 
 

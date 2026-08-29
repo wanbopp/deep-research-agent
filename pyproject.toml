@@ -47,7 +47,7 @@ dependencies = [
     "tenacity>=9.1.2",
     "redis>=7.4.0",
     # ---- 搜索 ----
-    "duckduckgo-search>=3.9.0",
+    "ddgs>=9.16.0",
 ]
 
 [tool.setuptools.packages.find]
