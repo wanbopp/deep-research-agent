@@ -205,8 +205,30 @@ class ParallelResearchRetriever:
         if plan is None:
             raise ValueError("retrieval requires a research plan")
 
+        steps = plan.steps
+        validation = state.get("validation")
+        if state["current_iteration"] > 0 and validation is not None and validation.missing:
+            # 补查不能机械重复第一轮查询。Validator 已经指出具体缺口，这里把缺口
+            # 转回对应步骤的临时执行视图；原计划仍保留在 state 中供审计和报告使用。
+            original_by_id = {step.step_id: step for step in plan.steps}
+            supplemental: list[ResearchStep] = []
+            for request in validation.missing:
+                original = original_by_id.get(request.step_id)
+                if original is None:
+                    raise ValueError("missing evidence request references unknown step")
+                supplemental.append(
+                    original.model_copy(
+                        update={
+                            "objective": request.objective,
+                            "search_queries": request.search_queries,
+                            "preferred_strategies": request.preferred_strategies,
+                        }
+                    )
+                )
+            steps = tuple(supplemental)
+
         work: list[tuple[ResearchStep, RetrievalStrategy, str]] = []
-        for step in plan.steps:
+        for step in steps:
             decision = self._router.route(step)
             for strategy in decision.strategies:
                 for query in step.search_queries:

@@ -5,12 +5,19 @@ from datetime import UTC, datetime
 import pytest
 from pydantic import ValidationError
 
-from app.agents.research.state import merge_evidence
+from app.agents.research.state import ResearchState, merge_evidence
 from app.agents.research.router import ResearchRouter
+from app.agents.research.graph import route_after_validation
+from app.agents.research.writer import render_report_markdown
 from app.schemas.research import (
     Evidence,
     EvidenceSourceKind,
+    Citation,
+    ReportSection,
+    ResearchConfig,
     ResearchPlan,
+    ResearchReport,
+    ResearchStatus,
     ResearchStep,
     RetrievalStrategy,
 )
@@ -66,3 +73,32 @@ def test_router_adds_required_strategy_without_discarding_planner_choice() -> No
         RetrievalStrategy.WEB,
         RetrievalStrategy.GRAPH_GLOBAL,
     )
+
+
+def test_validation_route_stops_when_budget_is_exhausted() -> None:
+    """达到循环上限后必须结束，不能再次发起检索."""
+    state: ResearchState = {
+        "topic": "测试",
+        "config": ResearchConfig(max_iterations=1),
+        "status": ResearchStatus.INSUFFICIENT_EVIDENCE,
+        "current_iteration": 1,
+        "evidence": (),
+        "retrieval_failures": (),
+    }
+
+    assert route_after_validation(state) == "end"
+
+
+def test_report_markdown_is_rendered_without_another_model_call() -> None:
+    """结构化报告可以确定性重建 Markdown 和引用列表."""
+    report = ResearchReport(
+        title="研究结论",
+        executive_summary="摘要",
+        sections=(ReportSection(heading="发现", body="事实", citation_ids=("R1",)),),
+        citations=(Citation(citation_id="R1", evidence_id="ev-1", title="来源", source="chunk:1"),),
+    )
+
+    rendered = render_report_markdown(report)
+
+    assert "Sources: [R1]" in rendered
+    assert "[R1] 来源: chunk:1" in rendered
