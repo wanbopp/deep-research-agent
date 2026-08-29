@@ -155,6 +155,14 @@ class RetrievalFailure(_StrictResearchModel):
     error_type: str = Field(min_length=1, max_length=200)
 
 
+class RouteDecision(_StrictResearchModel):
+    """Router 为一个步骤选择的查找方式及可记录理由."""
+
+    step_id: str = Field(pattern=r"^step-[1-9][0-9]*$")
+    strategies: tuple[RetrievalStrategy, ...] = Field(min_length=1, max_length=4)
+    reason: str = Field(min_length=1, max_length=500)
+
+
 class ValidatedFact(_StrictResearchModel):
     """经过验证、允许进入报告的事实及其支持证据."""
 
@@ -175,6 +183,7 @@ class Conflict(_StrictResearchModel):
 class MissingEvidenceRequest(_StrictResearchModel):
     """Validator 请求下一轮补查的明确缺口."""
 
+    step_id: str = Field(pattern=r"^step-[1-9][0-9]*$")
     objective: str = Field(min_length=1, max_length=500)
     search_queries: tuple[str, ...] = Field(min_length=1, max_length=5)
     preferred_strategies: tuple[RetrievalStrategy, ...] = Field(min_length=1, max_length=3)
@@ -238,6 +247,7 @@ __all__ = [
     "ResearchReport",
     "ResearchStatus",
     "ResearchStep",
+    "RouteDecision",
     "RetrievalFailure",
     "RetrievalStrategy",
     "ValidatedFact",

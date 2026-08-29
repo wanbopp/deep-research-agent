@@ -6,11 +6,13 @@ import pytest
 from pydantic import ValidationError
 
 from app.agents.research.state import merge_evidence
+from app.agents.research.router import ResearchRouter
 from app.schemas.research import (
     Evidence,
     EvidenceSourceKind,
     ResearchPlan,
     ResearchStep,
+    RetrievalStrategy,
 )
 
 
@@ -46,3 +48,21 @@ def test_parallel_evidence_is_deduplicated_by_stable_source_identity() -> None:
     )
 
     assert merge_evidence((first,), (first,)) == (first,)
+
+
+def test_router_adds_required_strategy_without_discarding_planner_choice() -> None:
+    """确定性规则应补上时效检索，同时保留 Planner 的文档检索建议."""
+    step = ResearchStep(
+        step_number=1,
+        objective="分析 2026 年最新趋势",
+        search_queries=("2026 latest trend",),
+        preferred_strategies=(RetrievalStrategy.HYBRID,),
+    )
+
+    decision = ResearchRouter().route(step)
+
+    assert decision.strategies == (
+        RetrievalStrategy.HYBRID,
+        RetrievalStrategy.WEB,
+        RetrievalStrategy.GRAPH_GLOBAL,
+    )
