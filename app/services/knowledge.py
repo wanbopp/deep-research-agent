@@ -130,6 +130,7 @@ class KnowledgeService:
             user_id: 认证 dependency 提供的可信用户 UUID。
             filename: multipart 元数据中的展示文件名；只保存规范化 basename。
             content_type: multipart MIME；规范化后必须命中服务端 allowlist。
+                参数来源于 multipart 请求中该文件 part 声明的 MIME 类型；经过规范化之后，必须命中服务端允许的类型白名单（allowlist），否则会抛出 KnowledgeUnsupportedMediaTypeError。
             source: UploadFile 或其他实现异步 read 的有界输入流。
 
         Returns:

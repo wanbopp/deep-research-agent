@@ -42,6 +42,19 @@ class ChatMessage(BaseModel):
         return _strip_text(value)
 
 
+class ChatMessageHistoryResponse(BaseModel):
+    """GET /chat/sessions/{thread_id}/messages 的不可变消息列表."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    # tuple 与 ChatSessionListResponse / DocumentListResponse 的集合风格对齐；
+    # frozen=True + extra=forbid 保证响应一旦构造就不能被 route 或 service 改写。
+    messages: tuple[ChatMessage, ...] = Field(
+        default_factory=tuple,
+        description="按 checkpoint 顺序排列的用户/助手消息；空会话返回空数组",
+    )
+
+
 class ChatRequest(BaseModel):
     """提交给非流式聊天接口的一条新用户输入."""
 

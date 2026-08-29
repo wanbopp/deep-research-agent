@@ -4,7 +4,7 @@ import asyncio
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Literal
 from uuid import UUID
 from langchain_core.messages import (
     AIMessage,
@@ -22,7 +22,9 @@ from app.agents.chat.graph import ChatGraph
 from app.agents.chat.state import ChatState
 from app.core.logging import logger
 from app.schemas.chat import (
+    MAX_MESSAGE_LENGTH,
     ChatMessage,
+    ChatMessageHistoryResponse,
     ChatRequest,
     ChatResponse,
     ChatResumeRequest,
@@ -601,6 +603,94 @@ class ChatService:
         )
 
         return turn_result
+
+    @staticmethod
+    def _history_message_from(message: object) -> ChatMessage | None:
+        """把一条 checkpoint 消息映射为客户端可见的公开消息.
+
+        Args:
+            message: LangGraph snapshot 中的 LangChain 消息，静态类型未知。
+
+        Returns:
+            映射成功时返回不可变 ChatMessage；不属于公开对话内容的消息返回
+            None，由调用方跳过。
+
+        Notes:
+            公开 API 只暴露用户与助手的文本消息：ToolMessage、仍带未决
+            tool_calls 的 AIMessage 属于 Agent 执行内部状态；多模态或空内容
+            无法安全映射为纯文本协议。超长内容截断到公开上限，避免历史中的
+            长回复使响应构造直接失败。
+        """
+        if isinstance(message, HumanMessage):
+            role: Literal["user", "assistant"] = "user"
+        elif isinstance(message, AIMessage) and not message.tool_calls:
+            role = "assistant"
+        else:
+            return None
+
+        content = message.content
+        if not isinstance(content, str):
+            return None
+
+        content = content.strip()
+        if not content:
+            return None
+
+        if len(content) > MAX_MESSAGE_LENGTH:
+            content = content[:MAX_MESSAGE_LENGTH]
+
+        return ChatMessage(role=role, content=content)
+
+    async def get_message_history(
+        self,
+        *,
+        session_id: UUID,
+        user_id: UUID,
+    ) -> ChatMessageHistoryResponse:
+        """在当前用户自己的 checkpoint 空间内读取可见历史消息.
+
+        Args:
+            session_id: 客户端使用的公开业务会话 UUID。
+            user_id: 认证链提供的可信用户 UUID，不能来自请求正文。
+
+        Returns:
+            按 checkpoint 顺序排列的用户/助手消息。会话存在但还没有任何
+            checkpoint（从未执行过 Agent）时返回空数组。
+
+        Raises:
+            ChatSessionNotFoundError: 会话不存在或属于其他用户。与读取、删除
+                入口相同的错误语义，跨用户不泄漏资源是否存在。
+            SQLAlchemyError: 所有权查询的数据库不可用，继续向上传播。
+
+        Notes:
+            这是只读快照查询，不进入 ``_hold_thread_execution`` 执行锁：读取
+            历史不应与正在执行的 turn 互斥，否则前端切换会话拉历史会收到
+            409。并发删除的最坏结果是读到空快照，没有安全影响；所有权校验
+            仍然先行，保证内部 checkpoint key 只能由会话属主构造。
+        """
+        await self._ownership_verifier.require_owned(
+            session_id=session_id,
+            user_id=user_id,
+        )
+
+        config = self._build_config(
+            user_id=user_id,
+            public_thread_id=session_id,
+        )
+        snapshot = await self._graph.aget_state(config)
+
+        state_values = dict(snapshot.values)
+        messages = state_values.get("messages")
+        if not isinstance(messages, list):
+            return ChatMessageHistoryResponse(messages=())
+
+        history: list[ChatMessage] = []
+        for message in messages:
+            public_message = self._history_message_from(message)
+            if public_message is not None:
+                history.append(public_message)
+
+        return ChatMessageHistoryResponse(messages=tuple(history))
 
     async def stream_turn(
         self,

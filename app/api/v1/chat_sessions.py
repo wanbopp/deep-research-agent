@@ -7,15 +7,18 @@ from fastapi import APIRouter, Depends, HTTPException, Response, status
 
 from app.api.dependencies import (
     CurrentUserDependency,
+    get_chat_service,
     get_chat_session_cleanup_service,
     get_chat_session_service,
 )
 from app.schemas.base import ErrorResponse
+from app.schemas.chat import ChatMessageHistoryResponse
 from app.schemas.chat_session import (
     ChatSessionCreateRequest,
     ChatSessionListResponse,
     ChatSessionResponse,
 )
+from app.services.chat import ChatService
 from app.services.chat_session_ownership import ChatSessionNotFoundError
 from app.services.chat_session_cleanup import ChatSessionCleanupService
 from app.services.chat_sessions import ChatSessionService
@@ -27,6 +30,13 @@ router = APIRouter(prefix="/chat/sessions", tags=["chat-sessions"])
 ChatSessionServiceDependency = Annotated[
     ChatSessionService,
     Depends(get_chat_session_service),
+]
+
+# 消息历史读取依赖 lifespan 共享的 ChatService：只有它知道内部 checkpoint
+# thread key 的构造规则和 snapshot 读取方式。
+ChatServiceDependency = Annotated[
+    ChatService,
+    Depends(get_chat_service),
 ]
 
 # 删除协调器是 lifespan 级共享服务，而不是请求级 ORM service。类型别名把
@@ -131,6 +141,53 @@ async def read_chat_session(
     """
     try:
         return await service.get_owned(
+            session_id=thread_id,
+            user_id=current_user.user_id,
+        )
+    except ChatSessionNotFoundError:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Chat session was not found",
+        ) from None
+
+
+@router.get(
+    "/{thread_id}/messages",
+    response_model=ChatMessageHistoryResponse,
+    responses={
+        status.HTTP_401_UNAUTHORIZED: {
+            "model": ErrorResponse,
+            "description": "Bearer token is missing or invalid",
+        },
+        status.HTTP_404_NOT_FOUND: {
+            "model": ErrorResponse,
+            "description": "Chat session is absent from the current user scope",
+        },
+    },
+)
+async def read_chat_session_messages(
+    thread_id: UUID,
+    chat_service: ChatServiceDependency,
+    current_user: CurrentUserDependency,
+) -> ChatMessageHistoryResponse:
+    """读取当前用户某个业务会话的可见聊天历史.
+
+    Args:
+        thread_id: 公开业务会话 UUID。它是标识符，不是授权凭据。
+        chat_service: lifespan 共享聊天服务，负责所有权校验后的 checkpoint
+            snapshot 读取与公开消息映射。
+        current_user: 可信用户上下文，提供所有权校验的 user_id。
+
+    Returns:
+        按时间顺序排列的用户/助手文本消息；会话尚无任何对话时 messages 为
+        空数组。工具消息与 Agent 内部状态不在公开范围内。
+
+    Raises:
+        HTTPException: 会话不存在或属于其他用户时统一返回 404，与单个会话
+            读取入口保持相同的不可区分语义。
+    """
+    try:
+        return await chat_service.get_message_history(
             session_id=thread_id,
             user_id=current_user.user_id,
         )
