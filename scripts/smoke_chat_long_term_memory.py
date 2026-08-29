@@ -139,6 +139,15 @@ class _ControlledUnavailableMemoryStore:
         self.search_calls += 1
         raise MemoryUnavailableError()
 
+    async def list(
+        self,
+        *,
+        user_id: UUID,
+    ) -> tuple[MemoryItem, ...]:
+        """保持 MemoryStore 协议完整；本 smoke 不应调用列表."""
+        _ = user_id
+        raise MemoryUnavailableError()
+
     async def add(
         self,
         *,

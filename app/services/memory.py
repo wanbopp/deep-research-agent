@@ -64,6 +64,29 @@ class MemoryStore(Protocol):
         """
         ...
 
+    async def list(
+        self,
+        *,
+        user_id: UUID,
+    ) -> tuple[MemoryItem, ...]:
+        """列出可信用户 namespace 内的全部记忆.
+
+        Args:
+            user_id: 认证 dependency 建立的可信用户 UUID。adapter 必须把它作为
+                数据库过滤条件，不能只在查询后用 Python 过滤。
+
+        Returns:
+            按创建时间倒序排列的不可变元组；没有记忆时返回空元组。
+
+        Raises:
+            MemoryUnavailableError: 后端无法可靠完成用户隔离查询。
+
+        Notes:
+            与 ``search`` 不同，本方法不做向量检索，只服务用户对自己记忆的审阅
+            与管理界面，因此不需要查询文本和数量参数。
+        """
+        ...
+
     async def add(
         self,
         *,

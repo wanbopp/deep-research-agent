@@ -108,6 +108,40 @@ class MemoryService:
         )
         return MemorySearchResult(items=items)
 
+    async def list(
+        self,
+        *,
+        user_id: UUID,
+    ) -> tuple[MemoryItem, ...]:
+        """列出当前用户全部长期记忆，供审阅与管理界面使用.
+
+        Args:
+            user_id: 认证链提供的可信用户 UUID，不能来自客户端参数。
+
+        Returns:
+            按创建时间倒序排列的记忆元组；没有记忆时返回空元组。
+
+        Raises:
+            MemoryUnavailableError: 真实 MemoryStore 不可用，或返回数据违反归属
+                契约。REST 层应把它映射为可重试的 503，而不是伪装成空列表。
+
+        Notes:
+            列表不做缓存：搜索缓存按查询文本组织，而管理界面要求实时反映写入
+            与删除；单用户记忆量小，直接回源成本可控。
+        """
+        items = await self._store.list(user_id=user_id)
+
+        # 与 search 相同的跨层复核：adapter 回归或错误实现都不能把其他用户的
+        # 记忆交给管理界面。
+        if any(item.user_id != user_id for item in items):
+            logger.error(
+                "memory_store_contract_violated",
+                operation="list",
+            )
+            raise MemoryUnavailableError() from None
+
+        return items
+
     async def add(
         self,
         *,

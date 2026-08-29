@@ -99,6 +99,7 @@ class _CountingMemoryStore:
         """保存真实存储协议并初始化计数器."""
         self._delegate = delegate
         self.search_calls = 0
+        self.list_calls = 0
         self.add_calls = 0
         self.delete_calls = 0
 
@@ -111,6 +112,11 @@ class _CountingMemoryStore:
         """计数后执行真实 Embedding 和 pgvector 检索."""
         self.search_calls += 1
         return await self._delegate.search(user_id=user_id, query=query)
+
+    async def list(self, *, user_id: UUID) -> tuple[MemoryItem, ...]:
+        """计数后执行真实 owner-scoped 全量列表."""
+        self.list_calls += 1
+        return await self._delegate.list(user_id=user_id)
 
     async def add(
         self,

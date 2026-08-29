@@ -232,6 +232,30 @@ class MemorySearchResult(_StrictMemoryModel):
         return self.status is MemorySearchStatus.DEGRADED
 
 
+class MemoryResponse(_StrictMemoryModel):
+    """REST 公开的单条记忆视图.
+
+    相比应用层 ``MemoryItem``，它去掉 ``user_id``（列表只返回当前认证用户自己的
+    记忆，无需回显归属）与 ``updated_at``（记忆写入后不再更新正文），字段命名
+    与其他资源响应保持一致。
+    """
+
+    memory_id: UUID = Field(description="记忆条目的业务 UUID")
+    content: str = Field(min_length=1, max_length=MAX_MEMORY_CONTENT_LENGTH)
+    kind: MemoryKind = Field(description="记忆分类")
+    source_thread_id: UUID = Field(description="提取该记忆的业务聊天会话 UUID")
+    created_at: AwareDatetime = Field(description="记忆创建时间")
+
+
+class MemoryListResponse(_StrictMemoryModel):
+    """GET /memory 的响应包装，与列表类响应统一的复数集合风格一致."""
+
+    memories: tuple[MemoryResponse, ...] = Field(
+        default_factory=tuple,
+        description="按创建时间倒序排列的记忆；没有记忆时为空数组",
+    )
+
+
 __all__ = [
     "MAX_MEMORY_CONTENT_LENGTH",
     "MAX_QUERY_LENGTH",
@@ -241,7 +265,9 @@ __all__ = [
     "MemoryExtractionResult",
     "MemoryItem",
     "MemoryKind",
+    "MemoryListResponse",
     "MemoryQuery",
+    "MemoryResponse",
     "MemorySearchResult",
     "MemorySearchStatus",
 ]

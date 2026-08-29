@@ -19,6 +19,7 @@ from app.infrastructure.lifespan import (
     get_application_chat_cleanup_service,
     get_application_chat_service,
     get_application_file_storage,
+    get_application_memory_service,
     get_application_rate_limiter,
     get_application_rate_limit_policies,
     get_application_resources,
@@ -35,6 +36,7 @@ from app.services.chat import ChatService
 from app.services.chat_session_cleanup import ChatSessionCleanupService
 from app.services.chat_sessions import ChatSessionService
 from app.services.knowledge import KnowledgeService
+from app.services.memory_service import MemoryService
 from app.services.rate_limit import (
     RateLimiter,
     RateLimitIdentityUnavailableError,
@@ -54,6 +56,16 @@ http_bearer = HTTPBearer(auto_error=False)
 def get_chat_service(request: Request) -> ChatService:
     """返回当前 FastAPI 应用在 startup 创建的共享聊天服务."""
     return get_application_chat_service(request.app)
+
+
+def get_memory_service(request: Request) -> MemoryService:
+    """返回 startup 创建的共享长期记忆服务.
+
+    MemoryService 无请求状态：内部只保存 Store 协议、Cache 协议和内容策略，
+    可信 user_id 由路由在每次调用时显式传入，因此可以像 ChatService 一样
+    跨请求复用，不需要请求级 Session。
+    """
+    return get_application_memory_service(request.app)
 
 
 def get_rate_limiter(request: Request) -> RateLimiter:

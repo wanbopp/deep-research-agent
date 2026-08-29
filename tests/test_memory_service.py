@@ -34,9 +34,11 @@ class _RecordingMemoryStore:
         """保存初始权威条目和可观察调用计数."""
         self.items = list(items)
         self.search_calls = 0
+        self.list_calls = 0
         self.add_calls = 0
         self.delete_calls = 0
         self.search_unavailable = False
+        self.list_unavailable = False
 
     async def search(
         self,
@@ -54,6 +56,15 @@ class _RecordingMemoryStore:
             if item.user_id == user_id and (query.kinds is None or item.kind in query.kinds)
         ]
         return tuple(matches[: query.limit])
+
+    async def list(self, *, user_id: UUID) -> tuple[MemoryItem, ...]:
+        """返回该用户全部条目（创建时间倒序），或抛稳定故障."""
+        self.list_calls += 1
+        if self.list_unavailable:
+            raise MemoryUnavailableError()
+        owned = [item for item in self.items if item.user_id == user_id]
+        owned.sort(key=lambda item: (item.created_at, item.id), reverse=True)
+        return tuple(owned)
 
     async def add(
         self,
@@ -216,3 +227,85 @@ async def test_memory_service_distinguishes_empty_degraded_and_rejects_wrong_own
     )
     rejected = await memory_cache.lookup(user_id=user_id, query=owner_query)
     assert not rejected.is_hit
+
+
+def _build_list_service(store: _RecordingMemoryStore) -> MemoryService:
+    """构造只做列表验证的 MemoryService（列表不使用缓存）."""
+    return MemoryService(
+        store,
+        InMemoryCache(),
+        search_cache_ttl_seconds=60,
+        generation_ttl_seconds=3600,
+    )
+
+
+@pytest.mark.anyio
+async def test_memory_service_list_returns_only_owned_items_newest_first() -> None:
+    """列表必须只包含当前用户条目，且最新创建的排在前面."""
+    user_id = uuid4()
+    source_thread_id = uuid4()
+    older_time = datetime(2026, 8, 1, tzinfo=UTC)
+    newer_time = datetime(2026, 8, 20, tzinfo=UTC)
+    older = MemoryItem(
+        id=uuid4(),
+        user_id=user_id,
+        content="较早的记忆",
+        kind=MemoryKind.FACT,
+        source_thread_id=source_thread_id,
+        created_at=older_time,
+        updated_at=older_time,
+    )
+    newer = MemoryItem(
+        id=uuid4(),
+        user_id=user_id,
+        content="较晚的记忆",
+        kind=MemoryKind.FACT,
+        source_thread_id=source_thread_id,
+        created_at=newer_time,
+        updated_at=newer_time,
+    )
+    other_user_item = _memory_item(user_id=uuid4(), source_thread_id=uuid4())
+    store = _RecordingMemoryStore((older, newer, other_user_item))
+    service = _build_list_service(store)
+
+    items = await service.list(user_id=user_id)
+
+    assert store.list_calls == 1
+    assert [item.id for item in items] == [newer.id, older.id]
+
+
+@pytest.mark.anyio
+async def test_memory_service_list_propagates_store_unavailable() -> None:
+    """存储故障必须向上抛出，由 REST 层映射为 503，不能伪装成空列表."""
+    store = _RecordingMemoryStore(())
+    store.list_unavailable = True
+    service = _build_list_service(store)
+
+    with pytest.raises(MemoryUnavailableError):
+        await service.list(user_id=uuid4())
+
+
+@pytest.mark.anyio
+async def test_memory_service_list_rejects_wrong_owner_items() -> None:
+    """Store 返回其他用户条目属于契约违规，必须按不可用处理."""
+    user_id = uuid4()
+    foreign = _memory_item(user_id=uuid4(), source_thread_id=uuid4())
+    store = _ForeignOwnerListStore(foreign)
+    service = _build_list_service(store)
+
+    with pytest.raises(MemoryUnavailableError):
+        await service.list(user_id=user_id)
+
+
+class _ForeignOwnerListStore(_RecordingMemoryStore):
+    """故意返回其他用户条目的违规 Store，只用于契约复核测试."""
+
+    def __init__(self, foreign_item: MemoryItem) -> None:
+        """保存将由 list 返回的他人条目."""
+        super().__init__(())
+        self._foreign_item = foreign_item
+
+    async def list(self, *, user_id: UUID) -> tuple[MemoryItem, ...]:
+        """无视作用域返回他人条目，模拟 adapter 回归."""
+        self.list_calls += 1
+        return (self._foreign_item,)

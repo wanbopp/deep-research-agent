@@ -109,6 +109,48 @@ class PostgresMemoryStore:
             self._log_database_failure(operation="decode", exc=exc)
             raise MemoryUnavailableError() from None
 
+    async def list(
+        self,
+        *,
+        user_id: UUID,
+    ) -> tuple[MemoryItem, ...]:
+        """列出单个用户的全部记忆，按创建时间倒序.
+
+        Args:
+            user_id: 认证链给出的可信用户 UUID，也是唯一的数据过滤条件。
+
+        Returns:
+            最新创建在前的记忆元组；没有记忆时返回空元组。
+
+        Raises:
+            MemoryUnavailableError: PostgreSQL 无法可靠完成查询或结果无法解码。
+        """
+        memory_table = self._memory_table()
+        statement = (
+            select(Memory)
+            .where(memory_table.c.user_id == user_id)
+            .order_by(
+                memory_table.c.created_at.desc(),
+                memory_table.c.id.desc(),
+            )
+        )
+
+        try:
+            async with self._session_factory() as session:
+                result = await session.execute(statement)
+                rows = result.scalars().all()
+        except SQLAlchemyError as exc:
+            self._log_database_failure(operation="list", exc=exc)
+            raise MemoryUnavailableError() from None
+
+        try:
+            return tuple(self._to_item(row) for row in rows)
+        except ValueError as exc:
+            # 与 search 相同：坏数据表示数据库状态偏离应用契约，不能作为正常
+            # 列表结果返回给管理界面。
+            self._log_database_failure(operation="decode", exc=exc)
+            raise MemoryUnavailableError() from None
+
     async def add(
         self,
         *,
