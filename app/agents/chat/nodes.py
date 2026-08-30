@@ -21,6 +21,8 @@ from app.schemas.memory import (
 )
 from app.services.llm.service import LLMService
 from app.services.memory_service import MemoryService
+from app.tools import ToolExecutionContext, ToolExecutor
+from app.tools.policy import ToolApprovalRequired, ToolAuthorizationError
 
 
 def create_memory_node(
@@ -228,6 +230,7 @@ def create_tool_node(
     registry: ToolRegistry,  # 位置参数：可以按位置或按名称传
     *,  # 分隔符：之后的参数必须按名称传
     tool_timeout_seconds: float = 10.0,  # keyword-only 参数
+    executor: ToolExecutor | None = None,
 ) -> StateNode:
     """创建并发执行一个或多个工具调用的异步节点.
 
@@ -242,13 +245,39 @@ def create_tool_node(
     if tool_timeout_seconds <= 0:
         raise ValueError("tool_timeout_seconds must be greater than 0")
 
-    async def _execute_tool_call(tool_call: ToolCall) -> ToolMessage:
+    async def _execute_tool_call(
+        tool_call: ToolCall,
+        execution_context: ToolExecutionContext,
+    ) -> ToolMessage:
         """执行一条调用，并转换为成功或错误 ToolMessage."""
         tool_call_id = tool_call["id"]
         if not isinstance(tool_call_id, str) or not tool_call_id:
             raise ValueError("tool call id must be a non-empty string")
 
         tool_name = tool_call["name"]
+
+        if executor is not None:
+            try:
+                result = await executor.execute(
+                    tool_name,
+                    dict(tool_call["args"]),
+                    context=execution_context,
+                )
+            except GraphBubbleUp:
+                raise
+            except (LookupError, ToolApprovalRequired, ToolAuthorizationError):
+                return ToolMessage(
+                    content=f"Tool {tool_name!r} is not available for this request.",
+                    name=tool_name,
+                    tool_call_id=tool_call_id,
+                    status="error",
+                )
+            return ToolMessage(
+                content=result.content,
+                name=tool_name,
+                tool_call_id=tool_call_id,
+                status="success" if result.status == "success" else "error",
+            )
 
         try:
             tool = registry.resolve(tool_name)
@@ -306,7 +335,7 @@ def create_tool_node(
         if not isinstance(runtime_context, ChatRuntimeContext):
             raise RuntimeError("tool node requires a trusted runtime context")
 
-        _trusted_user_id = runtime_context.user_id
+        execution_context = ToolExecutionContext(user_id=runtime_context.user_id)
 
         messages = state["messages"]
         if not messages:
@@ -324,7 +353,7 @@ def create_tool_node(
 
         # 所有协程在 gather() 调用时一起开始推进；返回列表仍与
         # tool_calls 的输入顺序一致，不受各工具完成先后的影响。
-        outputs = await asyncio.gather(*(_execute_tool_call(tool_call) for tool_call in tool_calls))
+        outputs = await asyncio.gather(*(_execute_tool_call(tool_call, execution_context) for tool_call in tool_calls))
 
         return {"messages": list(outputs)}
 

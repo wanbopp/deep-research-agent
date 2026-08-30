@@ -2,6 +2,7 @@
 
 from langgraph.checkpoint.base import BaseCheckpointSaver
 from langgraph.checkpoint.memory import InMemorySaver
+from langgraph.errors import GraphBubbleUp
 from pydantic import SecretStr
 
 from app.agents.chat.graph import ChatGraph, build_chat_graph
@@ -19,6 +20,15 @@ from app.services.llm.factory import create_openai_chat_model
 from app.services.llm.registry import LLMRegistry
 from app.services.llm.service import LLMService
 from app.services.memory_service import MemoryService
+from app.runtime import BudgetPolicy
+from app.tools import (
+    RuntimeToolRegistry,
+    ToolDescriptor,
+    ToolExecutor,
+    ToolExposure,
+    ToolRisk,
+)
+from app.tools.adapters import LangChainToolAdapter
 
 
 def create_chat_runtime(
@@ -85,6 +95,45 @@ def create_chat_runtime(
             ask_human,
         )
     )
+    runtime_tool_registry = RuntimeToolRegistry()
+    runtime_tool_registry.register(
+        ToolDescriptor(
+            name=get_current_utc_time.name,
+            namespace="local",
+            exposure=ToolExposure.MODEL,
+            risk=ToolRisk.READ_ONLY,
+            timeout_seconds=5.0,
+            output_token_limit=128,
+            supports_parallel=True,
+            requires_approval=False,
+        ),
+        LangChainToolAdapter(get_current_utc_time),
+    )
+    runtime_tool_registry.register(
+        ToolDescriptor(
+            name=ask_human.name,
+            namespace="local",
+            exposure=ToolExposure.MODEL,
+            risk=ToolRisk.INTERACTIVE,
+            timeout_seconds=20.0,
+            output_token_limit=512,
+            supports_parallel=False,
+            requires_approval=False,
+        ),
+        LangChainToolAdapter(ask_human),
+    )
+    tool_executor = ToolExecutor(
+        runtime_tool_registry,
+        budget_policy=BudgetPolicy(
+            total_timeout_seconds=20.0,
+            max_input_tokens=settings.RUNTIME_MAX_INPUT_TOKENS,
+            max_tool_output_tokens=settings.RUNTIME_MAX_TOOL_OUTPUT_TOKENS,
+            max_evidence=30,
+            max_retrieval_candidates=80,
+            max_parallel_operations=settings.RUNTIME_MAX_PARALLEL_OPERATIONS,
+        ),
+        passthrough_exception_types=(GraphBubbleUp,),
+    )
 
     # 创建 chat node 和 tool node。
     chat_node = create_chat_node(
@@ -96,6 +145,7 @@ def create_chat_runtime(
     tool_node = create_tool_node(
         registry=tool_registry,
         tool_timeout_seconds=20,
+        executor=tool_executor,
     )
 
     # 可选注入保留历史 smoke 的最小图，同时让 production lifespan 显式开启

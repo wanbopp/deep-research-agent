@@ -11,6 +11,7 @@ os.environ["DEBUG"] = "false"
 os.environ["LOG_LEVEL"] = "WARNING"
 
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage  # noqa: E402
+from langgraph.errors import GraphBubbleUp  # noqa: E402
 from pydantic import SecretStr  # noqa: E402
 
 from app.agents.chat.graph import build_chat_graph  # noqa: E402
@@ -23,6 +24,14 @@ from app.schemas.llm import ModelSpec  # noqa: E402
 from app.services.llm.factory import create_openai_chat_model  # noqa: E402
 from app.services.llm.registry import LLMRegistry  # noqa: E402
 from app.services.llm.service import LLMService  # noqa: E402
+from app.tools import (  # noqa: E402
+    RuntimeToolRegistry,
+    ToolDescriptor,
+    ToolExecutor,
+    ToolExposure,
+    ToolRisk,
+)
+from app.tools.adapters import LangChainToolAdapter  # noqa: E402
 
 EXPECTED_REPLY = "REAL_TOOL_AGENT_OK"
 GRAPH_TIMEOUT_SECONDS = 60.0
@@ -68,12 +77,27 @@ async def run_tool_agent_graph_smoke() -> int:
 
     # 同一个 Registry 同时决定模型可见 schema 和 Python 执行白名单。
     tool_registry = ToolRegistry((get_current_utc_time,))
+    runtime_registry = RuntimeToolRegistry()
+    runtime_registry.register(
+        ToolDescriptor(
+            name=get_current_utc_time.name,
+            namespace="local",
+            exposure=ToolExposure.MODEL,
+            risk=ToolRisk.READ_ONLY,
+            timeout_seconds=5.0,
+            output_token_limit=128,
+            supports_parallel=True,
+            requires_approval=False,
+        ),
+        LangChainToolAdapter(get_current_utc_time),
+    )
+    executor = ToolExecutor(runtime_registry, passthrough_exception_types=(GraphBubbleUp,))
     chat_node = create_chat_node(
         service,
         aliases=("primary",),
         tool_registry=tool_registry,
     )
-    tool_node = create_tool_node(tool_registry)
+    tool_node = create_tool_node(tool_registry, executor=executor)
     graph = build_chat_graph(
         chat_node,
         tool_node=tool_node,
