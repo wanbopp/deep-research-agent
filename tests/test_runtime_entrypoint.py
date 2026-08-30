@@ -51,11 +51,12 @@ def test_runtime_options_default_to_all(monkeypatch: pytest.MonkeyPatch) -> None
     assert options.host == "127.0.0.1"
     assert options.port == 8000
     assert options.log_level == "info"
+    assert options.until_idle is False
 
 
-@pytest.mark.parametrize("mode", ["all", "api", "worker"])
+@pytest.mark.parametrize("mode", ["all", "api", "worker", "index"])
 def test_runtime_options_accept_each_explicit_mode(mode: str) -> None:
-    """保留三种模式作为统一代码库的运维入口."""
+    """保留四种模式作为统一代码库的运维入口."""
     assert parse_options(["--mode", mode]).mode == mode
 
 
@@ -63,6 +64,13 @@ def test_runtime_options_reject_invalid_port() -> None:
     """端口越界时应在创建 Uvicorn Server 前失败."""
     with pytest.raises(ValueError, match="port"):
         parse_options(["--port", "70000"])
+
+
+def test_until_idle_is_only_available_for_index_mode() -> None:
+    """一次性消费不能误用于 all/api/worker 模式."""
+    assert parse_options(["--mode", "index", "--until-idle"]).until_idle is True
+    with pytest.raises(ValueError, match="until-idle"):
+        parse_options(["--mode", "all", "--until-idle"])
 
 
 def test_supervisor_stops_api_when_worker_fails() -> None:
@@ -132,5 +140,36 @@ def test_supervisor_cancels_worker_after_api_stops() -> None:
         assert worker_started.is_set()
         assert worker_cleaned.is_set()
         assert api_server.should_exit is True
+
+    asyncio.run(scenario())
+
+
+def test_supervisor_stops_all_components_when_index_fails() -> None:
+    """Index Scheduler 异常必须停止 API 和仍在运行的 Research Worker."""
+
+    async def scenario() -> None:
+        api_server = _WaitingApiServer()
+        research_cleaned = asyncio.Event()
+
+        async def waiting_research_worker() -> None:
+            try:
+                await asyncio.Event().wait()
+            finally:
+                research_cleaned.set()
+
+        async def failing_index_scheduler() -> None:
+            await api_server.startup_entered.wait()
+            raise ValueError("index startup failed")
+
+        with pytest.raises(RuntimeError, match="component failed") as captured:
+            await supervise_all(
+                api_server,
+                waiting_research_worker,
+                failing_index_scheduler,
+            )
+
+        assert api_server.should_exit is True
+        assert research_cleaned.is_set()
+        assert isinstance(captured.value.__cause__, ValueError)
 
     asyncio.run(scenario())

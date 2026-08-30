@@ -271,6 +271,9 @@ class Settings:
         )
         self.KNOWLEDGE_INDEX_MAX_ATTEMPTS = int(os.getenv("KNOWLEDGE_INDEX_MAX_ATTEMPTS", "3"))
         self.KNOWLEDGE_INDEX_LEASE_SECONDS = float(os.getenv("KNOWLEDGE_INDEX_LEASE_SECONDS", "300"))
+        # 常驻 Index Scheduler 在队列为空时的轮询间隔。保持短间隔可让上传后的
+        # 文档快速进入索引，同时避免空队列忙循环占用数据库连接和 CPU。
+        self.KNOWLEDGE_INDEX_POLL_INTERVAL_SECONDS = float(os.getenv("KNOWLEDGE_INDEX_POLL_INTERVAL_SECONDS", "2"))
         for name in (
             "KNOWLEDGE_MAX_UPLOAD_BYTES",
             "KNOWLEDGE_UPLOAD_READ_CHUNK_BYTES",
@@ -282,6 +285,8 @@ class Settings:
             raise ValueError("KNOWLEDGE_ALLOWED_CONTENT_TYPES must not be empty")
         if self.KNOWLEDGE_INDEX_LEASE_SECONDS <= 0:
             raise ValueError("KNOWLEDGE_INDEX_LEASE_SECONDS must be greater than 0")
+        if self.KNOWLEDGE_INDEX_POLL_INTERVAL_SECONDS <= 0:
+            raise ValueError("KNOWLEDGE_INDEX_POLL_INTERVAL_SECONDS must be greater than 0")
 
         # ---- RAG 解析、分块与向量版本 ----
         # 这些值会改变 chunk 边界或向量兼容性，因此必须进入确定性 ID/数据库

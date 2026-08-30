@@ -11,8 +11,8 @@ from typing import Any, Coroutine, Literal, Protocol, cast
 
 import uvicorn
 
-type RuntimeMode = Literal["all", "api", "worker"]
-type WorkerRunner = Callable[[], Coroutine[Any, Any, None]]
+type RuntimeMode = Literal["all", "api", "worker", "index"]
+type ComponentRunner = Callable[[], Coroutine[Any, Any, None]]
 
 
 class ApiServer(Protocol):
@@ -33,6 +33,7 @@ class RuntimeOptions:
     host: str
     port: int
     log_level: str
+    until_idle: bool
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -43,9 +44,9 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--mode",
-        choices=("all", "api", "worker"),
+        choices=("all", "api", "worker", "index"),
         default=os.getenv("DEEP_RESEARCH_RUNTIME_MODE", "all"),
-        help="运行组件；默认 all，同时启动 API 和 Research Worker。",
+        help="运行组件；默认 all，同时启动 API、Research Worker 和 Index Scheduler。",
     )
     parser.add_argument(
         "--host",
@@ -64,6 +65,11 @@ def build_parser() -> argparse.ArgumentParser:
         default=os.getenv("DEEP_RESEARCH_RUNTIME_LOG_LEVEL", "info"),
         help="Uvicorn 日志等级，默认 info。",
     )
+    parser.add_argument(
+        "--until-idle",
+        action="store_true",
+        help="仅用于 index 模式；处理到索引队列为空后退出。",
+    )
     return parser
 
 
@@ -81,11 +87,14 @@ def parse_options(argv: Sequence[str] | None = None) -> RuntimeOptions:
         raise ValueError("port must be between 1 and 65535")
     if not namespace.host.strip():
         raise ValueError("host must not be empty")
+    if namespace.until_idle and namespace.mode != "index":
+        raise ValueError("--until-idle is only valid with --mode index")
     return RuntimeOptions(
         mode=cast(RuntimeMode, namespace.mode),
         host=namespace.host,
         port=namespace.port,
         log_level=namespace.log_level,
+        until_idle=namespace.until_idle,
     )
 
 
@@ -101,40 +110,87 @@ def create_api_server(options: RuntimeOptions) -> uvicorn.Server:
         port=options.port,
         log_level=options.log_level,
         reload=False,
+        # Uvicorn 默认 log_config 会安装自己的 handler，绕过应用按组件拆分的
+        # JSONL 管线。禁用它后，标准库日志沿当前 api ContextVar 进入 api 文件。
+        log_config=None,
     )
     return uvicorn.Server(config)
 
 
 async def _run_standalone_worker() -> None:
     """惰性导入并运行独立 Worker，保持 ``--help`` 没有配置副作用."""
+    from app.core.logging import component_context
     from app.entrypoints.research_worker import run_worker
 
-    await run_worker()
+    with component_context("research-worker"):
+        await run_worker()
 
 
 async def _run_supervised_worker() -> None:
     """运行由 FastAPI lifespan 统一拥有 tracing 的 Worker."""
+    from app.core.logging import component_context
     from app.entrypoints.research_worker import run_worker
 
-    await run_worker(manage_tracing=False)
+    with component_context("research-worker"):
+        await run_worker(manage_tracing=False)
 
 
-async def supervise_all(api_server: ApiServer, worker_runner: WorkerRunner = _run_supervised_worker) -> None:
-    """并发运行 API 与 Worker，任一组件结束时收敛整个 Runtime.
+async def _run_index_scheduler() -> None:
+    """惰性导入并运行常驻 Index Scheduler."""
+    from app.core.logging import component_context
+    from app.entrypoints.index_worker import run_scheduler
+
+    with component_context("index-worker"):
+        await run_scheduler()
+
+
+async def _run_index_until_idle() -> None:
+    """惰性导入并运行一次性 Index Worker."""
+    from app.core.logging import component_context, logger
+    from app.entrypoints.index_worker import run_until_idle
+
+    with component_context("index-worker"):
+        summary = await run_until_idle()
+        logger.info("index_worker_until_idle_completed", **summary)
+
+
+async def _serve_api(api_server: ApiServer) -> None:
+    """在 api 日志组件上下文中运行 Uvicorn."""
+    from app.core.logging import component_context
+
+    with component_context("api"):
+        await api_server.serve()
+
+
+async def supervise_all(
+    api_server: ApiServer,
+    worker_runner: ComponentRunner = _run_supervised_worker,
+    index_runner: ComponentRunner | None = None,
+) -> None:
+    """并发运行 API 与后台消费者，任一组件结束时收敛 Runtime.
 
     API 正常响应 Ctrl+C 后会返回，本函数随即取消 Worker；Worker 的 finally 会
     关闭连接池且不会把进程关闭伪装成用户取消。若 Worker 初始化或运行异常，
     Supervisor 会要求 Uvicorn 优雅停止并向进程入口传播异常，使 systemd 能够
     根据非零退出码重启，而不是留下“API 正常、任务永远 pending”的半健康服务。
     """
-    api_task = asyncio.create_task(api_server.serve(), name="deep-research-api")
-    worker_task = asyncio.create_task(worker_runner(), name="deep-research-worker")
+    api_task = asyncio.create_task(_serve_api(api_server), name="deep-research-api")
+    component_tasks: dict[str, asyncio.Task[None]] = {
+        "Research Worker": asyncio.create_task(worker_runner(), name="deep-research-worker")
+    }
+    if index_runner is not None:
+        component_tasks["Index Scheduler"] = asyncio.create_task(index_runner(), name="deep-research-index")
     failure: BaseException | None = None
 
     try:
-        done, _ = await asyncio.wait((api_task, worker_task), return_when=asyncio.FIRST_COMPLETED)
-        if worker_task in done and not worker_task.cancelled():
-            failure = worker_task.exception() or RuntimeError("Research Worker stopped unexpectedly")
+        done, _ = await asyncio.wait(
+            (api_task, *component_tasks.values()),
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        for component_name, task in component_tasks.items():
+            if task in done and not task.cancelled():
+                failure = task.exception() or RuntimeError(f"{component_name} stopped unexpectedly")
+                break
         if api_task in done and not api_task.cancelled() and api_task.exception() is not None:
             failure = api_task.exception()
         elif api_task in done and not api_server.started:
@@ -143,11 +199,12 @@ async def supervise_all(api_server: ApiServer, worker_runner: WorkerRunner = _ru
         # 无论谁先退出，都先阻止 API 继续接收请求，再取消仍在运行的 Worker。
         # Uvicorn 看到 should_exit 后会执行 FastAPI lifespan 的完整 shutdown。
         api_server.should_exit = True
-        if not worker_task.done():
-            worker_task.cancel()
+        for task in component_tasks.values():
+            if not task.done():
+                task.cancel()
         if not api_task.done():
             await api_task
-        await asyncio.gather(worker_task, return_exceptions=True)
+        await asyncio.gather(*component_tasks.values(), return_exceptions=True)
 
     if failure is not None:
         raise RuntimeError("DeepResearch Runtime component failed") from failure
@@ -158,13 +215,19 @@ async def run(options: RuntimeOptions) -> None:
     if options.mode == "worker":
         await _run_standalone_worker()
         return
+    if options.mode == "index":
+        if options.until_idle:
+            await _run_index_until_idle()
+        else:
+            await _run_index_scheduler()
+        return
 
     api_server = create_api_server(options)
     if options.mode == "api":
-        await api_server.serve()
+        await _serve_api(api_server)
         return
 
-    await supervise_all(api_server)
+    await supervise_all(api_server, index_runner=_run_index_scheduler)
 
 
 def _event_loop_factory() -> asyncio.AbstractEventLoop:

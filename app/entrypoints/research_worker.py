@@ -1,13 +1,13 @@
 """持续运行的 Research Worker 入口实现."""
 
 import asyncio
-import json
 import selectors
 import sys
 from uuid import uuid4
 
 from app.agents.research.runtime import create_research_runtime
 from app.core.config import settings
+from app.core.logging import component_context, logger
 from app.graphrag.runtime import create_graphrag_runtime
 from app.infrastructure.factory import create_application_resources
 from app.infrastructure.file_storage import LocalFileStorage
@@ -65,13 +65,13 @@ async def run_worker(*, idle_sleep_seconds: float = 1.0, manage_tracing: bool = 
         )
         # 输出固定字段而不是数据库连接或任务内容，便于 Supervisor/systemd 判断
         # 队列消费者已经完成初始化，同时避免凭据和研究主题进入启动日志。
-        print(json.dumps({"research_worker_status": "ready", "worker_id": worker_id}), flush=True)
+        logger.info("research_worker_ready", worker_id=worker_id)
         while True:
             result = await worker.run_once()
             if result is ResearchWorkerResult.IDLE:
                 await asyncio.sleep(idle_sleep_seconds)
             else:
-                print(json.dumps({"research_worker_result": result.value}), flush=True)
+                logger.info("research_worker_result", result=result.value)
     finally:
         if manage_tracing:
             tracing.close()
@@ -95,7 +95,8 @@ def _event_loop_factory() -> asyncio.AbstractEventLoop:
 def main() -> int:
     """运行独立 Worker 模式，并把 Ctrl+C 收敛为正常退出."""
     try:
-        asyncio.run(run_worker(), loop_factory=_event_loop_factory)
+        with component_context("research-worker"):
+            asyncio.run(run_worker(), loop_factory=_event_loop_factory)
     except KeyboardInterrupt:
         return 0
     return 0

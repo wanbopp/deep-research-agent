@@ -513,9 +513,10 @@ async def lifespan(
                     error_type=type(error).__name__,
                 )
 
-        # Phase 5 runtime 在这里主要提供 Hybrid Retriever；索引 worker 仍由独立
-        # run_index_worker.py 进程运行。随后把 Hybrid、GraphRAG 和同一个持久
-        # checkpointer 装配成共享研究图，任何请求都不会重复编译节点拓扑。
+        # API lifespan 在这里主要装配 Hybrid Retriever；真正消费 IndexJob 的
+        # Index Scheduler 由统一 Runtime 的独立组件运行。api-only 模式不会领取
+        # 索引任务。随后把 Hybrid、GraphRAG 和同一个持久 checkpointer 装配成
+        # 共享研究图，任何请求都不会重复编译节点拓扑。
         _, hybrid_retriever = create_rag_runtime(
             config=config,
             session_factory=resources.orm_session_factory,
