@@ -18,6 +18,7 @@ from app.agents.research.writer import ResearchWriter
 from app.core.config import Settings
 from app.graphrag.runtime import GraphRAGRuntime
 from app.rag.hybrid import HybridRetriever
+from app.runtime import BudgetPolicy
 from app.schemas.llm import ModelSpec
 from app.schemas.research import RetrievalStrategy
 from app.services.llm.factory import create_openai_chat_model
@@ -70,6 +71,14 @@ def create_research_runtime(
         total_timeout_seconds=config.LLM_TOTAL_TIMEOUT,
     )
     aliases = (RESEARCH_MODEL_ALIAS,)
+    budget_policy = BudgetPolicy(
+        total_timeout_seconds=300.0,
+        max_input_tokens=config.RUNTIME_MAX_INPUT_TOKENS,
+        max_tool_output_tokens=config.RUNTIME_MAX_TOOL_OUTPUT_TOKENS,
+        max_evidence=30,
+        max_retrieval_candidates=80,
+        max_parallel_operations=config.RUNTIME_MAX_PARALLEL_OPERATIONS,
+    )
     retriever = ParallelResearchRetriever(
         router=ResearchRouter(),
         retrievers={
@@ -78,11 +87,12 @@ def create_research_runtime(
             RetrievalStrategy.GRAPH_GLOBAL: GlobalGraphEvidenceRetriever(graphrag_runtime.global_retriever),
             RetrievalStrategy.WEB: WebEvidenceRetriever(),
         },
+        budget_policy=budget_policy,
     )
     return build_research_graph(
         planner=ResearchPlanner(llm_service, aliases=aliases),
         retriever=retriever,
-        validator=ResearchValidator(llm_service, aliases=aliases),
+        validator=ResearchValidator(llm_service, aliases=aliases, budget_policy=budget_policy),
         writer=ResearchWriter(llm_service, aliases=aliases),
         checkpointer=checkpointer,
     )

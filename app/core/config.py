@@ -144,6 +144,21 @@ class Settings:
         self.LLM_TOTAL_TIMEOUT = int(os.getenv("LLM_TOTAL_TIMEOUT", "60"))
         self.MAX_TOKENS = int(os.getenv("MAX_TOKENS", "2000"))
 
+        # ---- 统一运行预算硬上限 ----
+        # 请求和任务配置只能在这些值之下继续收紧，不能通过传入更大数字扩容。
+        self.RUNTIME_MAX_INPUT_TOKENS = int(os.getenv("RUNTIME_MAX_INPUT_TOKENS", "12000"))
+        self.RUNTIME_MAX_TOOL_OUTPUT_TOKENS = int(os.getenv("RUNTIME_MAX_TOOL_OUTPUT_TOKENS", "2000"))
+        self.RUNTIME_MAX_PARALLEL_OPERATIONS = int(os.getenv("RUNTIME_MAX_PARALLEL_OPERATIONS", "12"))
+        for name in (
+            "RUNTIME_MAX_INPUT_TOKENS",
+            "RUNTIME_MAX_TOOL_OUTPUT_TOKENS",
+            "RUNTIME_MAX_PARALLEL_OPERATIONS",
+        ):
+            if getattr(self, name) <= 0:
+                raise ValueError(f"{name} must be greater than 0")
+        if self.RUNTIME_MAX_INPUT_TOKENS < 256:
+            raise ValueError("RUNTIME_MAX_INPUT_TOKENS must be at least 256")
+
         # ---- Embedding 配置 ----
         # Embedding 与聊天模型共享 OpenAI-compatible 凭据和 Base URL，但模型、
         # 维度和超时独立配置。向量维度一旦写入 PostgreSQL schema 就不能随意

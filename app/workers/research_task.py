@@ -22,6 +22,7 @@ from app.observability import metrics, tracing
 from app.repositories import ResearchTaskRepository
 from app.schemas.research import ResearchConfig, ResearchReport, ResearchStatus
 from app.schemas.research_events import ResearchEventType
+from app.runtime import BudgetPolicy
 
 
 class ResearchWorkerResult(StrEnum):
@@ -54,6 +55,7 @@ class ResearchTaskWorker:
         cancellation_poll_seconds: float = 0.5,
         heartbeat_interval_seconds: float = 10.0,
         stale_after_seconds: float = 120.0,
+        budget_policy: BudgetPolicy | None = None,
     ) -> None:
         """保存共享工厂、研究图和当前 worker 身份.
 
@@ -64,6 +66,7 @@ class ResearchTaskWorker:
             cancellation_poll_seconds: 检查持久取消标记的间隔。
             heartbeat_interval_seconds: Graph 长节点运行时续写 worker 存活时间的间隔。
             stale_after_seconds: 认为旧 worker 已失联的心跳时长。
+            budget_policy: 服务端统一硬预算；任务配置只能继续收紧。
         """
         if cancellation_poll_seconds <= 0 or heartbeat_interval_seconds <= 0 or stale_after_seconds <= 0:
             raise ValueError("worker timing values must be greater than zero")
@@ -75,6 +78,7 @@ class ResearchTaskWorker:
         self._cancellation_poll_seconds = cancellation_poll_seconds
         self._heartbeat_interval_seconds = heartbeat_interval_seconds
         self._stale_after_seconds = stale_after_seconds
+        self._budget = budget_policy or BudgetPolicy()
 
     async def run_once(self) -> ResearchWorkerResult:
         """恢复过期任务、原子领取一条任务并执行，队列为空时返回 idle."""
@@ -213,7 +217,7 @@ class ResearchTaskWorker:
         }
         runnable_config: RunnableConfig = {"configurable": {"thread_id": task.checkpoint_thread_id}}
         context = ResearchRuntimeContext(user_id=task.user_id, research_id=task.id)
-        async with asyncio.timeout(config.timeout_seconds):
+        async with asyncio.timeout(min(config.timeout_seconds, self._budget.total_timeout_seconds)):
             async for update in self._graph.astream(
                 initial,
                 config=runnable_config,
@@ -236,7 +240,9 @@ class ResearchTaskWorker:
     ) -> None:
         """只保存节点名、状态和计数，不把证据正文复制进事件表."""
         with tracing.span("research.node", node_name=node_name):
-            payload: dict[str, object] = {"run_id": str(run_id), "node": node_name}
+            # run_id 属于事件 envelope，由 Repository 独立写入；严格 payload 只保留
+            # 节点事实，避免同一关联字段在两层重复并导致协议校验失败。
+            payload: dict[str, object] = {"node": node_name}
             if isinstance(update, Mapping):
                 status = update.get("status")
                 if isinstance(status, StrEnum):

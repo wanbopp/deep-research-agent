@@ -129,7 +129,7 @@ def create_graphrag_runtime(
         local=LocalGraphRetriever(repository=repository, linker=linker),
         global_retriever=GlobalGraphRetriever(repository=repository, embedder=embedder),
         global_answerer=GlobalGraphAnswerer(llm_service, aliases=(GRAPHRAG_MODEL_ALIAS,)),
-        context=GraphContextAssembler(),
+        context=GraphContextAssembler(max_tokens=max(256, config.RUNTIME_MAX_INPUT_TOKENS // 4)),
     )
 
 

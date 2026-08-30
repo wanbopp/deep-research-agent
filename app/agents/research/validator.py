@@ -17,18 +17,34 @@ from app.schemas.research import (
     ValidatedFact,
     ValidationResult,
 )
+from app.runtime import (
+    BudgetPolicy,
+    ContextAllocator,
+    ContextFragment,
+    ContextKind,
+    ContextSource,
+    Sensitivity,
+    TrustLevel,
+)
 from app.services.llm.service import LLMService
 
 
 class ResearchValidator:
     """先执行确定性检查，再让模型判断证据内容是否支持研究结论."""
 
-    def __init__(self, llm_service: LLMService, *, aliases: tuple[str, ...]) -> None:
+    def __init__(
+        self,
+        llm_service: LLMService,
+        *,
+        aliases: tuple[str, ...],
+        budget_policy: BudgetPolicy | None = None,
+    ) -> None:
         """保存统一模型服务和按优先级排列的真实模型别名."""
         if not aliases:
             raise ValueError("validator aliases must not be empty")
         self._llm_service = llm_service
         self._aliases = aliases
+        self._budget = budget_policy or BudgetPolicy()
 
     async def __call__(
         self,
@@ -65,16 +81,47 @@ class ResearchValidator:
             )
             return self._next_update(state, result)
 
-        rendered = "\n\n".join(f"[{item.evidence_id}] source={item.source_key}\n{item.content}" for item in evidence)
-        base_messages = (
-            SystemMessage(
-                content=(
-                    "Validate the research evidence. Create only facts directly supported by the listed "
-                    "evidence IDs. Preserve conflicts. If evidence is insufficient, request focused follow-up "
-                    "queries. Never invent an evidence ID."
-                )
+        instruction = (
+            "Validate the research evidence. Create only facts directly supported by the listed "
+            "evidence IDs. Preserve conflicts. If evidence is insufficient, request focused follow-up "
+            "queries. Never invent an evidence ID."
+        )
+        source_by_kind = {
+            "document": ContextSource.HYBRID_RAG,
+            "graph": ContextSource.GRAPH_RAG,
+            "web": ContextSource.WEB,
+        }
+        fragments = (
+            ContextFragment(
+                kind=ContextKind.INSTRUCTION,
+                source=ContextSource.SYSTEM,
+                trust_level=TrustLevel.TRUSTED,
+                sensitivity=Sensitivity.INTERNAL,
+                content=instruction,
             ),
-            HumanMessage(content=f"Topic: {state['topic']}\n\nEvidence:\n{rendered}"),
+            ContextFragment(
+                kind=ContextKind.USER_INPUT,
+                source=ContextSource.USER_TOPIC,
+                trust_level=TrustLevel.UNTRUSTED,
+                sensitivity=Sensitivity.USER_PRIVATE,
+                content=f"Topic: {state['topic']}",
+            ),
+            *(
+                ContextFragment(
+                    kind=ContextKind.EVIDENCE,
+                    source=source_by_kind[item.source_kind.value],
+                    trust_level=TrustLevel.UNTRUSTED,
+                    sensitivity=Sensitivity.USER_PRIVATE,
+                    content=f"[{item.evidence_id}] source={item.source_key}\n{item.content}",
+                )
+                for item in evidence
+            ),
+        )
+        allocated = ContextAllocator(max_tokens=self._budget.max_input_tokens).allocate(fragments)
+        visible_evidence = tuple(item for item in evidence if f"[{item.evidence_id}]" in allocated.text)
+        base_messages = (
+            SystemMessage(content=allocated.fragments[0].content),
+            HumanMessage(content="\n\n".join(fragment.content for fragment in allocated.fragments[1:])),
         )
         result = await self._llm_service.call_structured(
             base_messages,
@@ -83,7 +130,7 @@ class ResearchValidator:
             overrides={"temperature": 0.0},
         )
 
-        allowed_ids = {item.evidence_id for item in evidence}
+        allowed_ids = {item.evidence_id for item in visible_evidence}
         unknown_ids = self._unknown_ids(result, allowed_ids)
         if unknown_ids:
             # 模型偶发编造 ID 时先给一次纠正机会：明确列出合法 ID 集合，

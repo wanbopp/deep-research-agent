@@ -111,12 +111,15 @@ async def run_smoke() -> dict[str, object]:
         required_events = {
             "task_created",
             "task_started",
-            "node_planner_completed",
-            "node_retrieve_completed",
-            "node_validate_completed",
-            "node_write_completed",
+            "node_completed",
             "task_completed",
         }
+        completed_nodes = {
+            node
+            for event in events
+            if event.event == "node_completed" and isinstance((node := getattr(event.payload, "node", None)), str)
+        }
+        required_nodes = {"planner", "retrieve", "validate", "write"}
         citation_count = len(report.citations) if report is not None else 0
         citation_ids = {item.citation_id for item in report.citations} if report is not None else set()
         used_ids = (
@@ -133,6 +136,7 @@ async def run_smoke() -> dict[str, object]:
             and bool(used_ids)
             and used_ids <= citation_ids
             and required_events <= set(event_names)
+            and required_nodes <= completed_nodes
             and completed.markdown_report is not None
         )
         return {
@@ -143,6 +147,7 @@ async def run_smoke() -> dict[str, object]:
             "task_status": completed.status,
             "event_count": len(events),
             "required_events_present": required_events <= set(event_names),
+            "required_nodes_present": required_nodes <= completed_nodes,
             "citation_count": citation_count,
             "citations_valid": bool(used_ids) and used_ids <= citation_ids,
             "markdown_available": completed.markdown_report is not None,

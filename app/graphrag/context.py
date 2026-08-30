@@ -8,21 +8,27 @@ from app.graphrag.schemas import (
     GraphContext,
     LocalGraphResult,
 )
+from app.runtime import (
+    ContextAllocator,
+    ContextFragment,
+    ContextKind,
+    ContextSource,
+    Sensitivity,
+    TrustLevel,
+)
 
 
 class GraphContextAssembler:
     """按硬字符预算组装路径和社区摘要，并维护稳定引用表."""
 
-    def __init__(self, *, max_characters: int = 12000) -> None:
-        """设置简单可预测的预模型预算；Phase 7 还会施加 token 总预算."""
-        if max_characters <= 0:
-            raise ValueError("max_characters must be greater than zero")
-        self._max_characters = max_characters
+    def __init__(self, *, max_tokens: int = 3000) -> None:
+        """使用与其他来源一致的 token 硬预算，不再混用字符估算."""
+        self._allocator = ContextAllocator(max_tokens=max_tokens)
 
     def assemble(self, *, local: LocalGraphResult, global_result: GlobalGraphResult) -> GraphContext:
         """生成图证据正文；社区摘要的引用仍指向原始 source chunk."""
         citations: dict[object, GraphCitation] = {}
-        parts: list[str] = []
+        fragments: list[ContextFragment] = []
 
         def citation_for(chunk_id: object) -> str:
             citation_id = "G" + sha256(str(chunk_id).encode()).hexdigest()[:8].upper()
@@ -36,16 +42,41 @@ class GraphContextAssembler:
             labels = [citation_for(chunk_id) for chunk_id in path.source_chunk_ids]
             relation_text = " -> ".join(path.entity_names)
             part = f"[Path {' '.join(labels)}] {relation_text}: {' | '.join(path.evidence_texts)}"
-            if sum(len(value) for value in parts) + len(part) <= self._max_characters:
-                parts.append(part)
+            fragments.append(
+                ContextFragment(
+                    kind=ContextKind.EVIDENCE,
+                    source=ContextSource.GRAPH_RAG,
+                    trust_level=TrustLevel.UNTRUSTED,
+                    sensitivity=Sensitivity.USER_PRIVATE,
+                    content=part,
+                )
+            )
 
         for community in global_result.communities:
             labels = [citation_for(chunk_id) for chunk_id in community.source_chunk_ids]
             part = f"[Community {' '.join(labels)}] {community.title}: {community.summary}"
-            if sum(len(value) for value in parts) + len(part) <= self._max_characters:
-                parts.append(part)
+            fragments.append(
+                ContextFragment(
+                    kind=ContextKind.EVIDENCE,
+                    source=ContextSource.GRAPH_RAG,
+                    trust_level=TrustLevel.UNTRUSTED,
+                    sensitivity=Sensitivity.USER_PRIVATE,
+                    content=part,
+                )
+            )
 
-        return GraphContext(text="\n\n".join(parts), citations=tuple(citations.values()))
+        allocated = self._allocator.allocate(tuple(fragments))
+        included = {
+            citation_id
+            for citation_id in (citation.citation_id for citation in citations.values())
+            if f"[{citation_id}]" in allocated.text or f" {citation_id}]" in allocated.text
+        }
+        return GraphContext(
+            text=allocated.text,
+            citations=tuple(citation for citation in citations.values() if citation.citation_id in included),
+            token_count=allocated.token_count,
+            truncated_fragment_count=allocated.truncated_fragment_count,
+        )
 
 
 __all__ = ["GraphContextAssembler"]

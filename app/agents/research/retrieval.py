@@ -32,6 +32,7 @@ from app.schemas.research import (
     RetrievalStrategy,
     ValidationResult,
 )
+from app.runtime import BudgetPolicy
 
 
 class EvidenceRetriever(Protocol):
@@ -194,10 +195,17 @@ class WebEvidenceRetriever:
 class ParallelResearchRetriever:
     """按步骤并行执行查找，并允许单条来源失败后保留其他结果."""
 
-    def __init__(self, *, router: ResearchRouter, retrievers: Mapping[RetrievalStrategy, EvidenceRetriever]) -> None:
+    def __init__(
+        self,
+        *,
+        router: ResearchRouter,
+        retrievers: Mapping[RetrievalStrategy, EvidenceRetriever],
+        budget_policy: BudgetPolicy | None = None,
+    ) -> None:
         """保存无请求状态 Router 和按策略注册的查找适配器."""
         self._router = router
         self._retrievers = dict(retrievers)
+        self._budget = budget_policy or BudgetPolicy()
 
     async def __call__(
         self,
@@ -258,7 +266,10 @@ class ParallelResearchRetriever:
                 return RetrievalFailure(step_id=step.step_id, strategy=strategy, error_type="UnavailableRetriever")
             started_at = perf_counter()
             try:
-                async with asyncio.timeout(min(30.0, config.timeout_seconds)):
+                async with (
+                    semaphore,
+                    asyncio.timeout(min(30.0, config.timeout_seconds, self._budget.total_timeout_seconds)),
+                ):
                     # query 和证据正文不进入 trace；只关联有限检索策略与研究 ID。
                     with tracing.span(
                         "retrieval",
@@ -269,7 +280,7 @@ class ParallelResearchRetriever:
                             user_id=runtime.context.user_id,
                             step=step,
                             query=query,
-                            top_k=config.max_evidence_per_step,
+                            top_k=min(config.max_evidence_per_step, self._budget.max_retrieval_candidates),
                         )
                     metrics.observe_retrieval(
                         strategy=strategy.value,
@@ -294,6 +305,7 @@ class ParallelResearchRetriever:
                 )
                 return RetrievalFailure(step_id=step.step_id, strategy=strategy, error_type=type(error).__name__)
 
+        semaphore = asyncio.Semaphore(self._budget.max_parallel_operations)
         results = await asyncio.gather(*(run_one(*item) for item in work))
         evidence: list[Evidence] = []
         failures: list[RetrievalFailure] = []
@@ -305,7 +317,7 @@ class ParallelResearchRetriever:
 
         # 全局上限在合并前执行，避免一个宽泛查询压垮 checkpoint 和 Writer 输入。
         limited = tuple(sorted(evidence, key=lambda item: (-item.score, item.evidence_id)))[
-            : config.max_total_evidence
+            : min(config.max_total_evidence, self._budget.max_evidence)
         ]
         return {
             # 节点内部使用模型获得类型保护，跨节点边界则降为 JSON 数据交给

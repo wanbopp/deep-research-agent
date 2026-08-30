@@ -381,6 +381,8 @@ class GraphContext(_StrictGraphModel):
 
     text: str
     citations: tuple[GraphCitation, ...]
+    token_count: int = Field(default=0, ge=0)
+    truncated_fragment_count: int = Field(default=0, ge=0)
 
 
 class CommunityMapResult(_StrictGraphModel):
