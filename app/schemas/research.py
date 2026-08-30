@@ -10,6 +10,8 @@ from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field, HttpUrl, model_validator
 
+from app.schemas.research_events import ResearchEventResponse
+
 
 class _StrictResearchModel(BaseModel):
     """研究流程共享的严格、不可变值对象.
@@ -264,15 +266,6 @@ class ResearchTaskListResponse(_StrictResearchModel):
     """当前用户研究任务列表."""
 
     tasks: tuple[ResearchTaskResponse, ...]
-
-
-class ResearchEventResponse(_StrictResearchModel):
-    """可以编码为 SSE 的持久进度事件."""
-
-    event_id: int = Field(ge=1)
-    event: str = Field(min_length=1, max_length=64)
-    payload: dict[str, object]
-    created_at: datetime
 
 
 __all__ = [

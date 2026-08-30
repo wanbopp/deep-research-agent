@@ -9,6 +9,7 @@ from sqlmodel import select
 
 from app.models import ResearchEvent, ResearchTask, ResearchTaskStatus, utc_now
 from app.repositories.base import RepositoryBase
+from app.schemas.research_events import ResearchEventType, validate_research_event_payload
 
 
 class ResearchTaskRepository(RepositoryBase):
@@ -120,15 +121,18 @@ class ResearchTaskRepository(RepositoryBase):
         *,
         task_id: UUID,
         user_id: UUID,
-        event_type: str,
+        event_type: ResearchEventType,
+        run_id: UUID | None = None,
         payload: dict[str, object] | None = None,
     ) -> ResearchEvent:
         """在任务状态事务中追加一个可重放进度事件."""
         event = ResearchEvent(
             research_task_id=task_id,
             user_id=user_id,
-            event_type=event_type,
-            payload_json=payload or {},
+            event_type=event_type.value,
+            schema_version=1,
+            run_id=run_id,
+            payload_json=validate_research_event_payload(event_type, payload or {}),
         )
         return await self._persist(event, resource="research_event")
 
@@ -262,9 +266,9 @@ class ResearchTaskRepository(RepositoryBase):
             await self.append_event(
                 task_id=task.id,
                 user_id=task.user_id,
-                event_type="run_lease_expired",
+                event_type=ResearchEventType.RUN_LEASE_EXPIRED,
                 payload={
-                    "run_id": str(expired_run_id) if expired_run_id is not None else None,
+                    "expired_run_id": str(expired_run_id) if expired_run_id is not None else None,
                     # SQLModel 的 String 列在部分加载路径返回普通 str，在另一些
                     # 路径保留 StrEnum；统一用 str()，避免恢复流程依赖 ORM 细节。
                     "previous_status": str(previous_status),

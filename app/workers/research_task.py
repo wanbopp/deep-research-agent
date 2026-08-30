@@ -21,6 +21,7 @@ from app.models import ResearchTask, ResearchTaskStatus, utc_now
 from app.observability import metrics
 from app.repositories import ResearchTaskRepository
 from app.schemas.research import ResearchConfig, ResearchReport, ResearchStatus
+from app.schemas.research_events import ResearchEventType
 
 
 class ResearchWorkerResult(StrEnum):
@@ -91,8 +92,9 @@ class ResearchTaskWorker:
             await repository.append_event(
                 task_id=task.id,
                 user_id=task.user_id,
-                event_type="task_started",
-                payload={"run_id": str(run_id), "attempt_count": task.attempt_count},
+                event_type=ResearchEventType.TASK_STARTED,
+                run_id=run_id,
+                payload={"attempt_count": task.attempt_count},
             )
 
         metrics.research_worker_inflight.inc()
@@ -161,8 +163,9 @@ class ResearchTaskWorker:
             await repository.append_event(
                 task_id=current.id,
                 user_id=current.user_id,
-                event_type="task_completed",
-                payload={"run_id": str(run_id), "status": ResearchTaskStatus.COMPLETED.value},
+                event_type=ResearchEventType.TASK_COMPLETED,
+                run_id=run_id,
+                payload={"status": ResearchTaskStatus.COMPLETED.value},
             )
         return ResearchWorkerResult.COMPLETED
 
@@ -244,7 +247,8 @@ class ResearchTaskWorker:
             await repository.append_event(
                 task_id=task.id,
                 user_id=task.user_id,
-                event_type=f"node_{node_name}_completed",
+                event_type=ResearchEventType.NODE_COMPLETED,
+                run_id=run_id,
                 payload=payload,
             )
 
@@ -291,8 +295,9 @@ class ResearchTaskWorker:
             await repository.append_event(
                 task_id=task.id,
                 user_id=task.user_id,
-                event_type="task_cancelled",
-                payload={"run_id": str(run_id), "status": ResearchTaskStatus.CANCELLED.value},
+                event_type=ResearchEventType.TASK_CANCELLED,
+                run_id=run_id,
+                payload={"status": ResearchTaskStatus.CANCELLED.value},
             )
 
     async def _finalize_failed(self, task_id: UUID, *, run_id: UUID, error_type: str) -> None:
@@ -315,8 +320,9 @@ class ResearchTaskWorker:
             await repository.append_event(
                 task_id=task.id,
                 user_id=task.user_id,
-                event_type="task_failed",
-                payload={"run_id": str(run_id), "error_code": error_type[:128]},
+                event_type=ResearchEventType.TASK_FAILED,
+                run_id=run_id,
+                payload={"error_code": error_type[:128]},
             )
 
 

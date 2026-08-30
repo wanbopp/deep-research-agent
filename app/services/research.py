@@ -10,11 +10,11 @@ from app.repositories import ResearchTaskRepository
 from app.schemas.research import (
     ResearchConfig,
     ResearchCreateRequest,
-    ResearchEventResponse,
     ResearchReport,
     ResearchTaskListResponse,
     ResearchTaskResponse,
 )
+from app.schemas.research_events import ResearchEventResponse, ResearchEventType, parse_research_event
 
 
 class ResearchServiceError(RuntimeError):
@@ -82,7 +82,7 @@ class ResearchService:
             await repository.append_event(
                 task_id=task.id,
                 user_id=user_id,
-                event_type="task_created",
+                event_type=ResearchEventType.TASK_CREATED,
                 payload={"status": str(task.status)},
             )
         return self._to_response(task), True
@@ -117,10 +117,10 @@ class ResearchService:
             if task.status in {ResearchTaskStatus.PENDING, ResearchTaskStatus.RETRYING}:
                 task.status = ResearchTaskStatus.CANCELLED
                 task.completed_at = now
-                event_type = "task_cancelled"
+                event_type = ResearchEventType.TASK_CANCELLED
             else:
                 task.status = ResearchTaskStatus.CANCELLING
-                event_type = "cancellation_requested"
+                event_type = ResearchEventType.CANCELLATION_REQUESTED
             await repository.append_event(
                 task_id=task.id,
                 user_id=user_id,
@@ -147,7 +147,7 @@ class ResearchService:
             await repository.append_event(
                 task_id=task.id,
                 user_id=user_id,
-                event_type="task_retrying",
+                event_type=ResearchEventType.TASK_RETRYING,
                 payload={"attempt_count": task.attempt_count},
             )
         return self._to_response(task)
@@ -190,11 +190,15 @@ class ResearchService:
         """要求数据库事件已有自增 ID 后再公开."""
         if event.id is None:
             raise RuntimeError("persisted research event is missing its ID")
-        return ResearchEventResponse(
-            event_id=event.id,
-            event=event.event_type,
-            payload=event.payload_json,
-            created_at=event.created_at,
+        return parse_research_event(
+            {
+                "event_id": event.id,
+                "schema_version": event.schema_version,
+                "event": event.event_type,
+                "run_id": event.run_id,
+                "payload": event.payload_json,
+                "created_at": event.created_at,
+            }
         )
 
 

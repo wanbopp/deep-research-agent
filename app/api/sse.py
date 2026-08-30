@@ -1,7 +1,7 @@
 """Server-Sent Events encoding helpers."""
 
 from app.schemas.chat import ChatStreamEvent
-from app.schemas.research import ResearchEventResponse
+from app.schemas.research_events import ResearchEventResponse
 
 
 def encode_sse_event(event: ChatStreamEvent) -> str:

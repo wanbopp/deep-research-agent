@@ -91,12 +91,17 @@ class ResearchEvent(SQLModel, table=True):
     """SSE 可重放的单调进度事件."""
 
     __tablename__: Any = "research_events"
-    __table_args__ = (Index("ix_research_events_task_id_id", "research_task_id", "id"),)
+    __table_args__ = (
+        Index("ix_research_events_task_id_id", "research_task_id", "id"),
+        CheckConstraint("schema_version IN (0, 1)", name="ck_research_events_schema_version"),
+    )
 
     id: int | None = Field(default=None, primary_key=True)
     research_task_id: UUID = Field(foreign_key="research_tasks.id", nullable=False, index=True, ondelete="CASCADE")
     user_id: UUID = Field(foreign_key="users.id", nullable=False, index=True)
     event_type: str = Field(sa_column=Column(String(64), nullable=False))
+    schema_version: int = Field(default=1, sa_column=Column(Integer, nullable=False))
+    run_id: UUID | None = Field(default=None, nullable=True, index=True)
     payload_json: dict[str, object] = Field(default_factory=dict, sa_column=Column(JSON, nullable=False))
     created_at: datetime = Field(default_factory=utc_now, sa_type=UTCDateTime, nullable=False)
 
