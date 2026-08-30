@@ -1,7 +1,7 @@
 """Application service for running chat Agent turns."""
 
 import asyncio
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Mapping
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from typing import Any, Literal
@@ -29,7 +29,9 @@ from app.schemas.chat import (
     ChatResponse,
     ChatResumeRequest,
     ChatStreamEvent,
+    ChatTimelineSnapshotResponse,
     ChatTimelineEvent,
+    ChatTurnCheckpoint,
     TokenStreamEvent,
     TurnCompletedEvent,
     TurnStartedEvent,
@@ -38,6 +40,7 @@ from app.schemas.chat import (
     ItemDeltaEvent,
     ItemStartedEvent,
     PendingActionCreatedEvent,
+    PendingActionResolvedEvent,
     TimelineErrorEvent,
 )
 from app.services.chat_session_ownership import (
@@ -510,10 +513,20 @@ class ChatService:
         # dict[str, list[HumanMessage]]。list 是不变类型；虽然 HumanMessage 属于
         # AnyMessage，list[HumanMessage] 仍不能自动替代 list[AnyMessage]。
         turn_id = uuid4()
+        checkpoint = ChatTurnCheckpoint(
+            turn_id=turn_id,
+            client_message_id=request.client_message_id or uuid4(),
+            user_item_id=uuid4(),
+            agent_item_id=uuid4(),
+            pending_item_id=uuid4(),
+            request_id=uuid4(),
+            user_message=request.message,
+        )
         graph_input: ChatState = {
             "messages": [
                 HumanMessage(content=request.message),
-            ]
+            ],
+            "turn": checkpoint.model_dump(mode="json"),
         }
 
         runtime_context = self._build_runtime_context(user_id)
@@ -538,8 +551,13 @@ class ChatService:
                     config=config,
                     thread_id=request.thread_id,
                     turn_id=turn_id,
-                    client_message_id=request.client_message_id,
+                    client_message_id=checkpoint.client_message_id,
                 )
+                if isinstance(turn_result, ChatResponse):
+                    await self._graph.aupdate_state(
+                        config,
+                        {"turn": checkpoint.model_copy(update={"status": "completed"}).model_dump(mode="json")},
+                    )
 
         # 执行到这里说明 timeout 和 guard 都已经正常退出。
         # 后台模型调用不能占用同一 thread 的 Graph 执行权。所以必须放到外面
@@ -589,6 +607,13 @@ class ChatService:
             async with asyncio.timeout(self._graph_timeout_seconds):
                 # 用户 B 即使猜到用户 A 的公开 thread ID，读取的也是 B 自己的内部空间。
                 snapshot = await self._graph.aget_state(config)
+                checkpoint = self._turn_checkpoint_from_values(snapshot.values)
+                if checkpoint is not None:
+                    if request.turn_id is not None and request.turn_id != checkpoint.turn_id:
+                        raise ChatResumeNotAvailableError
+                    if request.request_id is not None and request.request_id != checkpoint.request_id:
+                        raise ChatResumeNotAvailableError
+                    turn_id = checkpoint.turn_id
                 interrupts = tuple(interrupt for task in snapshot.tasks for interrupt in task.interrupts)
                 if not interrupts:
                     raise ChatResumeNotAvailableError
@@ -608,6 +633,11 @@ class ChatService:
                     turn_id=turn_id,
                     client_message_id=request.client_message_id,
                 )
+                if checkpoint is not None and isinstance(turn_result, ChatResponse):
+                    await self._graph.aupdate_state(
+                        config,
+                        {"turn": checkpoint.model_copy(update={"status": "completed"}).model_dump(mode="json")},
+                    )
 
                 # resume 值会返回给被中断的工具；长期记忆的用户来源仍应是
                 # checkpoint 中触发当前 Agent 流程的最近一条 HumanMessage。
@@ -713,6 +743,154 @@ class ChatService:
 
         return ChatMessageHistoryResponse(messages=tuple(history))
 
+    @staticmethod
+    def _turn_checkpoint_from_values(values: object) -> ChatTurnCheckpoint | None:
+        """从 checkpoint values 严格恢复当前 Turn 元数据，旧 checkpoint 返回空."""
+        if not isinstance(values, Mapping):
+            return None
+        raw = values.get("turn")
+        if raw is None:
+            return None
+        try:
+            return ChatTurnCheckpoint.model_validate(raw)
+        except ValueError:
+            logger.warning("chat_turn_checkpoint_invalid")
+            return None
+
+    async def get_timeline_snapshot(
+        self,
+        *,
+        session_id: UUID,
+        user_id: UUID,
+    ) -> ChatTimelineSnapshotResponse:
+        """从持久 checkpoint 重建当前 Turn，供刷新后恢复 PendingAction/终态."""
+        await self._ownership_verifier.require_owned(session_id=session_id, user_id=user_id)
+        config = self._build_config(user_id=user_id, public_thread_id=session_id)
+        snapshot = await self._graph.aget_state(config)
+        checkpoint = self._turn_checkpoint_from_values(snapshot.values)
+        if checkpoint is None:
+            return ChatTimelineSnapshotResponse(thread_id=session_id)
+
+        events: list[ChatTimelineEvent] = [
+            TurnStartedEvent(
+                thread_id=session_id,
+                turn_id=checkpoint.turn_id,
+                client_message_id=checkpoint.client_message_id,
+                user_item_id=checkpoint.user_item_id,
+                agent_item_id=checkpoint.agent_item_id,
+            ),
+            ItemCompletedEvent(
+                thread_id=session_id,
+                turn_id=checkpoint.turn_id,
+                item_id=str(checkpoint.user_item_id),
+                item_type="userMessage",
+                status="completed",
+                content=checkpoint.user_message,
+            ),
+            ItemStartedEvent(
+                thread_id=session_id,
+                turn_id=checkpoint.turn_id,
+                item_id=str(checkpoint.agent_item_id),
+                item_type="agentMessage",
+            ),
+        ]
+        interrupts = tuple(interrupt for task in snapshot.tasks for interrupt in task.interrupts)
+        if interrupts:
+            question = interrupts[0].value
+            if isinstance(question, str) and question.strip():
+                events.extend(
+                    (
+                        ItemCompletedEvent(
+                            thread_id=session_id,
+                            turn_id=checkpoint.turn_id,
+                            item_id=str(checkpoint.agent_item_id),
+                            item_type="agentMessage",
+                            status="waitingForUser",
+                        ),
+                        ItemStartedEvent(
+                            thread_id=session_id,
+                            turn_id=checkpoint.turn_id,
+                            item_id=str(checkpoint.pending_item_id),
+                            item_type="pendingAction",
+                        ),
+                        PendingActionCreatedEvent(
+                            thread_id=session_id,
+                            turn_id=checkpoint.turn_id,
+                            item_id=str(checkpoint.pending_item_id),
+                            request_id=checkpoint.request_id,
+                            question=question.strip(),
+                        ),
+                        ItemCompletedEvent(
+                            thread_id=session_id,
+                            turn_id=checkpoint.turn_id,
+                            item_id=str(checkpoint.pending_item_id),
+                            item_type="pendingAction",
+                            status="waitingForUser",
+                        ),
+                        TurnCompletedEvent(
+                            thread_id=session_id,
+                            turn_id=checkpoint.turn_id,
+                            status="waitingForUser",
+                        ),
+                    )
+                )
+                return ChatTimelineSnapshotResponse(thread_id=session_id, events=tuple(events))
+
+        messages = snapshot.values.get("messages", [])
+        final_content = next(
+            (
+                message.content.strip()
+                for message in reversed(messages if isinstance(messages, list) else [])
+                if isinstance(message, AIMessage)
+                and not message.tool_calls
+                and isinstance(message.content, str)
+                and message.content.strip()
+            ),
+            None,
+        )
+        had_pending_action = any(
+            isinstance(message, AIMessage) and any(call.get("name") == "ask_human" for call in message.tool_calls)
+            for message in (messages if isinstance(messages, list) else [])
+        )
+        if had_pending_action:
+            events.append(
+                PendingActionResolvedEvent(
+                    thread_id=session_id,
+                    turn_id=checkpoint.turn_id,
+                    request_id=checkpoint.request_id,
+                )
+            )
+        if final_content is not None:
+            events.append(
+                ItemCompletedEvent(
+                    thread_id=session_id,
+                    turn_id=checkpoint.turn_id,
+                    item_id=str(checkpoint.agent_item_id),
+                    item_type="agentMessage",
+                    status="completed",
+                    content=final_content[:MAX_MESSAGE_LENGTH],
+                )
+            )
+        status = checkpoint.status
+        terminal_status: Literal["completed", "failed", "cancelled"] | None
+        if status == "failed":
+            terminal_status = "failed"
+        elif status == "cancelled":
+            terminal_status = "cancelled"
+        elif status == "completed" or (not snapshot.next and final_content is not None):
+            terminal_status = "completed"
+        else:
+            terminal_status = None
+        if terminal_status is not None:
+            events.append(
+                TurnCompletedEvent(
+                    thread_id=session_id,
+                    turn_id=checkpoint.turn_id,
+                    status=terminal_status,
+                )
+            )
+        return ChatTimelineSnapshotResponse(thread_id=session_id, events=tuple(events))
+
     async def stream_turn(
         self,
         request: ChatRequest,
@@ -728,11 +906,6 @@ class ChatService:
         应用协议，并处理取消、错误、安全隔离和最终状态判断。
         """
         runtime_context = self._build_runtime_context(user_id)
-        # 与非流式入口使用相同的 ChatState 输入契约，保证 ainvoke/astream 不会
-        # 因局部变量推断差异产生两套类型边界。
-        graph_input: ChatState = {
-            "messages": [HumanMessage(content=request.message)],
-        }
 
         # ID 在进入 Graph 前一次性生成，后续所有 delta、工具卡、HITL 和终态都
         # 通过这些稳定身份关联。客户端 ID 为空时由服务端补齐并在首事件回显。
@@ -740,6 +913,21 @@ class ChatService:
         client_message_id = request.client_message_id or uuid4()
         user_item_id = uuid4()
         agent_item_id = uuid4()
+        checkpoint = ChatTurnCheckpoint(
+            turn_id=turn_id,
+            client_message_id=client_message_id,
+            user_item_id=user_item_id,
+            agent_item_id=agent_item_id,
+            pending_item_id=uuid4(),
+            request_id=uuid4(),
+            user_message=request.message,
+        )
+        # Turn 元数据与消息一起进入 checkpoint，使页面刷新和进程重启后仍能重建
+        # request_id；它不包含认证身份或模型私有内容。
+        graph_input: ChatState = {
+            "messages": [HumanMessage(content=request.message)],
+            "turn": checkpoint.model_dump(mode="json"),
+        }
 
         yield TurnStartedEvent(
             thread_id=request.thread_id,
@@ -857,8 +1045,6 @@ class ChatService:
 
                         # interrupt 不是失败，而是“本轮正常结束并等待人工输入”。先把
                         # 问题交给客户端，再用 done(interrupted) 明确关闭本次事件流。
-                        request_id = uuid4()
-                        pending_item_id = uuid4()
                         post_guard_events.extend(
                             (
                                 ItemCompletedEvent(
@@ -871,20 +1057,20 @@ class ChatService:
                                 ItemStartedEvent(
                                     thread_id=request.thread_id,
                                     turn_id=turn_id,
-                                    item_id=str(pending_item_id),
+                                    item_id=str(checkpoint.pending_item_id),
                                     item_type="pendingAction",
                                 ),
                                 PendingActionCreatedEvent(
                                     thread_id=request.thread_id,
                                     turn_id=turn_id,
-                                    item_id=str(pending_item_id),
-                                    request_id=request_id,
+                                    item_id=str(checkpoint.pending_item_id),
+                                    request_id=checkpoint.request_id,
                                     question=question.strip(),
                                 ),
                                 ItemCompletedEvent(
                                     thread_id=request.thread_id,
                                     turn_id=turn_id,
-                                    item_id=str(pending_item_id),
+                                    item_id=str(checkpoint.pending_item_id),
                                     item_type="pendingAction",
                                     status="waitingForUser",
                                 ),
@@ -918,6 +1104,10 @@ class ChatService:
                             raise RuntimeError("completed chat stream must produce a ChatResponse")
 
                         completed_result = parsed_result
+                        await self._graph.aupdate_state(
+                            config,
+                            {"turn": checkpoint.model_copy(update={"status": "completed"}).model_dump(mode="json")},
+                        )
 
                         post_guard_events.append(
                             ItemCompletedEvent(

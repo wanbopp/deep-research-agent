@@ -6,7 +6,13 @@ import pytest
 from pydantic import TypeAdapter, ValidationError
 
 from app.api.sse import encode_sse_event
-from app.schemas.chat import ChatTimelineEvent, ItemDeltaEvent, TurnStartedEvent
+from app.schemas.chat import (
+    ChatTimelineEvent,
+    ChatTimelineSnapshotResponse,
+    ItemDeltaEvent,
+    PendingActionResolvedEvent,
+    TurnStartedEvent,
+)
 
 
 _adapter = TypeAdapter(ChatTimelineEvent)
@@ -69,3 +75,18 @@ def test_sse_frame_uses_timeline_event_name_and_json_envelope() -> None:
     assert '"schema_version":2' in frame
     assert '"event":"item.delta"' in frame
     assert frame.endswith("\n\n")
+
+
+def test_canonical_snapshot_accepts_request_resolved_event() -> None:
+    """恢复后的快照可明确关闭旧 PendingAction，避免页面重复提交."""
+    thread_id = uuid4()
+    event = PendingActionResolvedEvent(
+        thread_id=thread_id,
+        turn_id=uuid4(),
+        request_id=uuid4(),
+    )
+
+    snapshot = ChatTimelineSnapshotResponse(thread_id=thread_id, events=(event,))
+
+    assert snapshot.schema_version == 2
+    assert snapshot.events[0].event == "request.resolved"

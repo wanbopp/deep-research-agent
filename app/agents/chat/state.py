@@ -30,6 +30,10 @@ class ChatState(TypedDict):
         UntrackedValue,
     ]
 
+    # 当前 Turn 的稳定 ID 和客户端对账信息需要随 checkpoint 持久化，页面刷新后
+    # 才能重建 PendingAction；其中不包含 JWT、email 或 user_id。
+    turn: NotRequired[dict[str, object]]
+
 
 class ChatStateUpdate(TypedDict, total=False):
     """描述一个 Agent node 对共享状态产生的局部更新.
@@ -49,3 +53,6 @@ class ChatStateUpdate(TypedDict, total=False):
 
     # memory node 同时写入 available/degraded 状态。
     memory_status: MemorySearchStatus
+
+    # 非模型节点也可以更新 Turn 终态；跨 checkpoint 边界保持 JSON 数据。
+    turn: dict[str, object]

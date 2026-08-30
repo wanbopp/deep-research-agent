@@ -268,6 +268,13 @@ class PendingActionCreatedEvent(_TimelineEventBase):
     question: str = Field(min_length=1, max_length=MAX_MESSAGE_LENGTH)
 
 
+class PendingActionResolvedEvent(_TimelineEventBase):
+    """待处理请求已经被回答或因 Turn 终止而关闭."""
+
+    event: Literal["request.resolved"] = "request.resolved"
+    request_id: UUID
+
+
 class TurnCompletedEvent(_TimelineEventBase):
     """Turn 权威终态；waitingForUser 表示可以用 request_id 恢复."""
 
@@ -290,7 +297,34 @@ ChatTimelineEvent = Annotated[
     | ItemDeltaEvent
     | ItemCompletedEvent
     | PendingActionCreatedEvent
+    | PendingActionResolvedEvent
     | TurnCompletedEvent
     | TimelineErrorEvent,
     Field(discriminator="event"),
 ]
+
+
+class ChatTurnCheckpoint(BaseModel):
+    """写入 LangGraph checkpoint 的当前 Turn 稳定身份，不包含用户凭据."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    schema_version: Literal[1] = 1
+    turn_id: UUID
+    client_message_id: UUID
+    user_item_id: UUID
+    agent_item_id: UUID
+    pending_item_id: UUID
+    request_id: UUID
+    user_message: str = Field(min_length=1, max_length=MAX_MESSAGE_LENGTH)
+    status: Literal["inProgress", "completed", "failed", "cancelled"] = "inProgress"
+
+
+class ChatTimelineSnapshotResponse(BaseModel):
+    """刷新恢复使用的当前 Turn 权威事件投影."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    schema_version: Literal[2] = 2
+    thread_id: UUID
+    events: tuple[ChatTimelineEvent, ...] = ()

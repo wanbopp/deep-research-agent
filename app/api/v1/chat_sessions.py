@@ -12,7 +12,7 @@ from app.api.dependencies import (
     get_chat_session_service,
 )
 from app.schemas.base import ErrorResponse
-from app.schemas.chat import ChatMessageHistoryResponse
+from app.schemas.chat import ChatMessageHistoryResponse, ChatTimelineSnapshotResponse
 from app.schemas.chat_session import (
     ChatSessionCreateRequest,
     ChatSessionListResponse,
@@ -141,6 +141,32 @@ async def read_chat_session(
     """
     try:
         return await service.get_owned(
+            session_id=thread_id,
+            user_id=current_user.user_id,
+        )
+    except ChatSessionNotFoundError:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Chat session was not found",
+        ) from None
+
+
+@router.get(
+    "/{thread_id}/timeline",
+    response_model=ChatTimelineSnapshotResponse,
+    responses={
+        status.HTTP_401_UNAUTHORIZED: {"model": ErrorResponse},
+        status.HTTP_404_NOT_FOUND: {"model": ErrorResponse},
+    },
+)
+async def read_chat_timeline_snapshot(
+    thread_id: UUID,
+    chat_service: ChatServiceDependency,
+    current_user: CurrentUserDependency,
+) -> ChatTimelineSnapshotResponse:
+    """读取当前 Turn 的 checkpoint 权威投影，用于刷新恢复待处理请求."""
+    try:
+        return await chat_service.get_timeline_snapshot(
             session_id=thread_id,
             user_id=current_user.user_id,
         )
