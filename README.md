@@ -71,6 +71,34 @@ development-index-worker-YYYY-MM-DD.jsonl
 The console remains an aggregated developer view. Component routing never uses
 user IDs, task IDs, prompts, filenames, or document content as file names.
 
+### Runtime 与日志规范
+
+以下约定是当前 Web 模式的统一运行规范，开发、测试和部署脚本都应遵守：
+
+1. **默认入口唯一。** 后端统一使用 `deep-research-runtime` 启动；无参数即为
+   `--mode all`，同时运行 API、Research Worker 和 Index Scheduler。前端在
+   `deep-research-web` 中使用 `npm run dev` 单独启动。
+2. **当前部署不拆服务。** 本地和云端默认都使用 `all`。`api`、`worker`、`index`
+   只用于故障诊断、维护和将来独立扩容，不作为当前常规部署组合。
+3. **禁止重复消费者。** 运行 `all` 时，不得再启动独立 Research Worker、Index
+   Scheduler 或旧 Worker 脚本，否则会产生额外消费者并增加排障复杂度。旧脚本只保留
+   兼容性；一次性索引维护统一使用 `--mode index --until-idle`。
+4. **统一停止。** 前台运行时使用 `Ctrl+C`；Supervisor 会停止接收新请求、取消后台
+   消费循环，并等待 FastAPI lifespan 和各组件释放数据库、Neo4j 与 tracing 资源。
+   不应通过强制结束单个子组件来终止 `all` 模式。
+5. **组件失败即整体失败。** Research Worker 或 Index Scheduler 意外退出时，整个
+   Runtime 必须以失败状态退出，由进程管理器重启，不能留下“API 健康但任务无人领取”
+   的半健康实例。
+6. **日志按固定组件分流。** JSONL 只允许写入 `runtime`、`api`、
+   `research-worker`、`index-worker` 四类文件；控制台用于聚合查看。组件名必须来自
+   代码中的有限集合，禁止根据请求参数动态创建日志文件。
+7. **日志不得泄密。** 文件名、事件字段和日志消息不得记录密码、Token、连接串、完整
+   Prompt、文档正文或其他敏感数据。请求 ID、任务 ID 等关联字段可写入 JSONL 事件，
+   但不得用作文件名，也不得形成无界日志标签。
+8. **保持任务持久化语义。** 统一进程只合并运行入口，不把 Research 或 Index 任务改成
+   API 进程内存队列；任务领取、租约、heartbeat、checkpoint、重试和恢复仍以持久化
+   存储为准。
+
 - Health check: <http://127.0.0.1:8000/api/v1/health>
 - Swagger UI: <http://127.0.0.1:8000/docs>
 - OpenAPI JSON: <http://127.0.0.1:8000/api/v1/openapi.json>
