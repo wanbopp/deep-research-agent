@@ -32,8 +32,9 @@ Copy-Item .env.example .env.development
 
 ## Run the Web runtime
 
-The default command starts both FastAPI and the durable Research Worker. This
-prevents the API from accepting tasks while no queue consumer is running:
+The default command starts FastAPI, the durable Research Worker, and the
+long-running Index Scheduler. This prevents either task queue from accepting
+work while no consumer is running:
 
 ```powershell
 Set-Location E:\workspace\Agent\DeepResearch\deep-research
@@ -47,12 +48,28 @@ entrypoint retains component-only modes for diagnostics and future scaling:
 .\.venv\Scripts\deep-research-runtime.exe --mode all
 .\.venv\Scripts\deep-research-runtime.exe --mode api
 .\.venv\Scripts\deep-research-runtime.exe --mode worker
+.\.venv\Scripts\deep-research-runtime.exe --mode index
+.\.venv\Scripts\deep-research-runtime.exe --mode index --until-idle
 ```
 
 `all` is the supported default for the current local and cloud deployment. The
-Supervisor stops the whole runtime if the Research Worker fails, rather than
-leaving a healthy-looking API with permanently pending tasks. `api` and
-`worker` are operational diagnostics; they are not the default Web mode.
+Supervisor stops the whole runtime if either background consumer fails, rather
+than leaving a healthy-looking API with permanently pending tasks. `api`,
+`worker`, and `index` are operational diagnostics; they are not the default
+Web mode. `index --until-idle` preserves the previous one-shot maintenance
+behavior.
+
+Application JSONL logs are split by finite runtime component under `LOG_DIR`:
+
+```text
+development-runtime-YYYY-MM-DD.jsonl
+development-api-YYYY-MM-DD.jsonl
+development-research-worker-YYYY-MM-DD.jsonl
+development-index-worker-YYYY-MM-DD.jsonl
+```
+
+The console remains an aggregated developer view. Component routing never uses
+user IDs, task IDs, prompts, filenames, or document content as file names.
 
 - Health check: <http://127.0.0.1:8000/api/v1/health>
 - Swagger UI: <http://127.0.0.1:8000/docs>
