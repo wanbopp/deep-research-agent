@@ -19,7 +19,7 @@ from app.agents.research.state import ResearchState, ResearchStateUpdate
 from app.core.logging import logger
 from app.graphrag.global_retriever import GlobalGraphRetriever
 from app.graphrag.local_retriever import LocalGraphRetriever
-from app.observability import metrics
+from app.observability import metrics, tracing
 from app.rag.hybrid import HybridRetriever
 from app.schemas.research import (
     Evidence,
@@ -259,12 +259,18 @@ class ParallelResearchRetriever:
             started_at = perf_counter()
             try:
                 async with asyncio.timeout(min(30.0, config.timeout_seconds)):
-                    result = await retriever.search(
-                        user_id=runtime.context.user_id,
-                        step=step,
-                        query=query,
-                        top_k=config.max_evidence_per_step,
-                    )
+                    # query 和证据正文不进入 trace；只关联有限检索策略与研究 ID。
+                    with tracing.span(
+                        "retrieval",
+                        research_id=runtime.context.research_id,
+                        retrieval_strategy=strategy.value,
+                    ):
+                        result = await retriever.search(
+                            user_id=runtime.context.user_id,
+                            step=step,
+                            query=query,
+                            top_k=config.max_evidence_per_step,
+                        )
                     metrics.observe_retrieval(
                         strategy=strategy.value,
                         outcome="success",

@@ -18,7 +18,7 @@ from app.agents.research.state import ResearchState
 from app.agents.research.writer import render_report_markdown
 from app.core.logging import logger
 from app.models import ResearchTask, ResearchTaskStatus, utc_now
-from app.observability import metrics
+from app.observability import metrics, tracing
 from app.repositories import ResearchTaskRepository
 from app.schemas.research import ResearchConfig, ResearchReport, ResearchStatus
 from app.schemas.research_events import ResearchEventType
@@ -116,7 +116,16 @@ class ResearchTaskWorker:
     async def _execute_claimed(self, task: ResearchTask, *, run_id: UUID) -> ResearchWorkerResult:
         """在领取事务之外执行一条任务，并返回有限的处理结果."""
         try:
-            final_state = await self._run_graph_until_done_or_cancelled(task, run_id=run_id)
+            # 关联 ID 可上传，topic/user_id/config 正文不进入 ObservationContext。
+            with (
+                tracing.bind(
+                    research_id=task.id,
+                    run_id=run_id,
+                    attempt_no=task.attempt_count,
+                ),
+                tracing.span("research.run"),
+            ):
+                final_state = await self._run_graph_until_done_or_cancelled(task, run_id=run_id)
         except ResearchCancellationRequested:
             await self._finalize_cancelled(task.id, run_id=run_id)
             return ResearchWorkerResult.CANCELLED
@@ -226,31 +235,32 @@ class ResearchTaskWorker:
         update: object,
     ) -> None:
         """只保存节点名、状态和计数，不把证据正文复制进事件表."""
-        payload: dict[str, object] = {"run_id": str(run_id), "node": node_name}
-        if isinstance(update, Mapping):
-            status = update.get("status")
-            if isinstance(status, StrEnum):
-                payload["status"] = status.value
-            evidence = update.get("evidence")
-            if isinstance(evidence, tuple):
-                payload["evidence_count"] = len(evidence)
-        async with self._session_factory() as session, session.begin():
-            repository = ResearchTaskRepository(session)
-            current = await repository.get_claim_for_update(
-                task_id=task.id,
-                run_id=run_id,
-                worker_id=self._worker_id,
-            )
-            if current is None:
-                raise ResearchRunClaimLost
-            await repository.heartbeat(current, run_id=run_id)
-            await repository.append_event(
-                task_id=task.id,
-                user_id=task.user_id,
-                event_type=ResearchEventType.NODE_COMPLETED,
-                run_id=run_id,
-                payload=payload,
-            )
+        with tracing.span("research.node", node_name=node_name):
+            payload: dict[str, object] = {"run_id": str(run_id), "node": node_name}
+            if isinstance(update, Mapping):
+                status = update.get("status")
+                if isinstance(status, StrEnum):
+                    payload["status"] = status.value
+                evidence = update.get("evidence")
+                if isinstance(evidence, tuple):
+                    payload["evidence_count"] = len(evidence)
+            async with self._session_factory() as session, session.begin():
+                repository = ResearchTaskRepository(session)
+                current = await repository.get_claim_for_update(
+                    task_id=task.id,
+                    run_id=run_id,
+                    worker_id=self._worker_id,
+                )
+                if current is None:
+                    raise ResearchRunClaimLost
+                await repository.heartbeat(current, run_id=run_id)
+                await repository.append_event(
+                    task_id=task.id,
+                    user_id=task.user_id,
+                    event_type=ResearchEventType.NODE_COMPLETED,
+                    run_id=run_id,
+                    payload=payload,
+                )
 
     async def _wait_for_cancellation(self, task_id: UUID, *, run_id: UUID) -> bool:
         """轮询取消标记，并在长节点运行期间独立续写 worker 心跳."""

@@ -19,7 +19,7 @@ from tenacity import (
 )
 
 from app.core.logging import logger
-from app.observability import MetricsRuntime, metrics
+from app.observability import MetricsRuntime, metrics, tracing
 from app.services.llm.errors import (
     AllModelsFailedError,
     LLMTimeoutError,
@@ -134,11 +134,13 @@ class LLMService:
             with attempt:
                 attempt_started_at = perf_counter()
                 try:
-                    result = await self._invoke_once(
-                        alias=alias,
-                        invoker=invoker,
-                        overrides=overrides,
-                    )
+                    # Span 只记录受控 alias，不采集 messages、tools、输出或异常正文。
+                    with tracing.span("llm", model_alias=alias):
+                        result = await self._invoke_once(
+                            alias=alias,
+                            invoker=invoker,
+                            overrides=overrides,
+                        )
                     self._metrics.observe_llm_attempt(model_alias=alias, outcome="success")
                     self._record_usage(alias=alias, result=result)
                     return result

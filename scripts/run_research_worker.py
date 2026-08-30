@@ -10,6 +10,7 @@ from app.core.config import settings
 from app.graphrag.runtime import create_graphrag_runtime
 from app.infrastructure.factory import create_application_resources
 from app.infrastructure.file_storage import LocalFileStorage
+from app.observability import build_trace_sink, tracing
 from app.rag.runtime import create_rag_runtime
 from app.workers.research_task import ResearchTaskWorker, ResearchWorkerResult
 
@@ -20,6 +21,7 @@ async def run_worker(*, idle_sleep_seconds: float = 1.0) -> None:
     PostgreSQL 是任务事实来源；本进程不需要与创建任务的 API 进程共享内存。
     多个 worker 同时运行时，数据库行锁会把不同任务分配给不同进程。
     """
+    tracing.configure(build_trace_sink(settings))
     resources = create_application_resources(settings)
     await resources.postgres_pool.open()
     await resources.checkpointer.setup()
@@ -51,6 +53,7 @@ async def run_worker(*, idle_sleep_seconds: float = 1.0) -> None:
             else:
                 print(json.dumps({"research_worker_result": result.value}))
     finally:
+        tracing.close()
         await resources.redis_client.aclose()
         await resources.neo4j_driver.close()
         await resources.orm_engine.dispose()

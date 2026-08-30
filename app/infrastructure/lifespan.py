@@ -30,6 +30,7 @@ from app.infrastructure.probes import DependencyName, DependencyProbeResult
 from app.infrastructure.rate_limit import RedisRateLimiter
 from app.infrastructure.redis import probe_redis
 from app.infrastructure.resources import ApplicationResources
+from app.observability import build_trace_sink, tracing
 from app.rag.runtime import create_rag_runtime
 from app.schemas.llm import ModelSpec
 from app.services.chat import ChatService
@@ -403,6 +404,10 @@ async def lifespan(
     resources = create_application_resources(config)
 
     async with AsyncExitStack() as stack:
+        # Trace 是可选增强能力：初始化、发送和 flush 失败都由 SafeTracingRuntime
+        # 隔离，不能阻止 API startup 或覆盖业务异常。
+        tracing.configure(build_trace_sink(config))
+        stack.callback(tracing.close)
         # 建议登记顺序：执行完成后逆向关闭
         # push_async_callback 只登记清理动作，此时不会执行 close。
         #
