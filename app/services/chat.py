@@ -5,7 +5,7 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from typing import Any, Literal
-from uuid import UUID
+from uuid import UUID, uuid4
 from langchain_core.messages import (
     AIMessage,
     AIMessageChunk,
@@ -29,11 +29,16 @@ from app.schemas.chat import (
     ChatResponse,
     ChatResumeRequest,
     ChatStreamEvent,
-    DoneStreamEvent,
-    ErrorStreamEvent,
-    InterruptStreamEvent,
+    ChatTimelineEvent,
     TokenStreamEvent,
+    TurnCompletedEvent,
+    TurnStartedEvent,
     ToolStreamEvent,
+    ItemCompletedEvent,
+    ItemDeltaEvent,
+    ItemStartedEvent,
+    PendingActionCreatedEvent,
+    TimelineErrorEvent,
 )
 from app.services.chat_session_ownership import (
     ChatSessionNotFoundError,
@@ -51,6 +56,9 @@ class ChatInterrupt:
     """Agent 暂停后交给上层处理的稳定应用结果."""
 
     thread_id: UUID
+    turn_id: UUID
+    request_id: UUID
+    client_message_id: UUID | None
     question: str
 
 
@@ -378,6 +386,8 @@ class ChatService:
         *,
         config: RunnableConfig,
         thread_id: UUID,
+        turn_id: UUID,
+        client_message_id: UUID | None,
     ) -> ChatTurnResult:
         """把 LangGraph 原始结果转换成稳定的应用层结果."""
         result_dict = dict(result)
@@ -395,6 +405,9 @@ class ChatService:
 
             return ChatInterrupt(
                 thread_id=thread_id,
+                turn_id=turn_id,
+                request_id=uuid4(),
+                client_message_id=client_message_id,
                 question=question.strip(),
             )
 
@@ -417,6 +430,8 @@ class ChatService:
 
         return ChatResponse(
             thread_id=thread_id,
+            turn_id=turn_id,
+            client_message_id=client_message_id,
             message=ChatMessage(
                 role="assistant",
                 content=content,
@@ -494,6 +509,7 @@ class ChatService:
         # 显式使用 ChatState，而不是让 Python 把字面量推断成
         # dict[str, list[HumanMessage]]。list 是不变类型；虽然 HumanMessage 属于
         # AnyMessage，list[HumanMessage] 仍不能自动替代 list[AnyMessage]。
+        turn_id = uuid4()
         graph_input: ChatState = {
             "messages": [
                 HumanMessage(content=request.message),
@@ -521,6 +537,8 @@ class ChatService:
                     result,
                     config=config,
                     thread_id=request.thread_id,
+                    turn_id=turn_id,
+                    client_message_id=request.client_message_id,
                 )
 
         # 执行到这里说明 timeout 和 guard 都已经正常退出。
@@ -558,6 +576,7 @@ class ChatService:
                 没有等待恢复的 interrupt。相同错误也用于隐藏其他用户会话是否存在。
         """
         runtime_context = self._build_runtime_context(user_id)
+        turn_id = request.turn_id or uuid4()
 
         # snapshot 检查也属于 resume 的临界区。否则普通请求可能在“检查到 interrupt”
         # 与真正 Command(resume=...) 之间抢先推进同一个 checkpoint。
@@ -586,6 +605,8 @@ class ChatService:
                     result,
                     config=config,
                     thread_id=request.thread_id,
+                    turn_id=turn_id,
+                    client_message_id=request.client_message_id,
                 )
 
                 # resume 值会返回给被中断的工具；长期记忆的用户来源仍应是
@@ -697,7 +718,7 @@ class ChatService:
         request: ChatRequest,
         *,
         user_id: UUID,
-    ) -> AsyncIterator[ChatStreamEvent]:
+    ) -> AsyncIterator[ChatTimelineEvent]:
         """流式执行一轮 Agent，并逐个产生稳定的应用层事件.
 
         这是异步生成器：每次执行到 ``yield`` 就把一个事件交给上层并暂停；
@@ -713,6 +734,35 @@ class ChatService:
             "messages": [HumanMessage(content=request.message)],
         }
 
+        # ID 在进入 Graph 前一次性生成，后续所有 delta、工具卡、HITL 和终态都
+        # 通过这些稳定身份关联。客户端 ID 为空时由服务端补齐并在首事件回显。
+        turn_id = uuid4()
+        client_message_id = request.client_message_id or uuid4()
+        user_item_id = uuid4()
+        agent_item_id = uuid4()
+
+        yield TurnStartedEvent(
+            thread_id=request.thread_id,
+            turn_id=turn_id,
+            client_message_id=client_message_id,
+            user_item_id=user_item_id,
+            agent_item_id=agent_item_id,
+        )
+        yield ItemCompletedEvent(
+            thread_id=request.thread_id,
+            turn_id=turn_id,
+            item_id=str(user_item_id),
+            item_type="userMessage",
+            status="completed",
+            content=request.message,
+        )
+        yield ItemStartedEvent(
+            thread_id=request.thread_id,
+            turn_id=turn_id,
+            item_id=str(agent_item_id),
+            item_type="agentMessage",
+        )
+
         try:
             # 只有 Graph 被最终 snapshot 证明已经到达 END 时才赋值。
             # interrupted、timeout、异常和取消路径始终保持 None。
@@ -724,7 +774,8 @@ class ChatService:
                 user_id=user_id,
                 public_thread_id=request.thread_id,
             ) as config:
-                terminal_event: DoneStreamEvent
+                terminal_event: TurnCompletedEvent
+                post_guard_events: list[ChatTimelineEvent] = []
 
                 async with asyncio.timeout(self._graph_timeout_seconds):
                     # 同时观察模型文本分片和节点完成后的状态增量。
@@ -759,7 +810,30 @@ class ChatService:
                         for event in events:
                             # 断点执行过这一行后，控制权会暂时交回 API/SSE 调用方；
                             # 下一次请求事件时，才回到这里继续处理后续 part。
-                            yield event
+                            if isinstance(event, TokenStreamEvent):
+                                yield ItemDeltaEvent(
+                                    thread_id=request.thread_id,
+                                    turn_id=turn_id,
+                                    item_id=str(agent_item_id),
+                                    delta=event.text,
+                                )
+                            elif isinstance(event, ToolStreamEvent) and event.status == "started":
+                                yield ItemStartedEvent(
+                                    thread_id=request.thread_id,
+                                    turn_id=turn_id,
+                                    item_id=event.tool_call_id,
+                                    item_type="toolCall",
+                                    name=event.name,
+                                )
+                            elif isinstance(event, ToolStreamEvent):
+                                yield ItemCompletedEvent(
+                                    thread_id=request.thread_id,
+                                    turn_id=turn_id,
+                                    item_id=event.tool_call_id,
+                                    item_type="toolCall",
+                                    name=event.name,
+                                    status="completed" if event.status == "success" else "error",
+                                )
 
                     # astream 停止产生 part 不等于图一定到达 END：ask_human 会让图
                     # 暂停并结束本轮 stream。因此必须读取同一 thread 的最新快照，
@@ -783,8 +857,44 @@ class ChatService:
 
                         # interrupt 不是失败，而是“本轮正常结束并等待人工输入”。先把
                         # 问题交给客户端，再用 done(interrupted) 明确关闭本次事件流。
-                        yield InterruptStreamEvent(question=question.strip())
-                        terminal_event = DoneStreamEvent(status="interrupted")
+                        request_id = uuid4()
+                        pending_item_id = uuid4()
+                        post_guard_events.extend(
+                            (
+                                ItemCompletedEvent(
+                                    thread_id=request.thread_id,
+                                    turn_id=turn_id,
+                                    item_id=str(agent_item_id),
+                                    item_type="agentMessage",
+                                    status="waitingForUser",
+                                ),
+                                ItemStartedEvent(
+                                    thread_id=request.thread_id,
+                                    turn_id=turn_id,
+                                    item_id=str(pending_item_id),
+                                    item_type="pendingAction",
+                                ),
+                                PendingActionCreatedEvent(
+                                    thread_id=request.thread_id,
+                                    turn_id=turn_id,
+                                    item_id=str(pending_item_id),
+                                    request_id=request_id,
+                                    question=question.strip(),
+                                ),
+                                ItemCompletedEvent(
+                                    thread_id=request.thread_id,
+                                    turn_id=turn_id,
+                                    item_id=str(pending_item_id),
+                                    item_type="pendingAction",
+                                    status="waitingForUser",
+                                ),
+                            )
+                        )
+                        terminal_event = TurnCompletedEvent(
+                            thread_id=request.thread_id,
+                            turn_id=turn_id,
+                            status="waitingForUser",
+                        )
                     else:
                         # 没有 interrupt 时，正常完成的图应该已经到达 END，此时 next
                         # 为空。若 next 仍有节点，说明图在未知的非终态停止。
@@ -798,6 +908,8 @@ class ChatService:
                             dict(snapshot.values),
                             config=config,
                             thread_id=request.thread_id,
+                            turn_id=turn_id,
+                            client_message_id=client_message_id,
                         )
 
                         # 当前分支已经排除了 interrupt；若解析器仍返回 ChatInterrupt，说明
@@ -807,7 +919,21 @@ class ChatService:
 
                         completed_result = parsed_result
 
-                        terminal_event = DoneStreamEvent(status="completed")
+                        post_guard_events.append(
+                            ItemCompletedEvent(
+                                thread_id=request.thread_id,
+                                turn_id=turn_id,
+                                item_id=str(agent_item_id),
+                                item_type="agentMessage",
+                                status="completed",
+                                content=parsed_result.message.content,
+                            )
+                        )
+                        terminal_event = TurnCompletedEvent(
+                            thread_id=request.thread_id,
+                            turn_id=turn_id,
+                            status="completed",
+                        )
 
             # 此处已经离开 Graph timeout 和 thread execution guard。
             # completed_result 为 None 时，说明当前流是 interrupted，不能提交。
@@ -823,6 +949,8 @@ class ChatService:
             # 客户端仍然可以立即收到最终 done 事件。
             # 先正常离开 guard 上下文并确认 Redis owner token 已释放，再发送 done。
             # 因此客户端看到 done 时，本轮执行权已经可供下一请求获取。
+            for event in post_guard_events:
+                yield event
             yield terminal_event
             return
 
@@ -834,29 +962,41 @@ class ChatService:
             # StreamingResponse 的 200 响应头通常已在异步生成器开始迭代前发送，
             # 此时不能再改成 HTTP 404。使用固定流内错误，随后结束本次事件流；
             # 不输出 user_id、内部 key，也不区分不存在和属于其他用户。
-            yield ErrorStreamEvent(
+            yield TimelineErrorEvent(
+                thread_id=request.thread_id,
+                turn_id=turn_id,
                 code="CHAT_SESSION_NOT_FOUND",
                 message="Chat session was not found",
             )
+            yield TurnCompletedEvent(thread_id=request.thread_id, turn_id=turn_id, status="failed")
             return
         except ChatThreadBusyError:
             # SSE 已经开始，只能发送流事件。固定文案不暴露锁名、内部 key 或 owner。
-            yield ErrorStreamEvent(
+            yield TimelineErrorEvent(
+                thread_id=request.thread_id,
+                turn_id=turn_id,
                 code="CHAT_THREAD_BUSY",
                 message="Chat thread is already being processed",
             )
+            yield TurnCompletedEvent(thread_id=request.thread_id, turn_id=turn_id, status="failed")
             return
         except ChatExecutionGuardUnavailableError:
-            yield ErrorStreamEvent(
+            yield TimelineErrorEvent(
+                thread_id=request.thread_id,
+                turn_id=turn_id,
                 code="CHAT_EXECUTION_GUARD_UNAVAILABLE",
                 message="Chat execution is temporarily unavailable",
             )
+            yield TurnCompletedEvent(thread_id=request.thread_id, turn_id=turn_id, status="failed")
             return
         except TimeoutError:
-            yield ErrorStreamEvent(
+            yield TimelineErrorEvent(
+                thread_id=request.thread_id,
+                turn_id=turn_id,
                 code="CHAT_STREAM_TIMEOUT",
                 message="Chat stream timed out",
             )
+            yield TurnCompletedEvent(thread_id=request.thread_id, turn_id=turn_id, status="failed")
             return
         except Exception as error:
             logger.exception(
@@ -864,8 +1004,11 @@ class ChatService:
                 error_type=type(error).__name__,
                 thread_id=str(request.thread_id),
             )
-            yield ErrorStreamEvent(
+            yield TimelineErrorEvent(
+                thread_id=request.thread_id,
+                turn_id=turn_id,
                 code="CHAT_STREAM_ERROR",
                 message="Chat stream failed",
             )
+            yield TurnCompletedEvent(thread_id=request.thread_id, turn_id=turn_id, status="failed")
             return

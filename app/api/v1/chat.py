@@ -44,6 +44,9 @@ def _to_api_response(result: ChatTurnResult) -> ChatAPIResponse:
         return ChatInterruptResponse(
             status="interrupted",
             thread_id=result.thread_id,
+            turn_id=result.turn_id,
+            request_id=result.request_id,
+            client_message_id=result.client_message_id,
             question=result.question,
         )
     else:

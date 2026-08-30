@@ -1,10 +1,10 @@
 """Server-Sent Events encoding helpers."""
 
-from app.schemas.chat import ChatStreamEvent
+from app.schemas.chat import ChatTimelineEvent
 from app.schemas.research_events import ResearchEventResponse
 
 
-def encode_sse_event(event: ChatStreamEvent) -> str:
+def encode_sse_event(event: ChatTimelineEvent) -> str:
     """把一个聊天流事件编码为独立的 SSE 文本帧."""
     event_name = event.event
     payload = event.model_dump_json()

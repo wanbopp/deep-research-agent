@@ -66,6 +66,10 @@ class ChatRequest(BaseModel):
     thread_id: UUID = Field(
         description="服务端创建的业务聊天会话 UUID",
     )
+    client_message_id: UUID | None = Field(
+        default=None,
+        description="客户端乐观消息 ID；服务端只用于幂等对账并原样回显",
+    )
     # 每次请求只提交当前一条用户输入；既有历史由 checkpointer 按
     # thread_id 保存，避免客户端重复提交完整历史。
     message: str = Field(
@@ -88,6 +92,8 @@ class ChatResponse(BaseModel):
 
     # 响应回传同一个业务 UUID，客户端才能在下一轮继续该会话。
     thread_id: UUID
+    turn_id: UUID
+    client_message_id: UUID | None = None
 
     # Literal 不只表示字段是字符串，还把可接受的值收窄为
     # "completed"。它与 ChatInterruptResponse.status 共同构成判别字段。
@@ -105,6 +111,9 @@ class ChatInterruptResponse(BaseModel):
 
     status: Literal["interrupted"] = "interrupted"
     thread_id: UUID
+    turn_id: UUID
+    request_id: UUID
+    client_message_id: UUID | None = None
     question: str = Field(
         min_length=1,
         max_length=MAX_MESSAGE_LENGTH,
@@ -123,6 +132,9 @@ class ChatResumeRequest(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
     thread_id: UUID
+    turn_id: UUID | None = None
+    request_id: UUID | None = None
+    client_message_id: UUID | None = None
     response: str = Field(
         min_length=1,
         max_length=MAX_MESSAGE_LENGTH,
@@ -192,5 +204,93 @@ class DoneStreamEvent(_ChatStreamEventBase):
 # event 是判别字段；Pydantic 根据它直接选择唯一事件模型。
 ChatStreamEvent = Annotated[
     TokenStreamEvent | ToolStreamEvent | InterruptStreamEvent | ErrorStreamEvent | DoneStreamEvent,
+    Field(discriminator="event"),
+]
+
+
+# ---- 页面交互 v2：Thread -> Turn -> TimelineItem ----
+
+
+class _TimelineEventBase(BaseModel):
+    """页面时间线事件共享 envelope."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    schema_version: Literal[2] = 2
+    thread_id: UUID
+    turn_id: UUID
+
+
+class TurnStartedEvent(_TimelineEventBase):
+    """服务端已经接受并开始执行一轮 Chat."""
+
+    event: Literal["turn.started"] = "turn.started"
+    client_message_id: UUID
+    user_item_id: UUID
+    agent_item_id: UUID
+
+
+class ItemStartedEvent(_TimelineEventBase):
+    """消息、工具或待处理请求开始出现."""
+
+    event: Literal["item.started"] = "item.started"
+    item_id: str = Field(min_length=1, max_length=256)
+    item_type: Literal["agentMessage", "toolCall", "pendingAction"]
+    name: str | None = Field(default=None, max_length=128)
+
+
+class ItemDeltaEvent(_TimelineEventBase):
+    """进行中 item 的非权威文本增量."""
+
+    event: Literal["item.delta"] = "item.delta"
+    item_id: str = Field(min_length=1, max_length=256)
+    delta: str = Field(min_length=1)
+
+
+class ItemCompletedEvent(_TimelineEventBase):
+    """item 的权威终态；content 只用于最终助手消息."""
+
+    event: Literal["item.completed"] = "item.completed"
+    item_id: str = Field(min_length=1, max_length=256)
+    item_type: Literal["userMessage", "agentMessage", "toolCall", "pendingAction"]
+    status: Literal["completed", "error", "waitingForUser", "cancelled"]
+    name: str | None = Field(default=None, max_length=128)
+    content: str | None = Field(default=None, max_length=MAX_MESSAGE_LENGTH)
+
+
+class PendingActionCreatedEvent(_TimelineEventBase):
+    """同一 Turn 暂停并等待用户回答的可关联请求."""
+
+    event: Literal["request.created"] = "request.created"
+    item_id: str = Field(min_length=1, max_length=256)
+    request_id: UUID
+    request_type: Literal["userInput"] = "userInput"
+    question: str = Field(min_length=1, max_length=MAX_MESSAGE_LENGTH)
+
+
+class TurnCompletedEvent(_TimelineEventBase):
+    """Turn 权威终态；waitingForUser 表示可以用 request_id 恢复."""
+
+    event: Literal["turn.completed"] = "turn.completed"
+    status: Literal["completed", "waitingForUser", "failed", "cancelled"]
+    error_code: str | None = Field(default=None, max_length=128)
+
+
+class TimelineErrorEvent(_TimelineEventBase):
+    """响应头发出后的安全错误；不包含异常正文或内部 key."""
+
+    event: Literal["turn.error"] = "turn.error"
+    code: str = Field(min_length=1, max_length=128)
+    message: str = Field(min_length=1, max_length=512)
+
+
+ChatTimelineEvent = Annotated[
+    TurnStartedEvent
+    | ItemStartedEvent
+    | ItemDeltaEvent
+    | ItemCompletedEvent
+    | PendingActionCreatedEvent
+    | TurnCompletedEvent
+    | TimelineErrorEvent,
     Field(discriminator="event"),
 ]
