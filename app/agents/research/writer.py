@@ -4,6 +4,7 @@ from pydantic import BaseModel, ConfigDict, Field
 from langchain_core.messages import HumanMessage, SystemMessage
 from langgraph.runtime import Runtime
 
+from app.agents.prompts.loader import load_prompt_artifact, render_prompt_input
 from app.agents.research.context import ResearchRuntimeContext
 from app.agents.research.state import ResearchState, ResearchStateUpdate
 from app.core.logging import logger
@@ -105,41 +106,40 @@ class ResearchWriter:
             for evidence_id in used_evidence_ids
         )
 
-        facts_text = "\n".join(
-            (
-                f"- {fact.statement} "
-                f"citations={[citation_id_by_evidence[value] for value in fact.supporting_evidence_ids]} "
-                f"conflicts={[citation_id_by_evidence[value] for value in fact.contradicting_evidence_ids]}"
-            )
-            for fact in validation.facts
-        )
-        conflicts_text = (
-            "\n".join(
-                f"- {item.description}: {[citation_id_by_evidence[value] for value in item.evidence_ids]}"
+        prompt = load_prompt_artifact("research_write")
+        prompt_input = render_prompt_input(
+            "research_write",
+            topic=state["topic"],
+            facts=[
+                {
+                    "statement": fact.statement,
+                    "citation_ids": [citation_id_by_evidence[value] for value in fact.supporting_evidence_ids],
+                    "contradicting_citation_ids": [
+                        citation_id_by_evidence[value] for value in fact.contradicting_evidence_ids
+                    ],
+                    "confidence": fact.confidence,
+                }
+                for fact in validation.facts
+            ],
+            conflicts=[
+                {
+                    "description": item.description,
+                    "citation_ids": [citation_id_by_evidence[value] for value in item.evidence_ids],
+                }
                 for item in validation.conflicts
-            )
-            or "none"
+            ],
+            validation_summary=validation.summary,
         )
 
         draft = await self._llm_service.call_structured(
             (
-                SystemMessage(
-                    content=(
-                        "Write a concise research report only from the validated facts. Use citation IDs exactly "
-                        "as provided. Every factual section must list its citation_ids. Preserve conflicts and "
-                        "limitations; never invent a citation or source."
-                    )
-                ),
-                HumanMessage(
-                    content=(
-                        f"Topic: {state['topic']}\nValidated facts:\n{facts_text}\n\n"
-                        f"Conflicts:\n{conflicts_text}\n\nValidation summary: {validation.summary}"
-                    )
-                ),
+                SystemMessage(content=prompt.content),
+                HumanMessage(content=prompt_input),
             ),
             response_model=_ReportDraft,
             aliases=self._aliases,
             overrides={"temperature": 0.0},
+            prompt=prompt,
         )
 
         allowed_citations = set(citation_id_by_evidence.values())

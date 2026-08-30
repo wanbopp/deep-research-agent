@@ -19,8 +19,9 @@ class ScriptedLLMService:
         self._results = list(results)
         self.calls: list[tuple] = []
 
-    async def call_structured(self, messages, *, response_model, aliases, overrides=None):
+    async def call_structured(self, messages, *, response_model, aliases, overrides=None, prompt=None):
         """返回脚本中的下一个结果，并记录本轮消息."""
+        assert prompt is not None
         self.calls.append(tuple(messages))
         return self._results.pop(0)
 

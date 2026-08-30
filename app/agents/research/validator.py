@@ -1,8 +1,11 @@
 """检查研究证据是否足够、是否冲突以及是否需要补查."""
 
+import json
+
 from langchain_core.messages import HumanMessage, SystemMessage
 from langgraph.runtime import Runtime
 
+from app.agents.prompts.loader import load_prompt_artifact, render_prompt_input
 from app.agents.research.context import ResearchRuntimeContext
 from app.agents.research.state import ResearchState, ResearchStateUpdate
 from app.core.logging import logger
@@ -81,11 +84,7 @@ class ResearchValidator:
             )
             return self._next_update(state, result)
 
-        instruction = (
-            "Validate the research evidence. Create only facts directly supported by the listed "
-            "evidence IDs. Preserve conflicts. If evidence is insufficient, request focused follow-up "
-            "queries. Never invent an evidence ID."
-        )
+        prompt = load_prompt_artifact("research_validate")
         source_by_kind = {
             "document": ContextSource.HYBRID_RAG,
             "graph": ContextSource.GRAPH_RAG,
@@ -93,18 +92,18 @@ class ResearchValidator:
         }
         fragments = (
             ContextFragment(
-                kind=ContextKind.INSTRUCTION,
-                source=ContextSource.SYSTEM,
-                trust_level=TrustLevel.TRUSTED,
-                sensitivity=Sensitivity.INTERNAL,
-                content=instruction,
-            ),
-            ContextFragment(
                 kind=ContextKind.USER_INPUT,
                 source=ContextSource.USER_TOPIC,
                 trust_level=TrustLevel.UNTRUSTED,
                 sensitivity=Sensitivity.USER_PRIVATE,
-                content=f"Topic: {state['topic']}",
+                # 首个对象固定携带主题、完整计划和 evidence 数组字段；具体证据按
+                # 独立 JSON 行继续追加，便于 ContextAllocator 在记录边界分配预算。
+                content=render_prompt_input(
+                    "research_validate",
+                    topic=state["topic"],
+                    plan=plan.model_dump(mode="json"),
+                    evidence=[],
+                ),
             ),
             *(
                 ContextFragment(
@@ -112,22 +111,28 @@ class ResearchValidator:
                     source=source_by_kind[item.source_kind.value],
                     trust_level=TrustLevel.UNTRUSTED,
                     sensitivity=Sensitivity.USER_PRIVATE,
-                    content=f"[{item.evidence_id}] source={item.source_key}\n{item.content}",
+                    content=json.dumps(
+                        {"evidence_record": item.model_dump(mode="json")},
+                        ensure_ascii=False,
+                        separators=(",", ":"),
+                        sort_keys=True,
+                    ),
                 )
                 for item in evidence
             ),
         )
         allocated = ContextAllocator(max_tokens=self._budget.max_input_tokens).allocate(fragments)
-        visible_evidence = tuple(item for item in evidence if f"[{item.evidence_id}]" in allocated.text)
+        visible_evidence = tuple(item for item in evidence if item.evidence_id in allocated.text)
         base_messages = (
-            SystemMessage(content=allocated.fragments[0].content),
-            HumanMessage(content="\n\n".join(fragment.content for fragment in allocated.fragments[1:])),
+            SystemMessage(content=prompt.content),
+            HumanMessage(content=allocated.text),
         )
         result = await self._llm_service.call_structured(
             base_messages,
             response_model=ValidationResult,
             aliases=self._aliases,
             overrides={"temperature": 0.0},
+            prompt=prompt,
         )
 
         allowed_ids = {item.evidence_id for item in visible_evidence}
@@ -142,11 +147,16 @@ class ResearchValidator:
                 stage="first_pass",
             )
             correction = HumanMessage(
-                content=(
-                    "Your validation referenced evidence IDs that do not exist: "
-                    f"{', '.join(sorted(unknown_ids))}. Only these evidence IDs exist: "
-                    f"{', '.join(sorted(allowed_ids))}. Produce the validation again using "
-                    "only existing evidence IDs."
+                content=json.dumps(
+                    {
+                        "validation_correction": {
+                            "unknown_evidence_ids": sorted(unknown_ids),
+                            "allowed_evidence_ids": sorted(allowed_ids),
+                        }
+                    },
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                    sort_keys=True,
                 )
             )
             result = await self._llm_service.call_structured(
@@ -154,6 +164,7 @@ class ResearchValidator:
                 response_model=ValidationResult,
                 aliases=self._aliases,
                 overrides={"temperature": 0.0},
+                prompt=prompt,
             )
             unknown_ids = self._unknown_ids(result, allowed_ids)
 

@@ -18,8 +18,9 @@ class StubLLMService:
         """记录收到的 prompt，供断言冲突文本已经生成."""
         self.received_contents: list[str] = []
 
-    async def call_structured(self, messages, *, response_model, aliases, overrides=None):
+    async def call_structured(self, messages, *, response_model, aliases, overrides=None, prompt=None):
         """按 writer 期望的关键字参数返回结构化草稿."""
+        assert prompt is not None
         self.received_contents = [message.content for message in messages]
         return response_model(
             title="测试报告",
