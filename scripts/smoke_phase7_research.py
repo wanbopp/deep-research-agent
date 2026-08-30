@@ -11,7 +11,7 @@ import json
 import selectors
 from uuid import UUID, uuid4
 
-from sqlmodel import select
+from sqlmodel import col, select
 
 from app.agents.research.runtime import create_research_runtime
 from app.core.config import settings
@@ -52,7 +52,7 @@ async def run_smoke() -> dict[str, object]:
         # user_id 来自数据库可信记录，不放入请求正文。Smoke 不创建或输出账户信息，
         # 只借用一个 owner 验证 Repository/worker/Graph 的身份传递链。
         async with resources.orm_session_factory() as session, session.begin():
-            user_id = (await session.execute(select(User.id).order_by(User.created_at).limit(1))).scalar_one()
+            user_id = (await session.execute(select(User.id).order_by(col(User.created_at)).limit(1))).scalar_one()
 
         request = ResearchCreateRequest(
             topic=(

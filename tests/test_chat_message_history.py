@@ -185,4 +185,6 @@ async def test_history_uses_user_scoped_checkpoint_key(anyio_backend: str) -> No
     await service.get_message_history(session_id=session_id, user_id=user_id)
 
     config = graph.received_configs[0]
-    assert config["configurable"]["thread_id"] == f"user:{user_id.hex}:thread:{session_id}"
+    configurable = config.get("configurable")
+    assert isinstance(configurable, dict)
+    assert configurable["thread_id"] == f"user:{user_id.hex}:thread:{session_id}"
