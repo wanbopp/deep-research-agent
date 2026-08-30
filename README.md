@@ -30,15 +30,29 @@ environment template:
 Copy-Item .env.example .env.development
 ```
 
-## Run the API
+## Run the Web runtime
 
-Run the command from the Python project root so imports, environment files, and
-the project-local virtual environment resolve consistently:
+The default command starts both FastAPI and the durable Research Worker. This
+prevents the API from accepting tasks while no queue consumer is running:
 
 ```powershell
 Set-Location E:\workspace\Agent\DeepResearch\deep-research
-.\.venv\Scripts\python.exe -m uvicorn app.main:app --reload --host 127.0.0.1 --port 8000
+.\.venv\Scripts\deep-research-runtime.exe
 ```
+
+Running without arguments is equivalent to `--mode all`. The same installed
+entrypoint retains component-only modes for diagnostics and future scaling:
+
+```powershell
+.\.venv\Scripts\deep-research-runtime.exe --mode all
+.\.venv\Scripts\deep-research-runtime.exe --mode api
+.\.venv\Scripts\deep-research-runtime.exe --mode worker
+```
+
+`all` is the supported default for the current local and cloud deployment. The
+Supervisor stops the whole runtime if the Research Worker fails, rather than
+leaving a healthy-looking API with permanently pending tasks. `api` and
+`worker` are operational diagnostics; they are not the default Web mode.
 
 - Health check: <http://127.0.0.1:8000/api/v1/health>
 - Swagger UI: <http://127.0.0.1:8000/docs>
@@ -46,10 +60,10 @@ Set-Location E:\workspace\Agent\DeepResearch\deep-research
 
 Application startup enters the FastAPI lifespan first. The required PostgreSQL
 dependency must be reachable before Uvicorn starts accepting HTTP requests.
-On Windows, keep `--reload` for the current development command: this Uvicorn
-subprocess path uses a Selector event loop compatible with psycopg async. The
-single-process Windows path uses a Proactor loop and is not the supported local
-development path for this project.
+On Windows, the unified entrypoint explicitly creates the Selector event loop
+required by psycopg async, so it does not depend on Uvicorn `--reload` to obtain
+a compatible child process. Run the React frontend separately with `npm run
+dev` from the `deep-research-web` project.
 
 ## Quality checks
 
