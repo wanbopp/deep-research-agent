@@ -65,6 +65,29 @@ def test_trace_metadata_only_contains_allowlisted_structured_fields() -> None:
             pass
 
 
+def test_trace_accepts_prompt_identity_but_not_prompt_content() -> None:
+    """Trace 允许版本与哈希，仍从类型结构上拒绝 Prompt 正文."""
+    sink = RecordingSink()
+    runtime = SafeTracingRuntime(sink)
+    prompt_hash = "a" * 64
+
+    with runtime.bind(prompt_name="research_plan", prompt_version="v2", prompt_hash=prompt_hash):
+        with runtime.span("llm", model_alias="planner"):
+            pass
+
+    assert sink.records == [
+        (
+            "llm",
+            {
+                "model_alias": "planner",
+                "prompt_name": "research_plan",
+                "prompt_version": "v2",
+                "prompt_hash": prompt_hash,
+            },
+        )
+    ]
+
+
 def test_trace_failure_does_not_change_business_result_or_exception() -> None:
     """追踪创建和刷新失败不能影响正常结果，也不能吞掉业务异常."""
     runtime = SafeTracingRuntime(FailingSink())

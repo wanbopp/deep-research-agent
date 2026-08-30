@@ -2,12 +2,14 @@
 
 from collections.abc import Mapping, Sequence
 import asyncio
+import logging
 import pytest
 from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.language_models.fake_chat_models import FakeListChatModel
 from langchain_core.messages import HumanMessage
 from pydantic import SecretStr
 
+from app.agents.prompts.loader import load_prompt_artifact
 from app.schemas.llm import ModelSpec
 from app.services.llm.errors import AllModelsFailedError, LLMTimeoutError
 from app.services.llm.registry import LLMRegistry
@@ -58,6 +60,35 @@ def _model_spec(alias: str) -> ModelSpec:
 def _is_transient(error: BaseException) -> bool:
     """只有测试用临时异常允许重试和 fallback."""
     return isinstance(error, _TransientError)
+
+
+@pytest.mark.anyio
+async def test_llm_service_logs_only_prompt_identity_metadata(caplog: pytest.LogCaptureFixture) -> None:
+    """模型调用记录名称、版本和哈希，但不记录固定或用户 Prompt 正文."""
+    caplog.set_level(logging.INFO)
+    factory = _SequenceFactory({"primary": ["ok"]})
+    service = LLMService(
+        LLMRegistry([_model_spec("primary")], factory),
+        max_attempts=1,
+    )
+    prompt = load_prompt_artifact("chat_assistant")
+    private_input = "PRIVATE-USER-PROMPT-MUST-NOT-LEAK"
+
+    result = await service.call(
+        [HumanMessage(content=private_input)],
+        aliases=("primary",),
+        prompt=prompt,
+    )
+
+    assert result.content == "ok"
+    events = [record.msg for record in caplog.records if isinstance(record.msg, dict)]
+    selected = next(event for event in events if event.get("event") == "llm_prompt_selected")
+    assert selected["prompt_name"] == "chat_assistant"
+    assert selected["prompt_version"] == "v1"
+    assert selected["prompt_hash"] == prompt.content_sha256
+    serialized = repr(events)
+    assert private_input not in serialized
+    assert prompt.content not in serialized
 
 
 @pytest.mark.anyio

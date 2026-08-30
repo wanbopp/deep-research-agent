@@ -3,7 +3,7 @@
 from langchain_core.messages import HumanMessage, SystemMessage
 from langgraph.runtime import Runtime
 
-from app.agents.prompts.loader import render_prompt
+from app.agents.prompts.loader import load_prompt_artifact, render_prompt_input
 from app.agents.research.context import ResearchRuntimeContext
 from app.agents.research.state import ResearchState, ResearchStateUpdate
 from app.core.logging import logger
@@ -40,24 +40,22 @@ class ResearchPlanner:
         # Checkpoint 保存普通字典；节点入口负责恢复和校验业务模型。这样即使任务
         # 在另一进程恢复，也不会依赖原进程中的 Python 对象身份。
         config = ResearchConfig.model_validate(state["config"])
-        prompt = render_prompt(
+        prompt = load_prompt_artifact("research_plan")
+        prompt_input = render_prompt_input(
             "research_plan",
             topic=state["topic"],
             max_steps=config.max_steps,
         )
         plan = await self._llm_service.call_structured(
             (
-                SystemMessage(content=prompt),
-                HumanMessage(
-                    content=(
-                        "Create an executable research plan. Every step must include a completion "
-                        "criterion and one or more suitable retrieval strategies."
-                    )
-                ),
+                SystemMessage(content=prompt.content),
+                # 用户主题只存在于低信任 HumanMessage JSON 中，不能再被提升为系统指令。
+                HumanMessage(content=prompt_input),
             ),
             response_model=ResearchPlan,
             aliases=self._aliases,
             overrides={"temperature": 0.0},
+            prompt=prompt,
         )
 
         if len(plan.steps) > config.max_steps:

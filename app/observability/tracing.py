@@ -29,6 +29,9 @@ class ObservationContext:
     attempt_no: int | None = None
     node_name: str | None = None
     model_alias: str | None = None
+    prompt_name: str | None = None
+    prompt_version: str | None = None
+    prompt_hash: str | None = None
     retrieval_strategy: str | None = None
 
     def metadata(self) -> dict[str, str | int]:

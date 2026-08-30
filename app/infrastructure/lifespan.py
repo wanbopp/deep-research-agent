@@ -9,6 +9,7 @@ from fastapi import FastAPI
 from pydantic import SecretStr
 
 from app.agents.chat.runtime import create_chat_runtime
+from app.agents.prompts.loader import load_all_prompt_artifacts
 from app.agents.research.graph import ResearchGraph
 from app.agents.research.runtime import create_research_runtime
 from app.core.config import Settings, settings
@@ -399,6 +400,14 @@ async def lifespan(
         RuntimeError: required dependency 不健康，或 checkpointer setup 失败。异常
             离开 AsyncExitStack 前仍会执行已经登记的资源清理回调。
     """
+    # Prompt 是随代码发布的运行时资源。必须在建立外部连接前一次性验证，避免
+    # 某个低频节点在服务运行数小时后才因 wheel 漏打包或空文件失败。
+    prompt_artifacts = load_all_prompt_artifacts()
+    logger.info(
+        "prompt_registry_validated",
+        prompt_versions=[f"{item.name}:{item.version}" for item in prompt_artifacts],
+    )
+
     # factory 会构造 AsyncPostgresSaver，因此必须在这里的运行中 event loop 内
     # 调用，不能提前到模块全局。此时仍没有连接数据库，也没有执行 DDL。
     resources = create_application_resources(config)

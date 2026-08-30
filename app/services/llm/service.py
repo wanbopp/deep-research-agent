@@ -3,7 +3,7 @@
 import asyncio
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from time import perf_counter
-from typing import TypeVar
+from typing import Protocol, TypeVar
 
 from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.messages import BaseMessage
@@ -49,6 +49,25 @@ OutputT = TypeVar("OutputT")
 # OutputT 让整条 retry/fallback/timeout 链保留 invoker 的返回类型。
 # 一个函数，接收一个 BaseChatModel，调用后返回一个可以 await 的对象；await 完以后，得到 OutputT
 ModelInvoker = Callable[[BaseChatModel], Awaitable[OutputT]]
+
+
+class PromptDescriptor(Protocol):
+    """LLMService 可观测但不读取正文的 Prompt 元数据协议."""
+
+    @property
+    def name(self) -> str:
+        """返回稳定逻辑名称."""
+        ...
+
+    @property
+    def version(self) -> str:
+        """返回发布版本."""
+        ...
+
+    @property
+    def content_sha256(self) -> str:
+        """返回固定系统指令正文的 SHA-256."""
+        ...
 
 
 def _is_retryable_provider_error(error: BaseException) -> bool:
@@ -217,6 +236,7 @@ class LLMService:
         aliases: Sequence[str],
         overrides: Mapping[str, object] | None = None,
         operation: str,
+        prompt: PromptDescriptor | None = None,
     ) -> OutputT:
         """在总时间预算内执行完整 retry 和 fallback 链."""
         # 保存 timeout 对象，异常发生后可以检查究竟是不是总预算到期。
@@ -224,39 +244,52 @@ class LLMService:
             self._total_timeout_seconds,
         )
 
+        trace_fields: dict[str, object] = {}
+        if prompt is not None:
+            if not prompt.name or not prompt.version or len(prompt.content_sha256) != 64:
+                raise ValueError("prompt metadata is invalid")
+            trace_fields = {
+                "prompt_name": prompt.name,
+                "prompt_version": prompt.version,
+                "prompt_hash": prompt.content_sha256,
+            }
+            # 只记录有限元数据，不记录 System/Human Message 正文。
+            logger.info("llm_prompt_selected", **trace_fields)
+
         started_at = perf_counter()
         outcome = "error"
-        try:
-            async with timeout_context:
-                result = await self._call_with_fallback(
-                    invoker=invoker,
-                    aliases=aliases,
-                    overrides=overrides,
+        with tracing.bind(**trace_fields):
+            try:
+                async with timeout_context:
+                    result = await self._call_with_fallback(
+                        invoker=invoker,
+                        aliases=aliases,
+                        overrides=overrides,
+                    )
+                    outcome = "success"
+                    return result
+            except TimeoutError:
+                # 内部代码也可能主动抛 TimeoutError。
+                # context 没有过期时，应保留原始异常。
+                if not timeout_context.expired():
+                    raise
+
+                logger.error(
+                    "llm_call_timed_out",
+                    timeout_seconds=self._total_timeout_seconds,
                 )
-                outcome = "success"
-                return result
-        except TimeoutError:
-            # 内部代码也可能主动抛 TimeoutError。
-            # context 没有过期时，应保留原始异常。
-            if not timeout_context.expired():
-                raise
 
-            logger.error(
-                "llm_call_timed_out",
-                timeout_seconds=self._total_timeout_seconds,
-            )
-
-            # 只有整个调用预算真正到期，才转换为领域错误。
-            outcome = "timeout"
-            raise LLMTimeoutError(
-                self._total_timeout_seconds,
-            ) from None
-        finally:
-            self._metrics.observe_llm_call(
-                operation=operation,
-                outcome=outcome,
-                duration_seconds=perf_counter() - started_at,
-            )
+                # 只有整个调用预算真正到期，才转换为领域错误。
+                outcome = "timeout"
+                raise LLMTimeoutError(
+                    self._total_timeout_seconds,
+                ) from None
+            finally:
+                self._metrics.observe_llm_call(
+                    operation=operation,
+                    outcome=outcome,
+                    duration_seconds=perf_counter() - started_at,
+                )
 
     async def call(
         self,
@@ -265,6 +298,7 @@ class LLMService:
         aliases: Sequence[str],
         tools: Sequence[BaseTool] | None = None,
         overrides: Mapping[str, object] | None = None,
+        prompt: PromptDescriptor | None = None,
     ) -> BaseMessage:
         """使用共享弹性链路执行普通文本模型调用."""
         # 固定本次调用的工具快照，不能保存到 self。
@@ -287,6 +321,7 @@ class LLMService:
             aliases=aliases,
             overrides=overrides,
             operation="text",
+            prompt=prompt,
         )
 
     async def call_structured(
@@ -296,6 +331,7 @@ class LLMService:
         response_model: type[StructuredT],
         aliases: Sequence[str],
         overrides: Mapping[str, object] | None = None,
+        prompt: PromptDescriptor | None = None,
     ) -> StructuredT:
         """使用共享弹性链路调用模型，并返回校验后的 Pydantic 对象."""
 
@@ -331,6 +367,7 @@ class LLMService:
             aliases=aliases,
             overrides=overrides,
             operation="structured",
+            prompt=prompt,
         )
 
     def _record_usage(self, *, alias: str, result: object) -> None:
