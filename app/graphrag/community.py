@@ -9,11 +9,12 @@ from uuid import UUID
 from langchain_core.messages import HumanMessage, SystemMessage
 from pydantic import BaseModel, ConfigDict, Field
 
+from app.agents.prompts.loader import load_prompt_artifact, render_prompt_input
 from app.graphrag.schemas import CommunityRecord, GraphEdge
 from app.services.llm.service import LLMService
 
 CONNECTED_COMPONENTS_VERSION = "connected-components-v1"
-COMMUNITY_SUMMARY_VERSION = "community-summary-v1"
+COMMUNITY_SUMMARY_VERSION = "community-summary-v2"
 
 
 class CommunityDraft:
@@ -128,19 +129,16 @@ class LLMCommunitySummarizer:
             f"- {edge.source_name} --{edge.relation_type.value}--> {edge.target_name}: {edge.evidence_text}"
             for edge in draft.edges
         )
+        prompt = load_prompt_artifact("graphrag_community_summary")
         return await self._llm_service.call_structured(
             (
-                SystemMessage(
-                    content=(
-                        "Summarize only the supplied graph facts. Create a short title and a factual summary. "
-                        "Do not add outside knowledge, citations, ids, secrets, or unsupported conclusions."
-                    )
-                ),
-                HumanMessage(content=facts),
+                SystemMessage(content=prompt.content),
+                HumanMessage(content=render_prompt_input("graphrag_community_summary", facts=facts)),
             ),
             response_model=_CommunitySummaryPayload,
             aliases=self._aliases,
             overrides={"temperature": 0.0},
+            prompt=prompt,
         )
 
 

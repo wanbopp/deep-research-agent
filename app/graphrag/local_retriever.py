@@ -6,6 +6,7 @@ from uuid import UUID
 
 from langchain_core.messages import HumanMessage, SystemMessage
 
+from app.agents.prompts.loader import load_prompt_artifact, render_prompt_input
 from app.graphrag.normalizer import normalize_entity_name
 from app.graphrag.schemas import GraphPath, LocalGraphResult, QueryEntityPayload, StoredEntity
 from app.services.llm.service import LLMService
@@ -33,19 +34,16 @@ class LLMQueryEntityLinker:
         """提取问题中逐字出现或明确指代的实体名称."""
         if not query.strip():
             raise ValueError("query must not be blank")
+        prompt = load_prompt_artifact("graphrag_query_entity")
         payload = await self._llm_service.call_structured(
             (
-                SystemMessage(
-                    content=(
-                        "Extract up to 10 entity names explicitly mentioned in the query. "
-                        "Do not answer the query and do not invent entities."
-                    )
-                ),
-                HumanMessage(content=query),
+                SystemMessage(content=prompt.content),
+                HumanMessage(content=render_prompt_input("graphrag_query_entity", query=query)),
             ),
             response_model=QueryEntityPayload,
             aliases=self._aliases,
             overrides={"temperature": 0.0},
+            prompt=prompt,
         )
         return tuple(dict.fromkeys(payload.names))
 

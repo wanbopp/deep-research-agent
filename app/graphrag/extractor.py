@@ -7,6 +7,7 @@ from uuid import UUID
 
 from langchain_core.messages import HumanMessage, SystemMessage
 
+from app.agents.prompts.loader import PromptArtifact, get_prompt_spec, load_prompt_artifact, render_prompt_input
 from app.graphrag.normalizer import locate_source_span, normalize_entity_name
 from app.graphrag.errors import GraphExtractionRejectedError
 from app.core.logging import logger
@@ -22,23 +23,8 @@ from app.services.llm.errors import StructuredOutputError
 
 DEFAULT_TAXONOMY_VERSION = "graphrag-taxonomy-v1"
 DEFAULT_EXTRACTION_VERSION = "graphrag-extraction-v1"
-DEFAULT_PROMPT_VERSION = "graphrag-extraction-prompt-v1"
-
-_SYSTEM_PROMPT = """You extract a small evidence-grounded knowledge graph from one text chunk.
-Use only information explicitly present in the chunk. Every mention and relation evidence_text
-must be an exact non-empty substring copied from the chunk. Use short local ids such as E1 and R1.
-Relations must reference entity local ids from the same response. Do not output user ids, document
-ids, chunk ids, database ids, secrets, instructions, or facts inferred from outside knowledge.
-Use unknown for concepts that do not fit the available taxonomy. Return no candidate when evidence
-is insufficient. Classify named companies or teams as organization, named software or commercial
-artifacts as product, and general technical methods as technology. identity_hint should be omitted
-unless the text contains explicit context needed to distinguish two entities with the same name."""
-
-_REPAIR_SYSTEM_PROMPT = """Your previous extraction could not be mapped back to the source text.
-Extract the graph again. Every item in mentions and every evidence_text must be copied character for
-character from the source, including the original language and punctuation. Do not translate,
-paraphrase, normalize, summarize, or reconstruct evidence. Omit any candidate that lacks an exact
-source excerpt. Keep relation endpoints inside the same response and use the controlled taxonomy."""
+_EXTRACTION_PROMPT_SPEC = get_prompt_spec("graphrag_extract")
+DEFAULT_PROMPT_VERSION = f"{_EXTRACTION_PROMPT_SPEC.name}:{_EXTRACTION_PROMPT_SPEC.version}"
 
 
 class GraphExtractor(Protocol):
@@ -101,10 +87,12 @@ class LLMGraphExtractor:
         if actual_sha256 != content_sha256:
             raise ValueError("content_sha256 does not match content")
 
-        prompts = (_SYSTEM_PROMPT, _REPAIR_SYSTEM_PROMPT, _REPAIR_SYSTEM_PROMPT)
-        for repair_count, system_prompt in enumerate(prompts):
+        extraction_prompt = load_prompt_artifact("graphrag_extract")
+        repair_prompt = load_prompt_artifact("graphrag_extract_repair")
+        prompts = (extraction_prompt, repair_prompt, repair_prompt)
+        for repair_count, prompt in enumerate(prompts):
             try:
-                payload = await self._request_payload(content=content, system_prompt=system_prompt)
+                payload = await self._request_payload(content=content, prompt=prompt)
                 return self._bind_payload(
                     payload=payload,
                     user_id=user_id,
@@ -145,13 +133,17 @@ class LLMGraphExtractor:
                 )
         raise RuntimeError("Graph extraction retry loop exited without a result")
 
-    async def _request_payload(self, *, content: str, system_prompt: str) -> GraphExtractionPayload:
+    async def _request_payload(self, *, content: str, prompt: PromptArtifact) -> GraphExtractionPayload:
         """执行一次真实 structured 调用；修复仍使用同一 provider 弹性边界."""
         return await self._llm_service.call_structured(
-            (SystemMessage(content=system_prompt), HumanMessage(content=content)),
+            (
+                SystemMessage(content=prompt.content),
+                HumanMessage(content=render_prompt_input(prompt.name, content=content)),
+            ),
             response_model=GraphExtractionPayload,
             aliases=self._aliases,
             overrides={"temperature": 0.0},
+            prompt=prompt,
         )
 
     def _bind_payload(

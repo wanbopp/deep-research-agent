@@ -6,6 +6,7 @@ from collections.abc import Sequence
 from langchain_core.messages import HumanMessage, SystemMessage
 from pydantic import BaseModel, ConfigDict, Field
 
+from app.agents.prompts.loader import load_prompt_artifact, render_prompt_input
 from app.graphrag.schemas import (
     CommunityMapResult,
     CommunityRecord,
@@ -54,20 +55,17 @@ class GlobalGraphAnswerer:
                 *(self._map_one(query=query, community=community) for community in retrieval.communities)
             )
         )
-        rendered = "\n".join(f"[{index}] {item.claim}" for index, item in enumerate(map_results))
+        claims = [{"index": index, "claim": item.claim} for index, item in enumerate(map_results)]
+        reduce_prompt = load_prompt_artifact("graphrag_global_reduce")
         reduced = await self._llm_service.call_structured(
             (
-                SystemMessage(
-                    content=(
-                        "Answer only from the numbered map claims. Select every claim index used. "
-                        "Do not invent sources or use outside knowledge."
-                    )
-                ),
-                HumanMessage(content=f"Question: {query}\nClaims:\n{rendered}"),
+                SystemMessage(content=reduce_prompt.content),
+                HumanMessage(content=render_prompt_input("graphrag_global_reduce", question=query, claims=claims)),
             ),
             response_model=_ReducePayload,
             aliases=self._aliases,
             overrides={"temperature": 0.0},
+            prompt=reduce_prompt,
         )
         indexes = tuple(dict.fromkeys(reduced.used_map_indexes))
         if any(index < 0 or index >= len(map_results) for index in indexes):
@@ -84,19 +82,22 @@ class GlobalGraphAnswerer:
     async def _map_one(self, *, query: str, community: CommunityRecord) -> CommunityMapResult:
         """在并发预算内生成一个社区局部结论并绑定真实来源."""
         async with self._semaphore:
+            map_prompt = load_prompt_artifact("graphrag_global_map")
             payload = await self._llm_service.call_structured(
                 (
-                    SystemMessage(
-                        content=(
-                            "Answer the question only from this community summary. If evidence is indirect, "
-                            "state that limitation. Do not add citations, ids, or outside knowledge."
+                    SystemMessage(content=map_prompt.content),
+                    HumanMessage(
+                        content=render_prompt_input(
+                            "graphrag_global_map",
+                            question=query,
+                            community=community.summary,
                         )
                     ),
-                    HumanMessage(content=f"Question: {query}\nCommunity: {community.summary}"),
                 ),
                 response_model=_MapPayload,
                 aliases=self._aliases,
                 overrides={"temperature": 0.0},
+                prompt=map_prompt,
             )
         return CommunityMapResult(
             community_id=community.community_id,
