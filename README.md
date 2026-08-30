@@ -99,6 +99,30 @@ user IDs, task IDs, prompts, filenames, or document content as file names.
    API 进程内存队列；任务领取、租约、heartbeat、checkpoint、重试和恢复仍以持久化
    存储为准。
 
+### Prompt 安全与版本规范
+
+所有模型提示词必须遵守以下规则：
+
+1. **固定系统指令。** System Prompt 必须来自 `app/agents/prompts/` 中已注册的版本化
+   Markdown 资源，禁止把用户主题、聊天正文、证据、记忆或工具输出拼入 SystemMessage。
+2. **低信任数据隔离。** 用户输入和检索内容通过严格字段契约编码为 HumanMessage JSON；
+   Prompt Registry 会同时拒绝缺失字段和额外字段，错误日志不得包含字段值。
+3. **禁止散落 Prompt。** 业务节点只能通过逻辑名称加载 Prompt，不应在 Python 文件中新增
+   大段系统提示词。升级内容时新增版本文件并修改中央注册项。
+4. **模型输出不直接可信。** 优先使用 Pydantic structured output；证据 ID、引用、身份、权限、
+   来源和持久化状态仍必须由服务端确定性校验或绑定。
+5. **版本可复现。** 每个 Prompt 工件包含逻辑名称、发布版本和正文 SHA-256。应用启动时会
+   验证全部注册资源，防止 wheel 漏打包或空文件延迟到首次请求才失败。
+6. **可观测但不采集正文。** 日志和 Trace 只记录 Prompt 名称、版本与哈希；不得记录完整
+   System Prompt、HumanMessage、证据正文、记忆正文或模型隐藏推理。Prompt 版本不得作为
+   包含用户值的动态指标标签。
+7. **修改必须经过门禁。** Prompt 变更至少通过字段契约、信任层级、注入隔离、结构化输出、
+   全量回归和相关真实 Provider smoke；不能只根据单次回答的主观观感发布。
+
+当前注册项覆盖 Chat、Research Planner/Validator/Writer、GraphRAG extraction/repair/linking/
+community/map/reduce、会话标题和长期记忆提取。Prompt Registry 与调用方式见
+`app/agents/prompts/loader.py`。
+
 - Health check: <http://127.0.0.1:8000/api/v1/health>
 - Swagger UI: <http://127.0.0.1:8000/docs>
 - OpenAPI JSON: <http://127.0.0.1:8000/api/v1/openapi.json>
