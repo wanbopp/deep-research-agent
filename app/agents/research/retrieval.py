@@ -6,6 +6,7 @@ import asyncio
 from collections.abc import Mapping
 from datetime import UTC, datetime
 from typing import Protocol
+from time import perf_counter
 from uuid import UUID
 
 from ddgs import DDGS
@@ -18,6 +19,7 @@ from app.agents.research.state import ResearchState, ResearchStateUpdate
 from app.core.logging import logger
 from app.graphrag.global_retriever import GlobalGraphRetriever
 from app.graphrag.local_retriever import LocalGraphRetriever
+from app.observability import metrics
 from app.rag.hybrid import HybridRetriever
 from app.schemas.research import (
     Evidence,
@@ -247,16 +249,36 @@ class ParallelResearchRetriever:
         ) -> tuple[Evidence, ...] | RetrievalFailure:
             retriever = self._retrievers.get(strategy)
             if retriever is None:
+                metrics.observe_retrieval(
+                    strategy=strategy.value,
+                    outcome="unavailable",
+                    duration_seconds=0.0,
+                    candidate_count=None,
+                )
                 return RetrievalFailure(step_id=step.step_id, strategy=strategy, error_type="UnavailableRetriever")
+            started_at = perf_counter()
             try:
                 async with asyncio.timeout(min(30.0, config.timeout_seconds)):
-                    return await retriever.search(
+                    result = await retriever.search(
                         user_id=runtime.context.user_id,
                         step=step,
                         query=query,
                         top_k=config.max_evidence_per_step,
                     )
+                    metrics.observe_retrieval(
+                        strategy=strategy.value,
+                        outcome="success",
+                        duration_seconds=perf_counter() - started_at,
+                        candidate_count=len(result),
+                    )
+                    return result
             except Exception as error:
+                metrics.observe_retrieval(
+                    strategy=strategy.value,
+                    outcome="error",
+                    duration_seconds=perf_counter() - started_at,
+                    candidate_count=None,
+                )
                 logger.warning(
                     "research_retrieval_failed",
                     research_id=str(runtime.context.research_id),

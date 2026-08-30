@@ -40,6 +40,7 @@ dependencies = [
     "email-validator>=2.2.0",
     # ---- 可观测性 & 限流 ----
     "langfuse>=3.9.1",
+    "prometheus-client>=0.21.0",
     "structlog>=25.2.0",
     "slowapi>=0.1.9",
     "asgi-correlation-id>=4.3.4",

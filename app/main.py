@@ -5,6 +5,7 @@ from fastapi import FastAPI
 from starlette.middleware.cors import CORSMiddleware
 
 from app.api.v1.api import api_router
+from app.api.metrics import router as metrics_router
 from app.core.config import settings
 from app.core.exception_handlers import register_exception_handlers
 from app.core.middleware import RequestLoggingMiddleware
@@ -44,3 +45,4 @@ app.add_middleware(
 
 # 注册app router
 app.include_router(api_router, prefix=settings.API_V1_STR)
+app.include_router(metrics_router)

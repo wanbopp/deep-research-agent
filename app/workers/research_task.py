@@ -18,6 +18,7 @@ from app.agents.research.state import ResearchState
 from app.agents.research.writer import render_report_markdown
 from app.core.logging import logger
 from app.models import ResearchTask, ResearchTaskStatus, utc_now
+from app.observability import metrics
 from app.repositories import ResearchTaskRepository
 from app.schemas.research import ResearchConfig, ResearchReport, ResearchStatus
 
@@ -86,6 +87,18 @@ class ResearchTaskWorker:
                 payload={"attempt_count": task.attempt_count},
             )
 
+        metrics.research_worker_inflight.inc()
+        try:
+            result = await self._execute_claimed(task)
+            metrics.observe_research_task(outcome=result.value)
+            return result
+        finally:
+            # Worker shutdown、finalize 失败和普通终态都必须归还 Gauge，避免进程内
+            # 指标永久显示幽灵任务。任务真实恢复仍由数据库 lease 决定。
+            metrics.research_worker_inflight.dec()
+
+    async def _execute_claimed(self, task: ResearchTask) -> ResearchWorkerResult:
+        """在领取事务之外执行一条任务，并返回有限的处理结果."""
         try:
             final_state = await self._run_graph_until_done_or_cancelled(task)
         except ResearchCancellationRequested:

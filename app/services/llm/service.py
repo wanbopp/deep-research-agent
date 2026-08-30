@@ -19,6 +19,7 @@ from tenacity import (
 )
 
 from app.core.logging import logger
+from app.observability import MetricsRuntime, metrics
 from app.services.llm.errors import (
     AllModelsFailedError,
     LLMTimeoutError,
@@ -67,6 +68,7 @@ class LLMService:
         retry_wait_multiplier: float = 0.25,
         total_timeout_seconds: float = 60.0,
         retry_predicate: RetryPredicate = _is_retryable_provider_error,
+        metrics_runtime: MetricsRuntime = metrics,
     ) -> None:
         """保存模型 Registry、单模型重试配置和整次调用总预算."""
         if max_attempts < 1:
@@ -81,6 +83,7 @@ class LLMService:
         self._retry_wait_multiplier = retry_wait_multiplier
         self._total_timeout_seconds = total_timeout_seconds
         self._retry_predicate = retry_predicate
+        self._metrics = metrics_runtime
 
     async def _invoke_once(
         self,
@@ -131,12 +134,16 @@ class LLMService:
             with attempt:
                 attempt_started_at = perf_counter()
                 try:
-                    return await self._invoke_once(
+                    result = await self._invoke_once(
                         alias=alias,
                         invoker=invoker,
                         overrides=overrides,
                     )
+                    self._metrics.observe_llm_attempt(model_alias=alias, outcome="success")
+                    self._record_usage(alias=alias, result=result)
+                    return result
                 except Exception as error:
+                    self._metrics.observe_llm_attempt(model_alias=alias, outcome="error")
                     logger.warning(
                         "llm_attempt_failed",
                         alias=alias,
@@ -207,6 +214,7 @@ class LLMService:
         *,
         aliases: Sequence[str],
         overrides: Mapping[str, object] | None = None,
+        operation: str,
     ) -> OutputT:
         """在总时间预算内执行完整 retry 和 fallback 链."""
         # 保存 timeout 对象，异常发生后可以检查究竟是不是总预算到期。
@@ -214,13 +222,17 @@ class LLMService:
             self._total_timeout_seconds,
         )
 
+        started_at = perf_counter()
+        outcome = "error"
         try:
             async with timeout_context:
-                return await self._call_with_fallback(
+                result = await self._call_with_fallback(
                     invoker=invoker,
                     aliases=aliases,
                     overrides=overrides,
                 )
+                outcome = "success"
+                return result
         except TimeoutError:
             # 内部代码也可能主动抛 TimeoutError。
             # context 没有过期时，应保留原始异常。
@@ -233,9 +245,16 @@ class LLMService:
             )
 
             # 只有整个调用预算真正到期，才转换为领域错误。
+            outcome = "timeout"
             raise LLMTimeoutError(
                 self._total_timeout_seconds,
             ) from None
+        finally:
+            self._metrics.observe_llm_call(
+                operation=operation,
+                outcome=outcome,
+                duration_seconds=perf_counter() - started_at,
+            )
 
     async def call(
         self,
@@ -265,6 +284,7 @@ class LLMService:
             invoke_text,
             aliases=aliases,
             overrides=overrides,
+            operation="text",
         )
 
     async def call_structured(
@@ -304,4 +324,22 @@ class LLMService:
 
         # 调用 self._execute()。
         # 传入 invoke_structured、aliases 和 overrides。
-        return await self._execute(invoker=invoke_structured, aliases=aliases, overrides=overrides)
+        return await self._execute(
+            invoker=invoke_structured,
+            aliases=aliases,
+            overrides=overrides,
+            operation="structured",
+        )
+
+    def _record_usage(self, *, alias: str, result: object) -> None:
+        """从 LangChain 标准 usage_metadata 读取明确 token 数，不检查响应正文."""
+        usage = getattr(result, "usage_metadata", None)
+        if not isinstance(usage, Mapping):
+            return
+        input_tokens = usage.get("input_tokens")
+        output_tokens = usage.get("output_tokens")
+        self._metrics.observe_llm_tokens(
+            model_alias=alias,
+            input_tokens=input_tokens if isinstance(input_tokens, int) else None,
+            output_tokens=output_tokens if isinstance(output_tokens, int) else None,
+        )

@@ -12,6 +12,7 @@ from starlette.requests import Request
 from starlette.responses import Response
 
 from app.core.logging import bind_context, clear_context, logger
+from app.observability import metrics
 
 
 class RequestLoggingMiddleware(BaseHTTPMiddleware):
@@ -49,6 +50,18 @@ class RequestLoggingMiddleware(BaseHTTPMiddleware):
                 "request_completed",
                 status_code=status_code,
                 duration_ms=duration_ms,
+            )
+
+            # 路由匹配发生在 call_next 内部，因此必须在返回后读取 route.path。
+            # 404 或路由前异常没有模板时统一使用 unmatched，绝不能把包含用户 ID、
+            # research_id 或任意 path segment 的原始 URL 写入 Prometheus 标签。
+            route = request.scope.get("route")
+            route_template = getattr(route, "path", "unmatched")
+            metrics.observe_http(
+                method=request.method,
+                route=route_template,
+                status_code=status_code,
+                duration_seconds=duration_ms / 1000,
             )
 
             # 清空本次请求的上下文
