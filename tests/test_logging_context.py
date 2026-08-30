@@ -11,7 +11,15 @@ from fastapi import FastAPI
 from httpx import ASGITransport, AsyncClient
 
 from app.core.middleware import RequestLoggingMiddleware
-from app.core.logging import bind_context, clear_context, get_context, logger
+from app.core.logging import (
+    ComponentLogFilter,
+    bind_context,
+    clear_context,
+    component_context,
+    get_context,
+    get_log_file_path,
+    logger,
+)
 
 
 # 真实的 HTTP 请求测试并发 HTTP 请求上下文隔离
@@ -182,3 +190,44 @@ async def test_concurrent_requests_write_correlated_log_events(
     assert second_event["request_id"] == second_request_id
     assert second_event["path"] == "/context/second"
     assert second_event["method"] == "GET"
+
+
+def test_component_context_restores_outer_logging_context() -> None:
+    """组件作用域退出后必须精确恢复外层字段而不是清空全部上下文."""
+    clear_context()
+    bind_context(runtime_instance="test-runtime")
+    try:
+        with component_context("research-worker"):
+            assert get_context() == {
+                "runtime_instance": "test-runtime",
+                "component": "research-worker",
+            }
+        assert get_context() == {"runtime_instance": "test-runtime"}
+    finally:
+        clear_context()
+
+
+def test_component_log_filter_routes_structured_and_foreign_records() -> None:
+    """Structlog dict 和标准库字符串日志都应按有限组件路由."""
+    api_filter = ComponentLogFilter("api")
+    worker_filter = ComponentLogFilter("research-worker")
+    structured = logging.LogRecord("test", logging.INFO, __file__, 1, {"component": "api"}, (), None)
+    foreign = logging.LogRecord("test", logging.INFO, __file__, 1, "server started", (), None)
+
+    assert api_filter.filter(structured) is True
+    assert worker_filter.filter(structured) is False
+    with component_context("research-worker"):
+        assert worker_filter.filter(foreign) is True
+        assert api_filter.filter(foreign) is False
+
+
+def test_component_log_paths_are_finite_and_distinct() -> None:
+    """日志文件名只接受固定组件，避免动态值创建无界文件."""
+    api_path = get_log_file_path("api")
+    index_path = get_log_file_path("index-worker")
+
+    assert api_path != index_path
+    assert "-api-" in api_path.name
+    assert "-index-worker-" in index_path.name
+    with pytest.raises(ValueError, match="component"):
+        get_log_file_path("task-user-input")
