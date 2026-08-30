@@ -106,6 +106,8 @@ class ResearchTaskRepository(RepositoryBase):
         now = utc_now()
         task.status = ResearchTaskStatus.RUNNING
         task.worker_id = worker_id
+        task.active_run_id = uuid4()
+        task.lifecycle_version += 1
         task.attempt_count += 1
         task.started_at = task.started_at or now
         task.heartbeat_at = now
@@ -164,24 +166,49 @@ class ResearchTaskRepository(RepositoryBase):
         """供已领取 worker 检查取消标记；调用方必须已持有可信 task ID."""
         return await self._session.get(ResearchTask, task_id)
 
-    async def heartbeat(self, task: ResearchTask, *, worker_id: str) -> None:
-        """只有当前 owner worker 可以续写心跳."""
-        if task.status != ResearchTaskStatus.RUNNING or task.worker_id != worker_id:
-            raise RuntimeError("research task is not owned by this worker")
+    async def get_claim_for_update(
+        self,
+        *,
+        task_id: UUID,
+        run_id: UUID,
+        worker_id: str,
+    ) -> ResearchTask | None:
+        """锁定仍属于指定 run 的任务；旧 Worker 的 token 不会命中新领取."""
+        columns = cast(Any, ResearchTask).__table__.c
+        result = await self._session.execute(
+            select(ResearchTask)
+            .where(
+                ResearchTask.id == task_id,
+                ResearchTask.active_run_id == run_id,
+                ResearchTask.worker_id == worker_id,
+                columns.status.in_((ResearchTaskStatus.RUNNING, ResearchTaskStatus.CANCELLING)),
+            )
+            .with_for_update()
+        )
+        return result.scalar_one_or_none()
+
+    async def heartbeat(self, task: ResearchTask, *, run_id: UUID) -> None:
+        """在调用方已经用 run_id 锁定当前 claim 后续写心跳."""
+        if task.active_run_id != run_id or task.worker_id is None:
+            raise RuntimeError("heartbeat requires the current research run claim")
         task.heartbeat_at = utc_now()
         task.updated_at = task.heartbeat_at
+        task.lifecycle_version += 1
         await self._session.flush()
 
     async def finalize(
         self,
         task: ResearchTask,
         *,
+        run_id: UUID,
         status: ResearchTaskStatus,
         report_json: dict[str, object] | None = None,
         markdown_report: str | None = None,
         error_code: str | None = None,
     ) -> None:
         """把运行中任务转换为一个稳定终态，并清除 worker 租用信息."""
+        if task.active_run_id != run_id:
+            raise RuntimeError("finalize requires the current research run claim")
         if status not in {
             ResearchTaskStatus.COMPLETED,
             ResearchTaskStatus.FAILED,
@@ -194,9 +221,11 @@ class ResearchTaskRepository(RepositoryBase):
         task.markdown_report = markdown_report
         task.error_code = error_code
         task.worker_id = None
+        task.active_run_id = None
         task.heartbeat_at = None
         task.completed_at = now
         task.updated_at = now
+        task.lifecycle_version += 1
         await self._session.flush()
 
     async def recover_stale(self, *, stale_before: datetime) -> int:
@@ -212,6 +241,8 @@ class ResearchTaskRepository(RepositoryBase):
         )
         tasks = tuple(result.scalars().all())
         for task in tasks:
+            expired_run_id = task.active_run_id
+            previous_status = task.status
             if task.status == ResearchTaskStatus.CANCELLING:
                 next_status = ResearchTaskStatus.CANCELLED
             elif task.attempt_count < task.max_attempts:
@@ -220,9 +251,27 @@ class ResearchTaskRepository(RepositoryBase):
                 next_status = ResearchTaskStatus.FAILED
             task.status = next_status
             task.worker_id = None
+            task.active_run_id = None
             task.heartbeat_at = None
             task.error_code = "WORKER_HEARTBEAT_EXPIRED"
-            task.updated_at = utc_now()
+            now = utc_now()
+            task.updated_at = now
+            task.lifecycle_version += 1
+            if next_status in {ResearchTaskStatus.FAILED, ResearchTaskStatus.CANCELLED}:
+                task.completed_at = now
+            await self.append_event(
+                task_id=task.id,
+                user_id=task.user_id,
+                event_type="run_lease_expired",
+                payload={
+                    "run_id": str(expired_run_id) if expired_run_id is not None else None,
+                    # SQLModel 的 String 列在部分加载路径返回普通 str，在另一些
+                    # 路径保留 StrEnum；统一用 str()，避免恢复流程依赖 ORM 细节。
+                    "previous_status": str(previous_status),
+                    "status": str(next_status),
+                    "attempt_count": task.attempt_count,
+                },
+            )
         await self._session.flush()
         return len(tasks)
 

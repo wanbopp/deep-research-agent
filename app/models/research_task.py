@@ -38,6 +38,14 @@ class ResearchTask(UUIDTimestampModel, table=True):
         ),
         CheckConstraint("attempt_count >= 0", name="ck_research_tasks_attempt_count"),
         CheckConstraint("max_attempts > 0", name="ck_research_tasks_max_attempts"),
+        CheckConstraint("lifecycle_version >= 0", name="ck_research_tasks_lifecycle_version"),
+        CheckConstraint(
+            "((status IN ('running', 'cancelling') AND active_run_id IS NOT NULL "
+            "AND worker_id IS NOT NULL AND heartbeat_at IS NOT NULL) OR "
+            "(status NOT IN ('running', 'cancelling') AND active_run_id IS NULL "
+            "AND worker_id IS NULL AND heartbeat_at IS NULL))",
+            name="ck_research_tasks_active_claim",
+        ),
         UniqueConstraint("user_id", "idempotency_key", name="uq_research_tasks_user_idempotency"),
     )
 
@@ -68,6 +76,10 @@ class ResearchTask(UUIDTimestampModel, table=True):
     attempt_count: int = Field(default=0, sa_column=Column(Integer, nullable=False))
     max_attempts: int = Field(default=2, sa_column=Column(Integer, nullable=False))
     worker_id: str | None = Field(default=None, sa_column=Column(String(128), nullable=True, index=True))
+    # active_run_id 是本次领取的 fencing token。worker_id 便于运维识别进程，
+    # 但进程名可能复用，不能单独证明写入者仍拥有当前执行权。
+    active_run_id: UUID | None = Field(default=None, nullable=True, index=True, unique=True)
+    lifecycle_version: int = Field(default=0, sa_column=Column(Integer, nullable=False))
     error_code: str | None = Field(default=None, sa_column=Column(String(128), nullable=True))
     heartbeat_at: datetime | None = Field(default=None, sa_type=UTCDateTime, nullable=True)
     started_at: datetime | None = Field(default=None, sa_type=UTCDateTime, nullable=True)

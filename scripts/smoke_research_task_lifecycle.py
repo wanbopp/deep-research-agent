@@ -70,8 +70,11 @@ async def run_smoke() -> dict[str, object]:
             claimed = await repository.claim_next(worker_id="phase7-lifecycle-retry")
             if claimed is None or claimed.id != retry_id:
                 raise RuntimeError("retry smoke task was not claimed")
+            if claimed.active_run_id is None:
+                raise RuntimeError("retry smoke claim is missing run_id")
             await repository.finalize(
                 claimed,
+                run_id=claimed.active_run_id,
                 status=ResearchTaskStatus.FAILED,
                 error_code="SMOKE_EXPECTED_FAILURE",
             )
@@ -84,7 +87,13 @@ async def run_smoke() -> dict[str, object]:
             reclaimed = await repository.claim_next(worker_id="phase7-lifecycle-retry-cleanup")
             if reclaimed is None or reclaimed.id != retry_id:
                 raise RuntimeError("retried smoke task was not reclaimed")
-            await repository.finalize(reclaimed, status=ResearchTaskStatus.CANCELLED)
+            if reclaimed.active_run_id is None:
+                raise RuntimeError("reclaimed smoke task is missing run_id")
+            await repository.finalize(
+                reclaimed,
+                run_id=reclaimed.active_run_id,
+                status=ResearchTaskStatus.CANCELLED,
+            )
 
         # 把已领取任务的心跳移到过去，模拟进程突然退出。新 Worker 的恢复扫描应
         # 将它转回 retrying；这条路径不依赖旧进程执行 finally。
@@ -94,6 +103,9 @@ async def run_smoke() -> dict[str, object]:
             claimed = await repository.claim_next(worker_id="phase7-lifecycle-stale")
             if claimed is None or claimed.id != stale_id:
                 raise RuntimeError("stale smoke task was not claimed")
+            if claimed.active_run_id is None:
+                raise RuntimeError("stale smoke claim is missing run_id")
+            stale_run_id = claimed.active_run_id
             claimed.heartbeat_at = utc_now() - timedelta(minutes=10)
             await session.flush()
         async with resources.orm_session_factory() as session, session.begin():
@@ -103,6 +115,36 @@ async def run_smoke() -> dict[str, object]:
         async with resources.orm_session_factory() as session:
             recovered = await ResearchService(session).get(task_id=stale_id, user_id=owner_id)
         recovery_ok = recovered_count >= 1 and recovered.status == ResearchTaskStatus.RETRYING.value
+
+        # 新 Worker 重新领取后必须得到不同 run_id。旧 token 查询不到当前 claim，
+        # 因而无法追加节点事件、续心跳或覆盖最终报告。
+        async with resources.orm_session_factory() as session, session.begin():
+            repository = ResearchTaskRepository(session)
+            new_claim = await repository.claim_next(worker_id="phase7-lifecycle-new-owner")
+            if new_claim is None or new_claim.id != stale_id or new_claim.active_run_id is None:
+                raise RuntimeError("recovered smoke task was not reclaimed")
+            new_run_id = new_claim.active_run_id
+        async with resources.orm_session_factory() as session, session.begin():
+            old_claim = await ResearchTaskRepository(session).get_claim_for_update(
+                task_id=stale_id,
+                run_id=stale_run_id,
+                worker_id="phase7-lifecycle-stale",
+            )
+        fencing_ok = old_claim is None and new_run_id != stale_run_id
+        async with resources.orm_session_factory() as session, session.begin():
+            repository = ResearchTaskRepository(session)
+            current_claim = await repository.get_claim_for_update(
+                task_id=stale_id,
+                run_id=new_run_id,
+                worker_id="phase7-lifecycle-new-owner",
+            )
+            if current_claim is None:
+                raise RuntimeError("new owner lost claim during smoke cleanup")
+            await repository.finalize(
+                current_claim,
+                run_id=new_run_id,
+                status=ResearchTaskStatus.CANCELLED,
+            )
 
         # SSE 重连本质是用 Last-Event-ID 查询更大的事件 ID。这里直接验证持久事件
         # 查询边界，HTTP 编码层已由 encode_research_sse_event 负责。
@@ -125,10 +167,11 @@ async def run_smoke() -> dict[str, object]:
             ownership_ok = True
 
         return {
-            "ok": cancel_ok and retry_ok and recovery_ok and replay_ok and ownership_ok,
+            "ok": cancel_ok and retry_ok and recovery_ok and fencing_ok and replay_ok and ownership_ok,
             "pending_cancel_ok": cancel_ok,
             "failed_retry_ok": retry_ok,
             "stale_recovery_ok": recovery_ok,
+            "stale_worker_fenced": fencing_ok,
             "event_replay_ok": replay_ok,
             "cross_user_rejected": ownership_ok,
         }

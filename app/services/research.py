@@ -113,6 +113,7 @@ class ResearchService:
             now = utc_now()
             task.cancellation_requested_at = now
             task.updated_at = now
+            task.lifecycle_version += 1
             if task.status in {ResearchTaskStatus.PENDING, ResearchTaskStatus.RETRYING}:
                 task.status = ResearchTaskStatus.CANCELLED
                 task.completed_at = now
@@ -140,7 +141,9 @@ class ResearchService:
             task.status = ResearchTaskStatus.RETRYING
             task.error_code = None
             task.completed_at = None
+            task.cancellation_requested_at = None
             task.updated_at = utc_now()
+            task.lifecycle_version += 1
             await repository.append_event(
                 task_id=task.id,
                 user_id=user_id,
