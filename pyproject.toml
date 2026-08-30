@@ -51,6 +51,9 @@ dependencies = [
     "ddgs>=9.16.0",
 ]
 
+[project.scripts]
+deep-research-runtime = "app.entrypoints.runtime:main"
+
 [tool.setuptools.packages.find]
 # 从 pyproject.toml 所在目录开始寻找包
 where = ["."]
