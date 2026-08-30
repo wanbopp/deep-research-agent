@@ -100,7 +100,11 @@ class ResearchEvent(SQLModel, table=True):
     research_task_id: UUID = Field(foreign_key="research_tasks.id", nullable=False, index=True, ondelete="CASCADE")
     user_id: UUID = Field(foreign_key="users.id", nullable=False, index=True)
     event_type: str = Field(sa_column=Column(String(64), nullable=False))
-    schema_version: int = Field(default=1, sa_column=Column(Integer, nullable=False))
+    # 数据库默认与迁移保持一致，非 ORM 写入也只能落到当前 v1；legacy v0 只读。
+    schema_version: int = Field(
+        default=1,
+        sa_column=Column(Integer, nullable=False, server_default="1"),
+    )
     run_id: UUID | None = Field(default=None, nullable=True, index=True)
     payload_json: dict[str, object] = Field(default_factory=dict, sa_column=Column(JSON, nullable=False))
     created_at: datetime = Field(default_factory=utc_now, sa_type=UTCDateTime, nullable=False)
