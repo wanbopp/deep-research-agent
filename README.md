@@ -1,149 +1,273 @@
 # DeepResearch
 
-DeepResearch is an intelligent research assistant built with FastAPI, LangGraph,
-hybrid RAG, and GraphRAG.
+一个面向复杂问题研究的智能研究平台。项目以 **FastAPI + LangGraph** 为核心，将多轮对话、文档知识库、Hybrid RAG、GraphRAG、Web Search 和可恢复的后台研究任务组合成一条可追踪、可验证、带引用的研究链路。
 
-The project is being developed as a step-by-step engineering course. The current
-foundation includes multi-environment configuration, structured logging, request
-correlation, FastAPI middleware, and versioned health routes.
+它不只是一次性的“问模型—等答案”：系统会先规划研究步骤，再从用户私有文档、知识图谱和网页中并行收集证据，检查证据覆盖度与冲突，必要时进行有界补查，最后生成引用可回溯的结构化报告。
 
-- Product vision: [`../docs/DeepSearch.md`](../docs/DeepSearch.md)
-- Authoritative learning plan and current progress: [`../docs/LABS.MD`](../docs/LABS.MD)
-- Full phase-by-phase curriculum: [`../docs/phases/README.md`](../docs/phases/README.md)
-- Current lesson: [`../docs/lessons/lab-05-model-configuration-registry.md`](../docs/lessons/lab-05-model-configuration-registry.md)
+> 当前仓库已覆盖 Chat、HITL、长期记忆、知识索引、Hybrid RAG、GraphRAG、持久化 Research Workflow、指标与 Tracing 等核心链路。设计与运维资料统一从 [`docs/README.md`](docs/README.md) 进入。
 
-## Local setup
+## 项目亮点
 
-Run the following commands in PowerShell from this `deep-research` directory:
+- **有界 Deep Research 工作流**：Planner、Retriever、Validator、Writer 由 LangGraph 编排；最大迭代次数、输入预算、工具输出预算和并行度均有硬上限，避免无限循环和成本失控。
+- **四源统一证据模型**：Hybrid RAG、Local GraphRAG、Global GraphRAG 与 Web Search 的结果统一归一化为 `Evidence`，使用稳定 `evidence_id` 去重，并在报告生成前校验证据和引用关系。
+- **互补的 Hybrid RAG + GraphRAG**：Hybrid RAG 负责精确文本召回，GraphRAG 负责实体关系与社区级全局主题；图谱构建复用文档解析、清洗和分块结果，而不是维护两套彼此割裂的入库流水线。
+- **可恢复的长任务**：Research Task、事件和 LangGraph checkpoint 持久化在 PostgreSQL；Worker 使用租约、heartbeat、fencing token、幂等键和失败重试，进程重启后仍可安全接管任务。
+- **实时但不依赖连接存活**：Chat 和研究进度通过 SSE 推送。Research SSE 只是观察通道，浏览器断线不会取消后台研究任务，并可通过 `Last-Event-ID` 从持久事件表继续回放。
+- **身份与资源纵深隔离**：JWT 身份贯穿 API、会话、checkpoint、长期记忆、知识文档和研究任务；资源不存在与越权访问统一收敛，降低跨用户枚举风险。
+- **工程化 LLM 边界**：模型 Registry 支持重试、Fallback、总超时和结构化输出；Prompt 采用版本化资源集中管理，用户输入和检索证据以低信任数据进入 `HumanMessage`，而不是拼入系统指令。
+- **可观测与可运维**：结构化日志、请求关联 ID、Prometheus 指标和可选 Langfuse tracing 已接入；统一 Runtime 同时监管 API、Research Worker 和 Index Scheduler，任一后台消费者异常都会使整体失败，避免“API 正常但任务无人消费”的半健康状态。
+
+## 系统架构
+
+```mermaid
+flowchart TB
+    UI["React Web / API Client"]
+
+    subgraph API["FastAPI API Layer"]
+        AUTH["JWT / Ownership / Rate Limit"]
+        CHATAPI["Chat + SSE"]
+        KBAPI["Knowledge API"]
+        RESEARCHAPI["Research Task API + SSE"]
+        OBS["Logging / Metrics / Tracing"]
+    end
+
+    subgraph AGENT["LangGraph Orchestration"]
+        CHATGRAPH["Chat Graph<br/>Memory → Chat ⇄ Tools / HITL"]
+        RESEARCHGRAPH["Research Graph<br/>Planner → Retrieve ⇄ Validate → Writer"]
+    end
+
+    subgraph RETRIEVAL["Retrieval & Indexing"]
+        INDEX["Index Scheduler<br/>Parse → Clean → Chunk → Embed"]
+        HYBRID["Hybrid RAG<br/>pgvector + BM25 + RRF + Reranker"]
+        GRAPH["GraphRAG<br/>Entity / Relation / Community<br/>Local + Global Search"]
+        WEB["Web Search"]
+    end
+
+    subgraph DATA["Persistence & Infrastructure"]
+        PG["PostgreSQL + pgvector<br/>Business Data / Checkpoint / Event / Vector"]
+        NEO["Neo4j<br/>Knowledge Graph"]
+        REDIS["Redis<br/>Cache / Rate Limit / Guard"]
+        FILES["File Storage<br/>Original Documents"]
+    end
+
+    UI --> API
+    AUTH --> CHATAPI & KBAPI & RESEARCHAPI
+    CHATAPI --> CHATGRAPH
+    RESEARCHAPI --> RESEARCHGRAPH
+    KBAPI --> FILES
+    KBAPI --> PG
+    INDEX --> FILES
+    INDEX --> PG
+    INDEX --> HYBRID
+    INDEX --> GRAPH
+    RESEARCHGRAPH --> HYBRID & GRAPH & WEB
+    CHATGRAPH --> PG & REDIS
+    RESEARCHGRAPH --> PG
+    HYBRID --> PG
+    GRAPH --> NEO
+    OBS -.-> CHATGRAPH & RESEARCHGRAPH
+```
+
+### 1. 交互式 Chat
+
+普通对话使用独立的 Chat Graph：按需检索长期记忆，调用模型，并在模型发出 tool call 时进入工具循环。需要人工确认时通过 LangGraph `interrupt()` 暂停，客户端随后用 `Command(resume=...)` 从同一 checkpoint 恢复。Chat SSE 与浏览器连接同生命周期，用户停止生成时会继续取消底层 Graph 和模型调用。
+
+```text
+Request → JWT/Ownership → Memory(optional) → Chat ⇄ Tools → Response
+                                           └→ HITL interrupt → resume
+```
+
+### 2. 知识索引与检索
+
+文档上传后只创建持久化 `Document` 与 `IndexJob`，耗时处理由 Index Scheduler 异步领取。PDF、DOCX、Markdown 和纯文本经过解析、清洗和确定性分块后，先写入 pgvector/BM25 检索层，再基于同一批 chunk 抽取实体与关系并更新 Neo4j 社区结构。
+
+```text
+Upload → Document + IndexJob → Parse/Clean/Chunk
+                              ├→ Embedding → pgvector + BM25
+                              └→ Entity/Relation → Neo4j → Community Summary
+```
+
+查询时，Hybrid RAG 通过向量召回与 BM25 召回获得候选，使用 RRF 融合并精排；GraphRAG 则提供实体邻域的 Local Search 和社区摘要的 Global Search。两者解决的问题不同，在 Research Retriever 中按研究步骤组合使用。
+
+### 3. 持久化 Research Workflow
+
+创建研究任务时 API 立即返回 `202 Accepted`，实际模型与检索调用由 Research Worker 执行：
+
+```text
+Planner → Parallel Retrieval → Validator ──充分──→ Writer → Report
+                   ▲              │
+                   └────补查───────┘
+```
+
+- **Planner**：把主题拆成有界研究步骤，并为每一步选择允许的检索策略。
+- **Retriever**：并行执行 Hybrid RAG、Local/Global GraphRAG 和 Web Search，统一生成可引用证据。
+- **Validator**：检查步骤覆盖度、证据冲突和失败来源；只有在预算允许时才发起补查。
+- **Writer**：基于服务端确认的证据集合生成结构化报告，并校验引用完整性。
+- **Worker**：以租约和 fencing token 领取任务，持续 heartbeat，持久化节点事件，并响应取消或重试请求。
+
+## 技术栈
+
+| 分层 | 主要技术 | 职责 |
+|---|---|---|
+| Web 前端 | React 18、TypeScript、Vite、TanStack Query、Zustand | 登录、会话、知识库、研究任务与 SSE 时间线 |
+| API | FastAPI、Pydantic、SSE | REST 契约、流式事件、认证与依赖装配 |
+| Agent | LangGraph、LangChain | Chat 工具循环、HITL、Research 多角色编排与 checkpoint |
+| LLM | OpenAI-compatible Provider、结构化输出、Prompt Registry | 模型路由、重试/超时、可复现 Prompt |
+| RAG | pgvector、BM25、RRF、Sentence Transformers | 文档解析、混合召回、精排、引用与评测 |
+| GraphRAG | Neo4j | 实体关系、消歧、社区摘要、Local/Global Search |
+| 数据与基础设施 | PostgreSQL、Redis、Alembic、Local FileStorage | 业务数据、向量、checkpoint、缓存、限流和原始文件 |
+| 可观测性 | structlog、Prometheus、Langfuse | JSONL 日志、低基数指标和可选 Trace |
+
+## 目录结构
+
+```text
+deep-research/                      # 当前后端仓库
+├── app/
+│   ├── agents/chat/               # Chat Graph、工具循环与 HITL
+│   ├── agents/research/           # Planner/Retriever/Validator/Writer
+│   ├── agents/prompts/            # 版本化 Prompt 资源与 Registry
+│   ├── api/                       # FastAPI 路由、SSE 与依赖
+│   ├── graphrag/                  # 图谱构建、社区和 Local/Global 检索
+│   ├── rag/                       # 解析、分块、Hybrid RAG 与评测
+│   ├── repositories/              # 持久化访问边界
+│   ├── services/                  # 应用服务与 Index Scheduler
+│   ├── workers/                   # Durable Research Worker
+│   └── observability/             # Metrics、Tracing 与 Evaluation
+├── migrations/                    # Alembic 数据库迁移
+├── tests/                         # 单元、契约与集成测试
+├── evals/                         # RAG / GraphRAG / Research 评测集
+├── docs/                          # 可发布的设计文档索引
+└── deploy/                        # VM / systemd 基础设施部署说明
+
+../deep-research-web/               # 配套 React 前端工作区
+```
+
+## 快速开始
+
+### 1. 前置依赖
+
+- Python 3.12+
+- Node.js 20+
+- PostgreSQL 17 + pgvector
+- Redis 7+
+- Neo4j（建议直接使用 Compose 中固定的已验证镜像版本）
+
+仓库提供 [`compose.yaml`](compose.yaml) 用于启动 PostgreSQL、Redis 和 Neo4j。请先复制 [`deploy/vm.env.example`](deploy/vm.env.example) 为未提交的 `deploy/vm.env`，填写本地专用密码并确认 `INFRA_BIND_IP`，然后运行：
 
 ```powershell
-python -m venv .venv
+docker compose --env-file .\deploy\vm.env up -d
+docker compose --env-file .\deploy\vm.env ps
+```
+
+VMware 私网部署、systemd 托管和端口暴露边界见 [`deploy/README.md`](deploy/README.md)。不要把真实密码、Token 或连接串提交到仓库。
+
+### 2. 安装后端
+
+在 `deep-research` 目录执行：
+
+```powershell
+py -3.12 -m venv .venv
 .\.venv\Scripts\Activate.ps1
 python -m pip install -e ".[dev,test]"
+Copy-Item .env.example .env.development.local
 ```
 
-The application has development defaults, so Phase 1 does not require an LLM
-key, database, Redis, Neo4j, or Docker. To customize local settings, copy the
-environment template:
+编辑 `.env.development.local`，至少配置以下内容：
+
+- `OPENAI_API_KEY`、`OPENAI_BASE_URL`、`DEFAULT_LLM_MODEL`
+- `EMBEDDING_MODEL`、`EMBEDDING_DIMENSIONS`
+- PostgreSQL、Redis、Neo4j 的连接信息
+- 独立生成的 `JWT_SECRET_KEY`
+
+Embedding 维度属于数据库 Schema 的一部分，修改 `EMBEDDING_DIMENSIONS` 前需要迁移并重建已有向量。配置完成后执行迁移：
 
 ```powershell
-Copy-Item .env.example .env.development
+python -m alembic upgrade head
 ```
 
-## Run the Web runtime
-
-The default command starts FastAPI, the durable Research Worker, and the
-long-running Index Scheduler. This prevents either task queue from accepting
-work while no consumer is running:
+### 3. 启动统一 Runtime
 
 ```powershell
-Set-Location E:\workspace\Agent\DeepResearch\deep-research
 .\.venv\Scripts\deep-research-runtime.exe
 ```
 
-Running without arguments is equivalent to `--mode all`. The same installed
-entrypoint retains component-only modes for diagnostics and future scaling:
+无参数等价于 `--mode all`，会同时运行 FastAPI、Research Worker 和 Index Scheduler，这是本地及当前部署的默认模式。以下组件模式只用于诊断、维护或未来独立扩容：
 
 ```powershell
-.\.venv\Scripts\deep-research-runtime.exe --mode all
 .\.venv\Scripts\deep-research-runtime.exe --mode api
 .\.venv\Scripts\deep-research-runtime.exe --mode worker
 .\.venv\Scripts\deep-research-runtime.exe --mode index
 .\.venv\Scripts\deep-research-runtime.exe --mode index --until-idle
 ```
 
-`all` is the supported default for the current local and cloud deployment. The
-Supervisor stops the whole runtime if either background consumer fails, rather
-than leaving a healthy-looking API with permanently pending tasks. `api`,
-`worker`, and `index` are operational diagnostics; they are not the default
-Web mode. `index --until-idle` preserves the previous one-shot maintenance
-behavior.
+> 使用 `all` 时不要再启动独立 Worker 或 Index Scheduler，否则会引入重复消费者。任一受监管组件异常退出时，Supervisor 会关闭整个 Runtime，由进程管理器统一重启。
 
-Application JSONL logs are split by finite runtime component under `LOG_DIR`:
+启动后可访问：
 
-```text
-development-runtime-YYYY-MM-DD.jsonl
-development-api-YYYY-MM-DD.jsonl
-development-research-worker-YYYY-MM-DD.jsonl
-development-index-worker-YYYY-MM-DD.jsonl
+- Health：<http://127.0.0.1:8000/api/v1/health>
+- Swagger UI：<http://127.0.0.1:8000/docs>
+- OpenAPI JSON：<http://127.0.0.1:8000/api/v1/openapi.json>
+- Prometheus Metrics：<http://127.0.0.1:8000/metrics>
+
+### 4. 启动前端
+
+在相邻的 `deep-research-web` 目录执行：
+
+```powershell
+npm ci
+Copy-Item .env.example .env.local
+npm run dev
 ```
 
-The console remains an aggregated developer view. Component routing never uses
-user IDs, task IDs, prompts, filenames, or document content as file names.
+默认访问 <http://127.0.0.1:5173>。开发服务器会把 `/api` 代理到 `http://127.0.0.1:8000`；生产环境通过 `VITE_API_BASE` 指向真实 API 地址。
 
-### Runtime 与日志规范
+## API 能力概览
 
-以下约定是当前 Web 模式的统一运行规范，开发、测试和部署脚本都应遵守：
+| 路径 | 能力 |
+|---|---|
+| `/api/v1/auth` | 注册、登录与读取当前身份 |
+| `/api/v1/chat` | 普通响应、SSE 流式对话、HITL resume |
+| `/api/v1/chat/sessions` | 会话、消息历史、标题和删除 |
+| `/api/v1/knowledge/documents` | 文档上传、索引状态、重试和删除 |
+| `/api/v1/memory` | 当前用户长期记忆查询与删除 |
+| `/api/v1/research` | 创建、查询、取消、重试研究任务 |
+| `/api/v1/research/{id}/stream` | 持久研究事件流与断线续传 |
 
-1. **默认入口唯一。** 后端统一使用 `deep-research-runtime` 启动；无参数即为
-   `--mode all`，同时运行 API、Research Worker 和 Index Scheduler。前端在
-   `deep-research-web` 中使用 `npm run dev` 单独启动。
-2. **当前部署不拆服务。** 本地和云端默认都使用 `all`。`api`、`worker`、`index`
-   只用于故障诊断、维护和将来独立扩容，不作为当前常规部署组合。
-3. **禁止重复消费者。** 运行 `all` 时，不得再启动独立 Research Worker、Index
-   Scheduler 或旧 Worker 脚本，否则会产生额外消费者并增加排障复杂度。旧脚本只保留
-   兼容性；一次性索引维护统一使用 `--mode index --until-idle`。
-4. **统一停止。** 前台运行时使用 `Ctrl+C`；Supervisor 会停止接收新请求、取消后台
-   消费循环，并等待 FastAPI lifespan 和各组件释放数据库、Neo4j 与 tracing 资源。
-   不应通过强制结束单个子组件来终止 `all` 模式。
-5. **组件失败即整体失败。** Research Worker 或 Index Scheduler 意外退出时，整个
-   Runtime 必须以失败状态退出，由进程管理器重启，不能留下“API 健康但任务无人领取”
-   的半健康实例。
-6. **日志按固定组件分流。** JSONL 只允许写入 `runtime`、`api`、
-   `research-worker`、`index-worker` 四类文件；控制台用于聚合查看。组件名必须来自
-   代码中的有限集合，禁止根据请求参数动态创建日志文件。
-7. **日志不得泄密。** 文件名、事件字段和日志消息不得记录密码、Token、连接串、完整
-   Prompt、文档正文或其他敏感数据。请求 ID、任务 ID 等关联字段可写入 JSONL 事件，
-   但不得用作文件名，也不得形成无界日志标签。
-8. **保持任务持久化语义。** 统一进程只合并运行入口，不把 Research 或 Index 任务改成
-   API 进程内存队列；任务领取、租约、heartbeat、checkpoint、重试和恢复仍以持久化
-   存储为准。
+完整请求/响应模型以运行时 Swagger 和 OpenAPI 为准。
 
-### Prompt 安全与版本规范
+## 关键工程约束
 
-所有模型提示词必须遵守以下规则：
+- **Prompt 安全**：System Prompt 只能来自 `app/agents/prompts/` 的已注册版本化资源；用户输入、证据、记忆和工具输出作为低信任数据传入。日志和 Trace 只记录 Prompt 名称、版本和哈希，不记录正文或模型隐藏推理。
+- **持久化语义**：统一进程只合并启动入口，不把 Research 或 Index Job 降级为内存队列。任务领取、租约、heartbeat、checkpoint、重试和恢复仍以持久化存储为事实来源。
+- **日志边界**：JSONL 仅按 `runtime`、`api`、`research-worker`、`index-worker` 四类有限组件分流；禁止使用用户 ID、任务 ID、Prompt、文件名或文档内容动态创建日志文件。
+- **资源生命周期**：PostgreSQL pool/checkpointer、Redis、Neo4j 和 tracing 由 FastAPI lifespan 统一装配和释放；Windows 入口会使用 psycopg async 所需的 Selector event loop。
+- **真实 Provider 验收**：新的 LLM/Agent 行为不能只靠 fake 或单次主观回答判断，需要在静态检查和确定性测试后执行相关真实 Provider smoke。
 
-1. **固定系统指令。** System Prompt 必须来自 `app/agents/prompts/` 中已注册的版本化
-   Markdown 资源，禁止把用户主题、聊天正文、证据、记忆或工具输出拼入 SystemMessage。
-2. **低信任数据隔离。** 用户输入和检索内容通过严格字段契约编码为 HumanMessage JSON；
-   Prompt Registry 会同时拒绝缺失字段和额外字段，错误日志不得包含字段值。
-3. **禁止散落 Prompt。** 业务节点只能通过逻辑名称加载 Prompt，不应在 Python 文件中新增
-   大段系统提示词。升级内容时新增版本文件并修改中央注册项。
-4. **模型输出不直接可信。** 优先使用 Pydantic structured output；证据 ID、引用、身份、权限、
-   来源和持久化状态仍必须由服务端确定性校验或绑定。
-5. **版本可复现。** 每个 Prompt 工件包含逻辑名称、发布版本和正文 SHA-256。应用启动时会
-   验证全部注册资源，防止 wheel 漏打包或空文件延迟到首次请求才失败。
-6. **可观测但不采集正文。** 日志和 Trace 只记录 Prompt 名称、版本与哈希；不得记录完整
-   System Prompt、HumanMessage、证据正文、记忆正文或模型隐藏推理。Prompt 版本不得作为
-   包含用户值的动态指标标签。
-7. **修改必须经过门禁。** Prompt 变更至少通过字段契约、信任层级、注入隔离、结构化输出、
-   全量回归和相关真实 Provider smoke；不能只根据单次回答的主观观感发布。
+## 质量检查
 
-当前注册项覆盖 Chat、Research Planner/Validator/Writer、GraphRAG extraction/repair/linking/
-community/map/reduce、会话标题和长期记忆提取。Prompt Registry 与调用方式见
-`app/agents/prompts/loader.py`。
-
-- Health check: <http://127.0.0.1:8000/api/v1/health>
-- Swagger UI: <http://127.0.0.1:8000/docs>
-- OpenAPI JSON: <http://127.0.0.1:8000/api/v1/openapi.json>
-
-Application startup enters the FastAPI lifespan first. The required PostgreSQL
-dependency must be reachable before Uvicorn starts accepting HTTP requests.
-On Windows, the unified entrypoint explicitly creates the Selector event loop
-required by psycopg async, so it does not depend on Uvicorn `--reload` to obtain
-a compatible child process. Run the React frontend separately with `npm run
-dev` from the `deep-research-web` project.
-
-## Quality checks
-
-Run each command independently so a failure identifies the affected stage:
+后端在 `deep-research` 目录执行：
 
 ```powershell
 python -m ruff check .\app .\tests
 python -m ruff format --check .\app .\tests
 python -m pyright --pythonpath ".\.venv\Scripts\python.exe"
 python -m pytest .\tests -v
+git diff --check
 ```
 
-The optional `Makefile` exposes the same workflow for environments that provide
-`make`; PowerShell users can use the commands above directly.
+前端在 `deep-research-web` 目录执行：
+
+```powershell
+npm run typecheck
+npm run test:run
+npm run build
+```
+
+## 文档导航
+
+| 文档 | 用途 |
+|---|---|
+| [`docs/README.md`](docs/README.md) | 仓库内设计、运维和代码入口总索引 |
+| [`docs/enterprise-memory-architecture.md`](docs/enterprise-memory-architecture.md) | 长期记忆的企业级架构与边界 |
+| [`docs/memory-retrieval-comparison.md`](docs/memory-retrieval-comparison.md) | 记忆检索方案对比 |
+| [`deploy/README.md`](deploy/README.md) | VMware 基础设施与 systemd 运维说明 |
